@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Session, SupabaseClient } from "@supabase/supabase-js";
 import { getAccessToken } from "./auth";
+import { createAuthThrottle, describeWait } from "./authThrottle";
 import { ConnectionTestScreen } from "./components/ConnectionTestScreen";
 import { NewPasswordScreen } from "./components/NewPasswordScreen";
 import { PasswordResetScreen } from "./components/PasswordResetScreen";
@@ -45,6 +46,25 @@ export default function App({ client = supabase, configError = supabaseConfigErr
   function endAuth() {
     authBusyRef.current = false;
     setAuthBusy(false);
+  }
+
+  const authThrottle = useRef(createAuthThrottle({ maxAttempts: 5, windowMs: 5 * 60_000 }));
+
+  function throttleKey(action: string, email: string) {
+    return `${action}:${email.trim().toLowerCase()}`;
+  }
+
+  /**
+   * Stops a burst of attempts from reaching Supabase. This is a guard inside
+   * one tab, not the security boundary: Supabase's limits still apply and a
+   * reload starts a fresh count.
+   */
+  function throttled(action: string, label: string, email: string): boolean {
+    const wait = authThrottle.current.waitFor(throttleKey(action, email));
+    if (wait === 0) return false;
+    setAuthNotice(null);
+    setAuthError(`Too many ${label} attempts for this address. Try again in ${describeWait(wait)}.`);
+    return true;
   }
 
   useEffect(() => {
@@ -110,7 +130,11 @@ export default function App({ client = supabase, configError = supabaseConfigErr
   }
 
   async function handleSignIn(email: string, password: string) {
-    if (!client || !beginAuth()) return;
+    if (!client) return;
+    const key = throttleKey("sign-in", email);
+    if (throttled("sign-in", "sign-in", email)) return;
+    if (!beginAuth()) return;
+    authThrottle.current.record(key);
     setAuthError(null);
     setAuthNotice(null);
 
@@ -126,6 +150,7 @@ export default function App({ client = supabase, configError = supabaseConfigErr
         setAuthError("Supabase did not start a session. Confirm your email address, then sign in again.");
         return;
       }
+      authThrottle.current.clear(key);
       // onAuthStateChange delivers the signed-in session to the screen, so the
       // app does not keep a second copy of it here.
     } catch (cause) {
@@ -136,7 +161,11 @@ export default function App({ client = supabase, configError = supabaseConfigErr
   }
 
   async function handleSignUp(email: string, password: string) {
-    if (!client || !beginAuth()) return;
+    if (!client) return;
+    const key = throttleKey("sign-up", email);
+    if (throttled("sign-up", "sign-up", email)) return;
+    if (!beginAuth()) return;
+    authThrottle.current.record(key);
     setAuthError(null);
     setAuthNotice(null);
 
@@ -152,6 +181,7 @@ export default function App({ client = supabase, configError = supabaseConfigErr
         setAuthError(error.message);
         return;
       }
+      authThrottle.current.clear(key);
       // Supabase reports an address that is already registered as a user with no
       // identities instead of failing, so a plain "check your email" would lie.
       if (Array.isArray(data.user?.identities) && data.user.identities.length === 0) {
@@ -175,7 +205,11 @@ export default function App({ client = supabase, configError = supabaseConfigErr
   }
 
   async function handlePasswordReset(email: string) {
-    if (!client || !beginAuth()) return;
+    if (!client) return;
+    const key = throttleKey("password-reset", email);
+    if (throttled("password-reset", "password reset", email)) return;
+    if (!beginAuth()) return;
+    authThrottle.current.record(key);
     setAuthError(null);
     setAuthNotice(null);
 
@@ -187,6 +221,7 @@ export default function App({ client = supabase, configError = supabaseConfigErr
         setAuthError(error.message);
         return;
       }
+      authThrottle.current.clear(key);
       // The same answer whether or not the address has an account.
       setAuthNotice(
         "If an account exists for that address, a reset link is on its way. Open it in this browser to choose a new password.",

@@ -114,6 +114,7 @@ function makeClient(options: ClientOptions = {}) {
   } = options;
 
   let current = initialSession;
+  let startupError = getSessionError;
   let listener: ((event: string, session: Session | null) => void) | null = null;
 
   const signInWithPassword = vi.fn(async ({ email }: { email: string; password: string }) => {
@@ -160,11 +161,16 @@ function makeClient(options: ClientOptions = {}) {
 
   const client = {
     auth: {
-      getSession: vi.fn(async () =>
-        getSessionError
-          ? { data: { session: null }, error: { message: getSessionError } }
-          : { data: { session: current }, error: null },
-      ),
+      getSession: vi.fn(async () => {
+        // A startup read can fail once and still recover when an auth event
+        // delivers a session; a persistent error would contradict that event.
+        if (startupError) {
+          const message = startupError;
+          startupError = null;
+          return { data: { session: null }, error: { message } };
+        }
+        return { data: { session: current }, error: null };
+      }),
       onAuthStateChange: vi.fn((callback: (event: string, session: Session | null) => void) => {
         listener = callback;
         return { data: { subscription: { unsubscribe: vi.fn() } } };
@@ -314,7 +320,7 @@ describe("App authentication", () => {
     await screen.findByRole("option", { name: /Gemma 4 31B/ });
     fireEvent.click(screen.getByRole("button", { name: /Send test request/i }));
 
-    expect(await screen.findByText(/Sign-out is paused until the current test request finishes/i)).toBeInTheDocument();
+    expect(await screen.findByText(/Sign-out is paused until the current request finishes/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
     expect(signOut).not.toHaveBeenCalled();
 
@@ -367,6 +373,31 @@ describe("Auth request safety", () => {
     release?.(null);
     expect(await screen.findByRole("alert")).toHaveTextContent("Invalid login credentials");
   });
+
+  it("stops forwarding sign-in attempts after repeated failures", async () => {
+    installStatusFetch();
+    const { client, signInWithPassword } = makeClient({ signInError: "Invalid login credentials" });
+    render(<App client={client} />);
+    await screen.findByRole("heading", { name: "Sign in" });
+    fillCredentials("ada@example.com", "correct horse battery staple");
+    const button = screen.getByRole("button", { name: "Sign in" });
+
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      await act(async () => {
+        fireEvent.click(button);
+      });
+      expect(signInWithPassword).toHaveBeenCalledTimes(attempt);
+    }
+
+    await act(async () => {
+      fireEvent.click(button);
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Too many sign-in attempts for this address. Try again in 5 minutes.",
+    );
+    expect(signInWithPassword).toHaveBeenCalledTimes(5);
+  });
 });
 
 describe("Account flows", () => {
@@ -383,6 +414,7 @@ describe("Account flows", () => {
     expect(signUp).toHaveBeenCalledWith({
       email: "new@example.com",
       password: "correct horse battery staple",
+      options: { emailRedirectTo: window.location.origin },
     });
     expect(screen.getByRole("heading", { name: "Sign in" })).toBeInTheDocument();
   });

@@ -220,7 +220,7 @@ cannot sign in.
 
 A real deployment still needs its own Supabase project with every migration applied, its own R2 bucket with a CORS rule
 for the production origin (`npm run cors:preview -- https://<origin>`), `APP_ORIGIN` set to that origin, and accounts
-created through the admin API: there is no sign-up or password-reset flow.
+created in the app or through the admin API.
 
 ### Zero-cost deploy verification (Render Free)
 
@@ -330,7 +330,7 @@ The startup line also proves the caps in force on the host. Render's *Logs* tab 
 Those numbers matching `render.yaml` are the evidence that a 512 MB instance runs the measured caps rather than the
 code defaults (256 MiB / 25 MiB / 256 MiB).
 
-**5. Browser smoke, no provider spend.** Sign in with an account created through the admin API (there is no sign-up),
+**5. Browser smoke, no provider spend.** Sign in with an account created in the app or through the admin API,
 save a project and reload, upload an image and confirm the row reaches `ready` and plays back — that round trip is what
 proves the CORS rule — then check the console: no `4xx/5xx` on `/api/*`, and `403 ORIGIN_NOT_ALLOWED` means `APP_ORIGIN`
 does not match the address bar.
@@ -1788,9 +1788,20 @@ end, and never deletes an account that existed before the run.
 
 ## Security limitations
 
-- Email/password sign-in only; there is no sign-up, password-reset, MFA, OAuth, or account-management UI. The
-  Supabase client persists session tokens in browser `localStorage`; production needs an explicit session-storage and
-  CSP review. Sign-out is local to this browser and does not revoke the account's other sessions.
+- Email/password sign-in, sign-up, and password reset; there is no MFA, OAuth, email-change, or account-settings
+  UI. The Supabase client persists session tokens in browser `localStorage`; production needs an explicit
+  session-storage and CSP review. Sign-out is local to this browser and does not revoke the account's other sessions.
+- Password-reset requests answer the same way whether or not an address has an account. Sign-up still names an
+  existing account so the person can sign in or reset instead of waiting for a mail that will not arrive. Supabase's
+  own rate limits still surface as errors to the person submitting the form.
+- Sign-up confirmation and password-recovery links depend on Supabase mail delivery and on the app origin being
+  allowlisted under Authentication → URL Configuration. Sign-up sends `emailRedirectTo` for the current origin;
+  recovery uses `redirectTo` for the current origin. Delivery is not exercised by the automated suite; those flows
+  are tested against a stubbed client.
+- The auth forms throttle bursts locally: five attempts per action and address within five minutes, then a wait
+  message naming the remaining time. The count lives in the mounted app, so a reload clears it. This is a usability
+  guard, not the security boundary; Supabase's server-side limits remain the enforcement point, and there is no
+  server-side throttle of our own.
 - All ten migrations and RLS policies are applied to the configured Supabase project (Phase 6 on 2026-11-25,
   including the ready-import uniqueness index). The
   hosted catalog was checked (12 tables, RLS, policies, grants, revision trigger), and live profile/project/child
@@ -1818,7 +1829,7 @@ end, and never deletes an account that existed before the run.
 - Rate limiting is in-memory and per-process; it is scoped to the verified account but is not a durable quota shared
   across processes or instances.
 - The Vite proxy and loopback API are the development loop; production serves the build and `/api` from one process,
-  but durable quotas shared across instances, managed secret rotation, and a sign-up/password-reset flow are still
+  but durable quotas shared across instances, managed secret rotation, and hosted email delivery remain
   missing.
 - The workspace is single-user per project and has no conflict merging: a stale save is refused, the draft is kept,
   and the caller must load the latest version. Revision history is read-only; restoring an old version is future work.
