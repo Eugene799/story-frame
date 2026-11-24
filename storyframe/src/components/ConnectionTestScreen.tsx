@@ -25,9 +25,11 @@ interface ConnectionTestScreenProps {
   getAccessToken: () => Promise<string>;
   /** Reports whether a billable request is in flight, so sign-out can wait for it. */
   onBusyChange?: (busy: boolean) => void;
+  /** Called when the session is gone or expired, so the app can return to sign-in. */
+  onSessionExpired?: () => void;
 }
 
-export function ConnectionTestScreen({ getAccessToken, onBusyChange }: ConnectionTestScreenProps) {
+export function ConnectionTestScreen({ getAccessToken, onBusyChange, onSessionExpired }: ConnectionTestScreenProps) {
   const [status, setStatus] = useState<AiStatusResponse | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [modelId, setModelId] = useState("");
@@ -86,6 +88,9 @@ export function ConnectionTestScreen({ getAccessToken, onBusyChange }: Connectio
       setResult(outcome.result);
       setUsageRecorded(outcome.usageRecorded);
     } catch (cause) {
+      if (cause instanceof AuthSessionError && (cause.code === "SESSION_EXPIRED" || cause.code === "AUTH_REQUIRED")) {
+        onSessionExpired?.();
+      }
       const requestError =
         cause instanceof AiRequestError
           ? cause
