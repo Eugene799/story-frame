@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AiUsageListResponse } from "../shared/ai-contract";
-import { USER_A, USER_B, pendingUsageRow } from "./fake-supabase";
+import { createSupabaseUsageLedger } from "../server/usage-ledger";
+import { SERVICE_ROLE_KEY, USER_A, USER_B, pendingUsageRow, startFakeSupabase } from "./fake-supabase";
 import {
   USER_A_TOKEN,
   jsonProviderResponse,
@@ -362,6 +363,47 @@ describe("usage ledger", () => {
       expect(app.supabase.usage.map((row) => row.user_id).sort()).toEqual([USER_A.id, USER_B.id].sort());
     } finally {
       await app.close();
+    }
+  });
+
+  it("cannot complete a reservation owned by another account", async () => {
+    const supabase = await startFakeSupabase();
+    const ledger = createSupabaseUsageLedger({
+      url: supabase.url,
+      serviceRoleKey: SERVICE_ROLE_KEY,
+      timeoutMs: 1_000,
+    });
+    const row = pendingUsageRow({
+      userId: USER_A.id,
+      idempotencyKey: "test-idempotency-owner-completion",
+      requestHash: "request-hash",
+      createdAt: new Date().toISOString(),
+    });
+    supabase.usage.push(row);
+
+    const completion = {
+      status: "success" as const,
+      returnedModel: "gemma4:31b",
+      promptEvalCount: 21,
+      evalCount: 6,
+      latencyMs: 1,
+      responseStatus: 200,
+      responseBody: { ok: true },
+    };
+
+    try {
+      // B knows A's reservation id but must not be able to settle A's row.
+      expect(await ledger.complete(USER_B.id, row.id, completion)).toBe(false);
+      expect(supabase.usage[0].status).toBe("pending");
+
+      expect(await ledger.complete(USER_A.id, row.id, completion)).toBe(true);
+      expect(supabase.usage[0]).toMatchObject({
+        status: "success",
+        response_status: 200,
+        returned_model: "gemma4:31b",
+      });
+    } finally {
+      await supabase.close();
     }
   });
 

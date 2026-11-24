@@ -84,8 +84,11 @@ export interface UsageLedger {
   lookup(userId: string, idempotencyKey: string): Promise<ExistingUsage | null>;
   /** Conditionally settles a stale pending reservation. False means it lost a race. */
   abandon(request: AbandonRequest): Promise<boolean>;
-  /** Settles a pending reservation. False means no pending row matched, so it is unconfirmed. */
-  complete(id: string, completion: UsageCompletion): Promise<boolean>;
+  /**
+   * Settles a pending reservation owned by `userId`. False means no pending row
+   * owned by that user matched, so it is unconfirmed.
+   */
+  complete(userId: string, id: string, completion: UsageCompletion): Promise<boolean>;
   listForUser(userId: string, limit: number): Promise<AiUsageRecord[]>;
 }
 
@@ -123,7 +126,13 @@ function toExisting(row: Record<string, unknown>): ExistingUsage {
   if (requestHash !== null && typeof requestHash !== "string") {
     throw new UsageLedgerError("The usage ledger returned a malformed reservation.");
   }
-  if (responseStatus !== null && typeof responseStatus !== "number") {
+  if (
+    responseStatus !== null &&
+    (typeof responseStatus !== "number" ||
+      !Number.isInteger(responseStatus) ||
+      responseStatus < 100 ||
+      responseStatus > 599)
+  ) {
     throw new UsageLedgerError("The usage ledger returned a malformed reservation status.");
   }
 
@@ -324,8 +333,14 @@ export function createSupabaseUsageLedger(options: SupabaseUsageLedgerOptions): 
       return payload.length > 0;
     },
 
-    async complete(id: string, completion: UsageCompletion): Promise<boolean> {
-      const query = new URLSearchParams({ id: `eq.${id}`, status: "eq.pending" });
+    async complete(userId: string, id: string, completion: UsageCompletion): Promise<boolean> {
+      // The owner is part of the update predicate, not just an after-the-fact
+      // check: a mixed-up reservation id can never settle another account's row.
+      const query = new URLSearchParams({
+        id: `eq.${id}`,
+        user_id: `eq.${userId}`,
+        status: "eq.pending",
+      });
       let response: Response;
       try {
         response = await fetch(`${endpoint}?${query}`, {

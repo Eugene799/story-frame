@@ -24,7 +24,7 @@ Node server (127.0.0.1:8787)
 - User identity always comes from the verified Supabase session; a client-supplied owner id is rejected.
 - A billable call is refused unless Supabase auth, the usage ledger, and the Ollama key are all configured.
 - `POST /api/ai/test` remains bounded: 4 KB body, 500-character prompt, 120 output tokens, 30 s provider timeout, one
-  concurrent request, six requests per minute, no automatic retries.
+  concurrent request per account, six requests per minute per account, no automatic retries.
 - Every test request requires an `Idempotency-Key`. A unique `(user_id, idempotency_key)` reservation is written before
   the provider call, so a retry cannot bill twice.
 - A reservation left `pending` by a dead request is settled as `REQUEST_ABANDONED` on a later retry, without calling the
@@ -191,7 +191,9 @@ plus three auth timeouts), the server assumes that attempt died. It settles the 
 `REQUEST_ABANDONED` (HTTP 409, no token counts, zero latency) and returns that response **without contacting Ollama**,
 because the original attempt may already have been billed. That key then replays `REQUEST_ABANDONED` for good: only a
 new key starts a new paid attempt. The settlement is conditional on the row still being `pending`, still owned by the
-caller, and still older than the threshold, so a concurrent completion wins the race and is replayed instead.
+caller, and still older than the threshold, so a concurrent completion wins the race and is replayed instead. The
+completion write is likewise filtered by the verified caller's user id, so a mismatched reservation id cannot settle
+another account's row.
 
 A completion write that fails after Ollama answered is retried once. If it still cannot be recorded, the reply is
 returned anyway (HTTP 200) with `X-Storyframe-Usage: unrecorded`, because the provider was already paid for it, and no
@@ -454,7 +456,8 @@ never called.
 - The threshold is a guard, not a lock: if a process were frozen for longer than it, that process's late completion can
   no longer overwrite the settled row (it stays `REQUEST_ABANDONED`), although the live caller still receives its real
   response.
-- Rate limiting is still in-memory, single-process, and not a durable per-user quota.
+- Rate limiting is in-memory and per-process; it is scoped to the verified account but is not a durable quota shared
+  across processes or instances.
 - The Vite proxy and loopback API are a development arrangement; production needs a deployed API, managed secrets,
   durable quotas, and a real auth flow.
 - Projects have a server API but no workspace UI yet, and only document schema v1 exists. There is no conflict merging:

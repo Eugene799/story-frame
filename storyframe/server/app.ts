@@ -62,7 +62,9 @@ import {
   type ChildStore,
 } from "./project-children";
 
-const MAX_CONCURRENT = 1;
+const MAX_CONCURRENT_PER_USER = 1;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const LEDGER_READY_TTL_MS = 30_000;
 const CHILD_RESOURCES = new Set(["scenes", "sources", "claims", "proposals", "jobs", "renders"]);
 const USAGE_PAGE_SIZE = 20;
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
@@ -157,7 +159,7 @@ function buildStatus(config: AppConfig, ledgerReady: boolean): AiStatusResponse 
       bodyMaxBytes: config.bodyMaxBytes,
       providerTimeoutMs: config.providerTimeoutMs,
       maxOutputTokens: config.maxOutputTokens,
-      maxConcurrentRequests: MAX_CONCURRENT,
+      maxConcurrentRequests: MAX_CONCURRENT_PER_USER,
       requestsPerMinute: config.requestsPerMinute,
       abandonAfterMs: config.abandonAfterMs,
     },
@@ -213,6 +215,21 @@ function readJsonBody(request: IncomingMessage, maxBytes: number): Promise<unkno
         return;
       }
       chunks.push(buffer);
+    });
+
+    // A client can disappear after sending headers and part of a body. Without
+    // settling here, the body promise never resolves and the per-user in-flight
+    // slot is held until the process exits.
+    request.on("aborted", () => {
+      if (settled) return;
+      settled = true;
+      reject(new HttpError(400, "INVALID_BODY", "The request body was interrupted."));
+    });
+
+    request.on("close", () => {
+      if (settled) return;
+      settled = true;
+      reject(new HttpError(400, "INVALID_BODY", "The request body was interrupted."));
     });
 
     request.on("end", () => {
@@ -275,8 +292,10 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
   const log = options.logger ?? console;
   const now = options.now ?? (() => Date.now());
   const fetchImpl = options.fetchImpl;
-  const recentRequests: number[] = [];
-  let inFlight = 0;
+  const recentRequestsByUser = new Map<string, number[]>();
+  const inFlightByUser = new Map<string, number>();
+  let lastRateLimitSweep = 0;
+  let ledgerReadiness: { value: boolean; checkedAt: number } | null = null;
 
   const auth: SupabaseAuth | null =
     config.supabaseUrl && config.supabasePublishableKey
@@ -338,7 +357,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
 
     if (path === "/api/ai/status") {
       if (method !== "GET") throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for this endpoint.");
-      const ledgerReady = ledger ? await ledger.check().then(() => true).catch(() => false) : false;
+      const ledgerReady = await readLedgerReadiness();
       sendJson(response, 200, buildStatus(config, ledgerReady));
       return;
     }
@@ -395,6 +414,16 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       }
       throw error;
     }
+  }
+
+  async function readLedgerReadiness(): Promise<boolean> {
+    if (!ledger) return false;
+    if (ledgerReadiness && now() - ledgerReadiness.checkedAt < LEDGER_READY_TTL_MS) {
+      return ledgerReadiness.value;
+    }
+    const value = await ledger.check().then(() => true).catch(() => false);
+    ledgerReadiness = { value, checkedAt: now() };
+    return value;
   }
 
   function requireLedger(): UsageLedger {
@@ -688,16 +717,38 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     const idempotencyKey = readIdempotencyKey(request);
 
     const nowMs = now();
-    while (recentRequests.length > 0 && recentRequests[0] <= nowMs - 60_000) recentRequests.shift();
-    if (recentRequests.length >= config.requestsPerMinute) {
-      throw new HttpError(429, "TOO_MANY_REQUESTS", "Development request limit reached. Wait a minute before retrying.");
+    const cutoff = nowMs - RATE_LIMIT_WINDOW_MS;
+
+    // Limits are per verified account. A global window let one account consume
+    // every slot and deny service to all other signed-in users.
+    if (nowMs - lastRateLimitSweep >= RATE_LIMIT_WINDOW_MS) {
+      lastRateLimitSweep = nowMs;
+      for (const [userId, times] of recentRequestsByUser) {
+        if (times.every((at) => at <= cutoff)) recentRequestsByUser.delete(userId);
+      }
     }
-    if (inFlight >= MAX_CONCURRENT) {
-      throw new HttpError(429, "REQUEST_IN_PROGRESS", "A test request is already running. Wait for it to finish.");
+
+    const recentRequests = (recentRequestsByUser.get(user.id) ?? []).filter((at) => at > cutoff);
+    if (recentRequests.length >= config.requestsPerMinute) {
+      recentRequestsByUser.set(user.id, recentRequests);
+      throw new HttpError(
+        429,
+        "TOO_MANY_REQUESTS",
+        "This account reached its development request limit. Wait a minute before retrying.",
+      );
+    }
+    const activeRequests = inFlightByUser.get(user.id) ?? 0;
+    if (activeRequests >= MAX_CONCURRENT_PER_USER) {
+      throw new HttpError(
+        429,
+        "REQUEST_IN_PROGRESS",
+        "A test request for this account is already running. Wait for it to finish.",
+      );
     }
 
     recentRequests.push(nowMs);
-    inFlight += 1;
+    recentRequestsByUser.set(user.id, recentRequests);
+    inFlightByUser.set(user.id, activeRequests + 1);
 
     try {
       const body = await readJsonBody(request, config.bodyMaxBytes);
@@ -836,7 +887,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         });
       } catch (error) {
         const providerError = error instanceof ProviderError ? error : null;
-        await recordOutcome(usageLedger, reservation.id, {
+        await recordOutcome(usageLedger, user.id, reservation.id, {
           status: "error",
             returnedModel: null,
             promptEvalCount: null,
@@ -865,7 +916,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         usage: output.usage,
         doneReason: output.doneReason,
       };
-      const recorded = await recordOutcome(usageLedger, reservation.id, {
+      const recorded = await recordOutcome(usageLedger, user.id, reservation.id, {
         status: "success",
         returnedModel: output.returnedModel,
         promptEvalCount: output.usage.promptEvalCount,
@@ -883,7 +934,9 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         recorded ? undefined : { "X-Storyframe-Usage": "unrecorded" },
       );
     } finally {
-      inFlight -= 1;
+      const remaining = (inFlightByUser.get(user.id) ?? 1) - 1;
+      if (remaining > 0) inFlightByUser.set(user.id, remaining);
+      else inFlightByUser.delete(user.id);
     }
   }
 
@@ -896,12 +949,13 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
    */
   async function recordOutcome(
     target: UsageLedger,
+    userId: string,
     id: string,
     completion: UsageCompletion,
   ): Promise<boolean> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        if (await target.complete(id, completion)) return true;
+        if (await target.complete(userId, id, completion)) return true;
         break;
       } catch {
         // Retry once; the second failure reports an unrecorded outcome below.
