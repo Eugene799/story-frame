@@ -307,6 +307,43 @@ try {
     "deleted media remains visible as deleted until retention",
     listed?.media.find((row) => row.id === mediaA)?.status === "deleted",
   );
+
+  // Project deletion must clean up objects that are still attached, not just
+  // rows. This is the lifecycle step a browser delete leaves behind.
+  const secondInitiate = await api(`/api/projects/${projectA}/media`, userA.token, {
+    method: "POST",
+    body: JSON.stringify({ kind: "image", contentType: "image/png", byteSize: PNG.length }),
+  });
+  check("second upload initiated for project-deletion cleanup", secondInitiate.status === 201);
+  const secondTicket = (await secondInitiate.json()) as {
+    media: { id: string };
+    upload: { url: string; headers: Record<string, string> };
+  };
+  const secondKey = `media/${userA.id}/${secondTicket.media.id}`;
+  const secondPut = await fetch(secondTicket.upload.url, {
+    method: "PUT",
+    headers: secondTicket.upload.headers,
+    body: new Uint8Array(PNG),
+  });
+  check("second upload reaches the real bucket", secondPut.status === 200);
+  const secondComplete = await api(
+    `/api/projects/${projectA}/media/${secondTicket.media.id}/complete`,
+    userA.token,
+    { method: "POST" },
+  );
+  check("second upload completes", secondComplete.status === 200);
+  const secondAttach = await api(
+    `/api/projects/${projectA}/media/${secondTicket.media.id}/references`,
+    userA.token,
+    { method: "POST", body: JSON.stringify({ refKind: "scene", refId: "scene-1" }) },
+  );
+  check("second asset reference is attached", secondAttach.status === 201);
+  check("second object is present before project deletion", (await objects.head(secondKey))?.byteSize === PNG.length);
+
+  const removeProject = await api(`/api/projects/${projectA}`, userA.token, { method: "DELETE" });
+  check("project deletion returns 200", removeProject.status === 200);
+  check("project deletion removes the attached object", (await objects.head(secondKey)) === null);
+  check("deleted project is no longer readable (404)", (await api(`/api/projects/${projectA}`, userA.token)).status === 404);
 } catch (error) {
   check(`live check ran without an unexpected error (${(error as Error).message})`, false);
 } finally {

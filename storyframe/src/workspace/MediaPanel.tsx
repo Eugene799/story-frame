@@ -389,6 +389,10 @@ function MediaItem({
   const attached = scenes
     .map((scene, index) => ({ scene, index }))
     .filter(({ scene }) => scene.assetIds.includes(media.id));
+  // After a failed detach save the reference is gone but the stored document
+  // still lists the asset. Deleting then would leave a dangling asset id, so
+  // require the retry to save the removal first.
+  const canDelete = !(attached.length > 0 && media.referenceCount === 0);
 
   async function detach(sceneId: string, index: number) {
     setDetachingId(sceneId);
@@ -398,20 +402,23 @@ function MediaItem({
       const accessToken = await getAccessToken();
       const references = await listMediaReferences(accessToken, projectId, media.id);
       const reference = references.find((item) => item.refKind === "scene" && item.refId === sceneId);
-      if (!reference) {
-        throw new AiRequestError(
-          "MEDIA_REFERENCE_NOT_FOUND",
-          "This scene link is already gone on the server. Save the project to remove the asset id.",
-          404,
-        );
+      if (reference) {
+        try {
+          await deleteMediaReference(accessToken, projectId, media.id, reference.id);
+        } catch (cause) {
+          // A concurrent attempt may have released it first; the save below is
+          // still the step that makes the document match.
+          if (!(cause instanceof AiRequestError && cause.code === "MEDIA_REFERENCE_NOT_FOUND")) {
+            throw cause;
+          }
+        }
       }
-      await deleteMediaReference(accessToken, projectId, media.id, reference.id);
-      onReferenceReleased(media.id);
       const saved = await onDetachAsset(sceneId, media.id);
+      onReferenceReleased(media.id);
       setNotice(
         saved
           ? `Detached from scene ${index + 1} and saved. Delete asset is now available.`
-          : "The reference was released, but the project save did not complete. Resolve the save error and detach again.",
+          : "The reference was released, but the project save did not complete. Fix the save error and press Detach again; the missing reference will not block the retry.",
       );
     } catch (cause) {
       setError(toRequestError(cause).message);
@@ -450,7 +457,12 @@ function MediaItem({
               type="button"
               className="button-secondary button-small button-danger"
               onClick={() => setConfirming(true)}
-              disabled={deleting}
+              disabled={deleting || !canDelete}
+              title={
+                canDelete
+                  ? undefined
+                  : "The saved document still lists this asset. Press Detach again to save the removal before deleting."
+              }
             >
               Delete asset
             </button>

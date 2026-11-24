@@ -136,7 +136,9 @@ export function ProjectEditor({
           : scene,
       ),
     };
-    setDraft(next);
+    // The draft is replaced only by a successful save. A failed detach keeps
+    // the scene link visible, so pressing Detach again can finish the job even
+    // though the server reference is already gone.
     const ok = await saveDocument(next);
     if (ok) setNotice(`Media ${mediaId.slice(0, 8)} detached from the scene and saved.`);
     return ok;

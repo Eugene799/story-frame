@@ -488,17 +488,17 @@ editable project JSON and the script as plain text; video export is not offered 
 | Duration totals and target comparison | **PASS** | Script/storyboard totals update through duplicate, delete, and retime; asserted `0:30` → `0:50` → `0:35` against a `1:00` target |
 | Optimistic conflicts keep the draft and allow reload | **PASS** | Server `409 PROJECT_VERSION_CONFLICT`; UI test asserts the draft survives and **Load latest version** restores the stored brief |
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
-| Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; live media script is 25/25 |
+| Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 33/33 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 132/132; `verify:sql` 69/69; `verify:live-routes` exit 0; `verify:r2-live` 6/6; `verify:media-live` 25/25 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 134/134; `verify:sql` 69/69; `verify:live-routes` exit 0; `verify:r2-live` 6/6; `verify:media-live` 33/33 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
 | Real browser sign-in and upload against hosted Supabase/R2 | **PASS** | Disposable hosted user signed in through the browser; a 7.7 KiB PNG went initiate `201` → direct presigned `PUT 200` to the `story-frame` bucket → complete `200` → scene reference `201` → saved asset id → presigned playback `GET 200`, with the image decoding at 64 px and a one-reference count |
 | JSON/script download clicked in a browser | **PASS** | Both export buttons downloaded through the browser; the JSON parsed as a schema 2 document with the saved brief, scene ids, durations, asset id, and approvals, and the script text matched the stored narration and visual direction |
 | Hosted browser test cleanup | **PASS** | Reference release then media delete returned `200`, project delete returned the dashboard to 0 projects, the disposable user and every project/media/profile row were deleted, and the R2 object answered `The specified key does not exist` |
-| Project deletion removes uploaded objects | **PASS** | `tests/media.test.ts`: a completed upload exists in the fake bucket, project `DELETE` returns `200`, the object and media rows are gone, and the project reads `404`; a second case seeds 205 objects across two store pages and asserts all are removed |
-| Detach from a scene, then delete the asset | **PASS** | `tests/workspace.test.tsx`: Detach releases the reference, clears `scene.assetIds`, saves, and Delete asset then succeeds |
+| Project deletion removes uploaded objects | **PASS** | `tests/media.test.ts`: a completed upload exists in the fake bucket, project `DELETE` returns `200`, the object and media rows are gone, and the project reads `404`; a second case seeds 205 objects across two store pages and asserts all are removed. `verify:media-live` also checks this against hosted Supabase and the real bucket |
+| Detach from a scene, then delete the asset | **PASS** | `tests/workspace.test.tsx`: Detach releases the reference, clears `scene.assetIds`, saves, and Delete asset then succeeds; a retry after a failed save releases the already-missing reference and completes the save instead of dead-ending |
 
 The browser run on 2026-11-24 also exposed a double-counted media reference: the Media tab sent `sceneKey` at initiate
 and then attached the same scene as an explicit reference, so the store counted two references while the list showed
@@ -520,7 +520,7 @@ in Phase 4.
 | Retention and interrupted-upload cleanup | **PASS** | Clock-driven sweep tests |
 | Real R2 signing and bucket access | **PASS** | `npm run verify:r2-live`: presigned PUT/GET, signed HEAD/range/DELETE, 6/6 against the `story-frame` bucket |
 | Migration applied to the hosted Supabase project | **PASS** | Applied through the Management API; catalog checked (columns, table, RLS, policy, grants) |
-| Full upload through the app with a real signed-in session | **PASS** | `npm run verify:media-live`: two disposable hosted accounts, 25/25 checks, including a real bucket upload and playback |
+| Full upload through the app with a real signed-in session | **PASS** | `npm run verify:media-live`: two disposable hosted accounts, 33/33 checks, including a real bucket upload and playback |
 | Two-account isolation on the hosted project | **PASS** | Same check: RLS reads, refused browser write, and `404` for foreign routes |
 | Bucket CORS | **PASS** | Rule applied and probed (allowed preflight `204`, foreign origin `403`, presigned `GET` header) |
 | Upload from the UI in a browser | **UNVERIFIED** | There is still no media UI; the flow is API-only until the workspace is built |
@@ -641,6 +641,8 @@ Coverage includes:
   the bucket, leaving no orphaned upload behind even past one store page (205-row regression case)
 - Workspace detach: releases the scene reference, removes the asset id, saves the document, and then deletes the now
   unreferenced asset
+- Detach retry: when the reference release succeeds but the project save fails, the scene link stays visible and the
+  next Detach skips the already-missing reference and saves the removal
 - Missing key, unknown/disabled model, oversized prompt/body, provider auth failure, rate limiting, timeout,
   malformed/empty responses, success extraction, secret leakage, and duplicate submission
 - UI reply rendering, error display, and duplicate-submission suppression
@@ -697,12 +699,13 @@ the `story-frame` bucket: 6/6 checks passed.
 R2_BUCKET_NAME=<bucket> npm run verify:media-live
 ```
 
-This check is **opt-in** and creates two disposable Supabase users in the configured project, then exercises the real
-routes against the hosted schema and the real bucket: project creation, upload initiation, direct presigned upload,
-completion, presigned playback with byte comparison, reference attach/release, blocked then allowed deletion, RLS
-reads for both accounts, a refused browser write, and cross-owner `404`s. It deletes the users, projects, rows, and
-objects afterwards and checks that they are gone. It never prints keys, tokens, or signed URLs. Run on 2026-11-24:
-**25/25 checks passed**, and cleanup verified both users and all their media rows removed.
+This is the automated API-level media E2E check. It is **opt-in** because it needs the hosted project and the real bucket, and
+it creates two disposable Supabase users, then exercises the real routes: project creation, upload initiation, direct
+presigned upload, completion, presigned playback with byte comparison, reference attach/release, blocked then allowed
+deletion, RLS reads for both accounts, a refused browser write, cross-owner `404`s, and project deletion removing the
+objects that are still attached. It deletes the users, projects, rows, and objects afterwards and checks that they are
+gone. It never prints keys, tokens, or signed URLs. Cleanup covers the project even if the run fails midway. Run
+on 2026-11-24: **33/33 checks passed**, including project deletion removing a still-attached object.
 
 ## Security limitations
 

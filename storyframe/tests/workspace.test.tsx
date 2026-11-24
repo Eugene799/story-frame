@@ -29,6 +29,7 @@ interface FakeBackend {
   revisions: Map<string, ProjectRevisionSummary[]>;
   media: Map<string, MediaRecord[]>;
   references: Map<string, { id: string; refKind: "scene"; refId: string }[]>;
+  saveFailures: number;
   uploads: { url: string; headers: Record<string, string> }[];
   requests: { method: string; path: string; body: unknown }[];
 }
@@ -39,6 +40,7 @@ function makeBackend(project?: ProjectRecord): FakeBackend {
     revisions: new Map(project ? [[project.id, [{ revision: 1, title: project.title, schemaVersion: 2, createdAt: NOW }]]] : []),
     media: new Map(project ? [[project.id, []]] : []),
     references: new Map(),
+    saveFailures: 0,
     uploads: [],
     requests: [],
   };
@@ -105,6 +107,13 @@ function installBackend(backend: FakeBackend) {
       if (method === "GET") return jsonResponse({ ok: true, project });
       if (method === "PUT") {
         const update = body as { title: string; document: ProjectDocumentV2; version: number };
+        if (backend.saveFailures > 0) {
+          backend.saveFailures -= 1;
+          return jsonResponse(
+            { ok: false, error: { code: "PROJECTS_UNAVAILABLE", message: "The project store is unreachable." } },
+            503,
+          );
+        }
         if (update.version !== project.version) {
           return jsonResponse(
             {
@@ -533,6 +542,44 @@ describe("workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
     await waitFor(() => expect(backend.media.get(PROJECT_ID)).toHaveLength(0));
     expect(screen.queryByRole("button", { name: "Detach media from scene 1" })).not.toBeInTheDocument();
+  });
+
+  it("retries detach after the reference was released but the save failed", async () => {
+    const project = projectFixture();
+    const backend = makeBackend(project);
+    installBackend(backend);
+    renderWorkspace();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open The Late Letter" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Media" }));
+    await screen.findByText(/No media yet/i);
+
+    const file = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], "frame.png", {
+      type: "image/png",
+    });
+    fireEvent.change(screen.getByLabelText(/Media file/), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Upload media" }));
+    await screen.findByText(/attached to "INT\. TRAIN CAR - NIGHT"/i);
+
+    // The release succeeds, then the project save fails.
+    backend.saveFailures = 1;
+    fireEvent.click(screen.getByRole("button", { name: "Detach media from scene 1" }));
+    expect(await screen.findByText(/reference was released, but the project save did not complete/i)).toBeInTheDocument();
+    expect(backend.projects.get(PROJECT_ID)?.document.scenes[0].assetIds).toEqual(["media-1"]);
+    expect(backend.references.get("media-1")).toEqual([]);
+    expect(screen.getByRole("button", { name: "Delete asset" })).toBeDisabled();
+
+    // The scene link is still shown, and the missing reference does not block the retry.
+    const retry = await screen.findByRole("button", { name: "Detach media from scene 1" });
+    fireEvent.click(retry);
+    expect(await screen.findByText(/Detached from scene 1 and saved/i)).toBeInTheDocument();
+    expect(backend.projects.get(PROJECT_ID)?.document.scenes[0].assetIds).toEqual([]);
+    expect(backend.references.get("media-1")).toEqual([]);
+    expect(screen.getByRole("button", { name: "Delete asset" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete asset" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
+    await waitFor(() => expect(backend.media.get(PROJECT_ID)).toHaveLength(0));
   });
 
   it("keeps the draft and offers a reload when a save conflicts", async () => {
