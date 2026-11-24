@@ -540,6 +540,8 @@ export async function startFakeSupabase(
                 if (String(value ?? "") !== raw.slice(3)) return false;
               } else if (raw.startsWith("lt.")) {
                 if (value === null || value === undefined || String(value) >= raw.slice(3)) return false;
+              } else if (raw.startsWith("gt.")) {
+                if (value === null || value === undefined || String(value) <= raw.slice(3)) return false;
               } else if (raw.startsWith("neq.")) {
                 if (String(value ?? "") === raw.slice(4)) return false;
               } else if (raw.startsWith("in.(") && raw.endsWith(")")) {
@@ -680,7 +682,12 @@ export async function startFakeSupabase(
             if (order === "position.asc") {
               rows = rows.slice().sort((a, b) => Number(a.position) - Number(b.position));
             } else if (order === "id.asc") {
-              rows = rows.slice().sort((a, b) => String(a.id).localeCompare(String(b.id)));
+              // Match the lexicographic order used by the gt. cursor, not locale collation.
+              rows = rows.slice().sort((a, b) => {
+                const left = String(a.id);
+                const right = String(b.id);
+                return left < right ? -1 : left > right ? 1 : 0;
+              });
             }
             const rawLimit = Number(url.searchParams.get("limit") ?? "100");
             const limit = Number.isFinite(rawLimit) ? Math.max(0, Math.min(200, Math.floor(rawLimit))) : 100;

@@ -490,7 +490,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 136/136; `verify:sql` 69/69; `verify:live-routes` exit 0; `verify:r2-live` 6/6; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 137/137; `verify:sql` 69/69; `verify:live-routes` exit 0; `verify:r2-live` 6/6; `verify:media-live` 37/37 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -500,7 +500,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Project deletion removes uploaded objects | **PASS** | `tests/media.test.ts`: a completed upload exists in the fake bucket, project `DELETE` returns `200`, the object and media rows are gone, and the project reads `404`; a second case seeds 205 objects across two store pages and asserts all are removed. `verify:media-live` also checks this against hosted Supabase and the real bucket |
 | Detach from a scene, then delete the asset | **PASS** | `tests/workspace.test.tsx`: Detach releases the reference, clears `scene.assetIds`, saves, and Delete asset then succeeds; a retry after a failed save releases the already-missing reference and completes the save instead of dead-ending |
 | A document-listed asset cannot be deleted | **PASS** | `tests/media.test.ts`: with no reference but the saved scene still listing the asset id, `DELETE` returns `409 MEDIA_ASSET_IN_DOCUMENT` and keeps the object and row; removing the id lets the same delete return `200`. `verify:media-live` checks the same guard against hosted Supabase and real R2 |
-| Retention spares a document-listed asset | **PASS** | `tests/media.test.ts`: an unreferenced ready asset past retention survives two sweeps while a saved scene lists it, then is removed once the id is gone |
+| Retention spares a document-listed asset | **PASS** | `tests/media.test.ts`: an unreferenced ready asset past retention survives two sweeps while a saved scene lists it, then is removed once the id is gone; 30 protected rows (more than one 25-row batch) do not stop a later expired asset from being cleaned |
 
 The browser run on 2026-11-24 also exposed a double-counted media reference: the Media tab sent `sceneKey` at initiate
 and then attached the same scene as an explicit reference, so the store counted two references while the list showed
@@ -519,7 +519,7 @@ in Phase 4.
 | Actual type validation | **PASS** | Magic-byte detection test rejects an MP4 declared as PNG |
 | Authorized playback and another account refused | **PASS** | Playback URL returns the exact bytes; cross-owner read/complete/delete are `404` |
 | Safe deletion and shared references | **PASS** | Shared asset blocked while referenced, remains playable after one reference is released |
-| Retention and interrupted-upload cleanup | **PASS** | Clock-driven sweep tests, including a document-listed asset surviving retention until its saved scene id is removed |
+| Retention and interrupted-upload cleanup | **PASS** | Clock-driven sweep tests, including a document-listed asset surviving retention until its saved scene id is removed and keyset paging past a full batch of protected rows |
 | Real R2 signing and bucket access | **PASS** | `npm run verify:r2-live`: presigned PUT/GET, signed HEAD/range/DELETE, 6/6 against the `story-frame` bucket |
 | Migration applied to the hosted Supabase project | **PASS** | Applied through the Management API; catalog checked (columns, table, RLS, policy, grants) |
 | Full upload through the app with a real signed-in session | **PASS** | `npm run verify:media-live`: two disposable hosted accounts, 37/37 checks, including a real bucket upload, playback, the document-delete guard, and project-deletion object cleanup |
@@ -646,7 +646,7 @@ Coverage includes:
 - Detach retry: when the reference release succeeds but the project save fails, the scene link stays visible and the
   next Detach skips the already-missing reference and saves the removal
 - Retention: a ready asset past its unreferenced window is kept while a saved scene lists it, and removed on the next
-  sweep after the id is removed
+  sweep after the id is removed; the sweep pages by id past protected rows, so a full batch cannot starve other assets
 - Missing key, unknown/disabled model, oversized prompt/body, provider auth failure, rate limiting, timeout,
   malformed/empty responses, success extraction, secret leakage, and duplicate submission
 - UI reply rendering, error display, and duplicate-submission suppression

@@ -449,6 +449,62 @@ describe("private media storage", () => {
     }
   });
 
+  it("pages past more protected rows than one sweep batch", async () => {
+    let clock = Date.now();
+    const app = await startTestServer({ now: () => clock, env: { MEDIA_UNREFERENCED_RETENTION_MS: "0" } });
+    try {
+      const projectId = await createProject(app.url);
+      const projectRow = app.supabase.projects.find((row) => row.id === projectId);
+      const document = projectRow?.document as { scenes: { id: string; assetIds: string[] }[] };
+      const protectedIds = Array.from({ length: 30 }, (_, index) => `guard-${String(index).padStart(3, "0")}`);
+      const staleId = "stale-999";
+      const createdAt = new Date(clock - 60_000).toISOString();
+
+      const seed = (id: string) => {
+        const objectKey = `media/${USER_A.id}/${id}`;
+        app.supabase.media.push({
+          id,
+          owner_id: USER_A.id,
+          project_id: projectId,
+          object_key: objectKey,
+          scene_key: null,
+          kind: "image",
+          status: "ready",
+          content_type: "image/png",
+          byte_size: PNG.length,
+          upload_expires_at: null,
+          ready_at: createdAt,
+          deleted_at: null,
+          created_at: createdAt,
+        });
+        app.r2.objects.set(objectKey, { body: PNG, contentType: "image/png" });
+      };
+      for (const id of [...protectedIds, staleId]) seed(id);
+
+      // Two scenes hold 30 saved ids; the stale id sorts after all of them, so
+      // it is only reachable after paging past a full protected batch.
+      const scene = document.scenes[0];
+      document.scenes = [
+        { ...scene, id: "scene-1", assetIds: protectedIds.slice(0, 15) },
+        { ...scene, id: "scene-2", assetIds: protectedIds.slice(15) },
+      ];
+
+      clock += 1000;
+      const listed = await apiRequest(app.url, `/api/projects/${projectId}/media`);
+      const media = ((await listed.json()) as { media: MediaRecord[] }).media;
+
+      expect(media).toHaveLength(30);
+      expect(media.some((row) => row.id === staleId)).toBe(false);
+      expect(app.r2.objects.size).toBe(30);
+      expect(app.r2.objects.has(`media/${USER_A.id}/${staleId}`)).toBe(false);
+      for (const id of protectedIds) {
+        expect(app.r2.objects.has(`media/${USER_A.id}/${id}`)).toBe(true);
+      }
+    } finally {
+      await app.close();
+    }
+  });
+
   it("removes every uploaded object across more than one store page", async () => {
     const app = await startTestServer();
     try {

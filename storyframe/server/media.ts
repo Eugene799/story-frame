@@ -309,7 +309,8 @@ export interface MediaStore {
   usedBytes(ownerId: string): Promise<number>;
   stalePending(nowIso: string, limit: number): Promise<StoredObjectRow[]>;
   expiredDeleted(cutoffIso: string, limit: number): Promise<StoredObjectRow[]>;
-  unreferencedReady(cutoffIso: string, limit: number): Promise<StoredObjectRow[]>;
+  /** Ready assets older than the cutoff, ordered by id; afterId pages the scan. */
+  unreferencedReady(cutoffIso: string, limit: number, afterId?: string): Promise<StoredObjectRow[]>;
 }
 
 // object_key stays server-side: it is selected for storage operations but omitted
@@ -745,18 +746,19 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
       return found.map(toStoredObjectRow);
     },
 
-    async unreferencedReady(cutoffIso, limit) {
+    async unreferencedReady(cutoffIso, limit, afterId) {
+      const query: Record<string, string> = {
+        select: STORED_OBJECT_COLUMNS,
+        status: "eq.ready",
+        created_at: `lt.${cutoffIso}`,
+        order: "id.asc",
+        limit: String(limit),
+      };
+      // Keyset paging: protected rows stay in the table, so an offset would
+      // shift and either skip or repeat candidates between pages.
+      if (afterId !== undefined) query.id = `gt.${afterId}`;
       const found = rows(
-        await request(
-          tableUrl("media_metadata", {
-            select: STORED_OBJECT_COLUMNS,
-            status: "eq.ready",
-            created_at: `lt.${cutoffIso}`,
-            limit: String(limit),
-          }),
-          { headers: readHeaders },
-          "the unreferenced media list",
-        ),
+        await request(tableUrl("media_metadata", query), { headers: readHeaders }, "the unreferenced media list"),
       );
       return found.map(toStoredObjectRow);
     },
@@ -811,19 +813,9 @@ export async function sweepMedia(options: SweepOptions): Promise<void> {
   }
 
   const unreferencedCutoff = new Date(now() - options.limits.unreferencedRetentionMs).toISOString();
-  const unreferenced = await options.store.unreferencedReady(unreferencedCutoff, options.limits.sweepBatch);
-  if (unreferenced.length === 0) return;
-
-  // Reference counts are owner-scoped, so group the batch by owner.
-  const byOwner = new Map<string, StoredObjectRow[]>();
-  for (const row of unreferenced) {
-    const group = byOwner.get(row.ownerId) ?? [];
-    group.push(row);
-    byOwner.set(row.ownerId, group);
-  }
 
   // A saved scene asset id is a link like a reference, even when no reference
-  // row exists. Cache one document read per project for the batch; null means
+  // row exists. Cache one document read per project for the pass; null means
   // the read failed, so that project's assets are skipped until the next pass.
   const documentIds = new Map<string, Set<string> | null>();
   async function savedAssetIds(row: StoredObjectRow): Promise<Set<string> | null> {
@@ -850,18 +842,46 @@ export async function sweepMedia(options: SweepOptions): Promise<void> {
     }
   }
 
-  for (const [ownerId, rows] of byOwner) {
-    const counts = await options.store.referenceCounts(
-      ownerId,
-      rows.map((row) => row.id),
+  // Scan past protected rows instead of stopping at one page: a project can
+  // have more document-listed assets than a batch, and those must not starve
+  // other expired assets. Each page advances by id, and the pass stops after
+  // one batch of removals or once the candidate list is exhausted.
+  let afterId: string | null = null;
+  let removed = 0;
+  while (removed < options.limits.sweepBatch) {
+    const page = await options.store.unreferencedReady(
+      unreferencedCutoff,
+      options.limits.sweepBatch,
+      afterId ?? undefined,
     );
-    for (const row of rows) {
-      if (row.sceneKey !== null) continue;
-      if ((counts.get(row.id) ?? 0) > 0) continue;
-      const listed = await savedAssetIds(row);
-      if (listed === null || listed.has(row.id)) continue;
-      if (!(await removeObject(row.objectKey))) continue;
-      await options.store.removeRow(row.id).catch(() => log.error("[media] MEDIA_ROW_DELETE_FAILED"));
+    if (page.length === 0) break;
+
+    // Reference counts are owner-scoped, so group each page by owner.
+    const byOwner = new Map<string, StoredObjectRow[]>();
+    for (const row of page) {
+      afterId = row.id;
+      const group = byOwner.get(row.ownerId) ?? [];
+      group.push(row);
+      byOwner.set(row.ownerId, group);
     }
+
+    for (const [ownerId, rows] of byOwner) {
+      const counts = await options.store.referenceCounts(
+        ownerId,
+        rows.map((row) => row.id),
+      );
+      for (const row of rows) {
+        if (removed >= options.limits.sweepBatch) break;
+        if (row.sceneKey !== null) continue;
+        if ((counts.get(row.id) ?? 0) > 0) continue;
+        const listed = await savedAssetIds(row);
+        if (listed === null || listed.has(row.id)) continue;
+        if (!(await removeObject(row.objectKey))) continue;
+        await options.store.removeRow(row.id).catch(() => log.error("[media] MEDIA_ROW_DELETE_FAILED"));
+        removed += 1;
+      }
+    }
+
+    if (page.length < options.limits.sweepBatch) break;
   }
 }
