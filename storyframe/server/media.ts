@@ -244,6 +244,13 @@ export function mediaObjectKey(ownerId: string, mediaId: string): string {
   return `media/${ownerId}/${mediaId}`;
 }
 
+const MEDIA_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Media ids are UUIDs; rejecting other shapes avoids a pointless store query. */
+export function isMediaId(value: string): boolean {
+  return MEDIA_ID_PATTERN.test(value);
+}
+
 export function newMediaId(): string {
   return randomUUID();
 }

@@ -402,7 +402,10 @@ describe("private media storage", () => {
     const app = await startTestServer();
     try {
       const projectId = await createProject(app.url);
-      const assetIds = Array.from({ length: 101 }, (_, index) => `bulk-${String(index).padStart(3, "0")}`);
+      const assetIds = Array.from(
+        { length: 101 },
+        (_, index) => `11111111-1111-4111-8111-${String(index).padStart(12, "0")}`,
+      );
       for (const id of assetIds) {
         app.supabase.media.push({ id, owner_id: USER_A.id, project_id: projectId, status: "ready" });
       }
@@ -430,7 +433,7 @@ describe("private media storage", () => {
       const accepted = await save(assetIds, project.version);
       expect(accepted.status).toBe(200);
 
-      const broken = [...assetIds.slice(0, 100), "bulk-missing"];
+      const broken = [...assetIds.slice(0, 100), "11111111-1111-4111-8111-999999999999"];
       const rejected = await save(broken, project.version + 1);
       expect(rejected.status).toBe(422);
       expect(await rejected.json()).toMatchObject({ ok: false, error: { code: "MEDIA_ASSET_INVALID" } });
@@ -441,6 +444,42 @@ describe("private media storage", () => {
       }).project;
       expect(reread.version).toBe(project.version + 1);
       expect(reread.document.scenes.flatMap((item) => item.assetIds)).toEqual(assetIds);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("refuses a malformed scene asset id before any media lookup", async () => {
+    const app = await startTestServer();
+    try {
+      const projectId = await createProject(app.url);
+      const read = await apiRequest(app.url, `/api/projects/${projectId}`);
+      const project = ((await read.json()) as {
+        project: { title: string; version: number; document: { scenes: Record<string, unknown>[] } };
+      }).project;
+      const save = (assetId: string) =>
+        apiRequest(app.url, `/api/projects/${projectId}`, {
+          method: "PUT",
+          body: JSON.stringify({
+            title: project.title,
+            document: {
+              ...project.document,
+              scenes: [{ ...project.document.scenes[0], assetIds: [assetId] }],
+            },
+            version: project.version,
+          }),
+        });
+
+      const rejected = await save("not-a-uuid");
+      expect(rejected.status).toBe(422);
+      expect(await rejected.json()).toMatchObject({ ok: false, error: { code: "MEDIA_ASSET_INVALID" } });
+
+      const after = await apiRequest(app.url, `/api/projects/${projectId}`);
+      const reread = ((await after.json()) as {
+        project: { version: number; document: { scenes: { assetIds: string[] }[] } };
+      }).project;
+      expect(reread.version).toBe(project.version);
+      expect(reread.document.scenes[0].assetIds).toEqual([]);
     } finally {
       await app.close();
     }

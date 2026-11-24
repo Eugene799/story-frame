@@ -45,6 +45,7 @@ import {
   MEDIA_NOT_FOUND_MESSAGE,
   createSupabaseMediaStore,
   detectMediaType,
+  isMediaId,
   limitForKind,
   mediaObjectKey,
   mediaTypeMatches,
@@ -658,6 +659,10 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       // Refuse a save that would store an id with no ready media behind it, so
       // an API write cannot create a dangling reference.
       const assetIds = [...new Set(update.document.scenes.flatMap((scene) => scene.assetIds))];
+      const malformed = assetIds.find((assetId) => !isMediaId(assetId));
+      if (malformed) {
+        throw new HttpError(422, "MEDIA_ASSET_INVALID", `Scene asset id ${malformed} is not a valid media id.`);
+      }
       if (assetIds.length > 0) {
         const ready = await requireMediaStore().readyAssetIds(user.id, projectId, assetIds);
         const unknown = assetIds.find((assetId) => !ready.has(assetId));
