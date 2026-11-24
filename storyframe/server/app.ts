@@ -522,7 +522,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     if (now() - lastMediaSweep < config.media.sweepIntervalMs) return;
     lastMediaSweep = now();
     try {
-      await sweepMedia({ store, objects, limits: config.media, now, logger: log });
+      await sweepMedia({ store, objects, projects: requireProjects(), limits: config.media, now, logger: log });
     } catch {
       // Cleanup is opportunistic; it must never fail the request that triggered it.
       log.error("[media] MEDIA_SWEEP_FAILED");

@@ -308,8 +308,8 @@ try {
     listed?.media.find((row) => row.id === mediaA)?.status === "deleted",
   );
 
-  // Project deletion must clean up objects that are still attached, not just
-  // rows. This is the lifecycle step a browser delete leaves behind.
+  // Project deletion must clean up a remaining object, not just rows, even
+  // after its scene id was removed.
   const secondInitiate = await api(`/api/projects/${projectA}/media`, userA.token, {
     method: "POST",
     body: JSON.stringify({ kind: "image", contentType: "image/png", byteSize: PNG.length }),
@@ -332,17 +332,67 @@ try {
     { method: "POST" },
   );
   check("second upload completes", secondComplete.status === 200);
-  const secondAttach = await api(
-    `/api/projects/${projectA}/media/${secondTicket.media.id}/references`,
-    userA.token,
-    { method: "POST", body: JSON.stringify({ refKind: "scene", refId: "scene-1" }) },
-  );
-  check("second asset reference is attached", secondAttach.status === 201);
   check("second object is present before project deletion", (await objects.head(secondKey))?.byteSize === PNG.length);
+
+  // A saved scene asset id is a link even with no reference row. The delete
+  // must refuse it rather than leave the stored document dangling.
+  const projectRead = await api(`/api/projects/${projectA}`, userA.token);
+  check("project reads back for the document guard", projectRead.status === 200);
+  const projectBody = (await projectRead.json()) as {
+    project: {
+      title: string;
+      version: number;
+      document: { schemaVersion: number; summary: string; brief: unknown; scenes: unknown[] };
+    };
+  };
+  const guardScene = {
+    id: "scene-1",
+    heading: "Media guard",
+    body: "The saved document still lists this asset.",
+    visualDirection: "",
+    assetIds: [secondTicket.media.id],
+    onScreenText: "",
+    durationSeconds: 5,
+    approved: false,
+    approvedFingerprint: null,
+    locks: { narration: false, visualDirection: false, onScreenText: false, duration: false },
+  };
+  const saveWithAsset = await api(`/api/projects/${projectA}`, userA.token, {
+    method: "PUT",
+    body: JSON.stringify({
+      title: projectBody.project.title,
+      document: { ...projectBody.project.document, scenes: [guardScene] },
+      version: projectBody.project.version,
+    }),
+  });
+  check("document saved with the second asset id", saveWithAsset.status === 200);
+
+  const guardedDelete = await api(`/api/projects/${projectA}/media/${secondTicket.media.id}`, userA.token, {
+    method: "DELETE",
+  });
+  const guardedBody = (await guardedDelete.json()) as { error?: { code?: string } };
+  check(
+    "deleting a document-listed asset is refused (409)",
+    guardedDelete.status === 409 && guardedBody.error?.code === "MEDIA_ASSET_IN_DOCUMENT",
+  );
+  check("refused delete leaves the object in the bucket", (await objects.head(secondKey))?.byteSize === PNG.length);
+
+  const clearAsset = await api(`/api/projects/${projectA}`, userA.token, {
+    method: "PUT",
+    body: JSON.stringify({
+      title: projectBody.project.title,
+      document: {
+        ...projectBody.project.document,
+        scenes: [{ ...guardScene, assetIds: [] }],
+      },
+      version: projectBody.project.version + 1,
+    }),
+  });
+  check("document saved without the second asset id", clearAsset.status === 200);
 
   const removeProject = await api(`/api/projects/${projectA}`, userA.token, { method: "DELETE" });
   check("project deletion returns 200", removeProject.status === 200);
-  check("project deletion removes the attached object", (await objects.head(secondKey)) === null);
+  check("project deletion removes the remaining object", (await objects.head(secondKey)) === null);
   check("deleted project is no longer readable (404)", (await api(`/api/projects/${projectA}`, userA.token)).status === 404);
 } catch (error) {
   check(`live check ran without an unexpected error (${(error as Error).message})`, false);

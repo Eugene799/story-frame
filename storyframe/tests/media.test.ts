@@ -411,6 +411,44 @@ describe("private media storage", () => {
     }
   });
 
+  it("keeps a document-listed asset through retention until the document drops it", async () => {
+    let clock = Date.now();
+    const app = await startTestServer({ now: () => clock, env: { MEDIA_UNREFERENCED_RETENTION_MS: "0" } });
+    try {
+      const projectId = await createProject(app.url);
+      const ticket = await initiateUpload(app.url, projectId, {
+        kind: "image",
+        contentType: "image/png",
+        byteSize: PNG.length,
+      });
+      await putObject(ticket, PNG);
+      expect((await complete(app.url, projectId, ticket.media.id)).status).toBe(200);
+
+      const projectRow = app.supabase.projects.find((row) => row.id === projectId);
+      const document = projectRow?.document as { scenes: { assetIds: string[] }[] };
+      document.scenes[0].assetIds.push(ticket.media.id);
+
+      // The asset has no reference and is past retention, but the saved scene
+      // still lists it, so two sweeps must leave it alone.
+      clock += 1000;
+      const first = await apiRequest(app.url, `/api/projects/${projectId}/media`);
+      expect(((await first.json()) as { media: MediaRecord[] }).media).toHaveLength(1);
+      clock += 1000;
+      const second = await apiRequest(app.url, `/api/projects/${projectId}/media`);
+      expect(((await second.json()) as { media: MediaRecord[] }).media).toHaveLength(1);
+      expect(app.r2.objects.size).toBe(1);
+
+      document.scenes[0].assetIds = [];
+      clock += 1000;
+      const third = await apiRequest(app.url, `/api/projects/${projectId}/media`);
+      expect(((await third.json()) as { media: MediaRecord[] }).media).toHaveLength(0);
+      expect(app.r2.objects.size).toBe(0);
+      expect(app.supabase.media).toHaveLength(0);
+    } finally {
+      await app.close();
+    }
+  });
+
   it("removes every uploaded object across more than one store page", async () => {
     const app = await startTestServer();
     try {

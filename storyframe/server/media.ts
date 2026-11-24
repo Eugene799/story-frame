@@ -253,8 +253,14 @@ export function newMediaId(): string {
 export interface StoredObjectRow {
   id: string;
   ownerId: string;
+  projectId: string;
   objectKey: string;
   sceneKey: string | null;
+}
+
+/** The saved-document lookup the retention sweep needs before deleting an asset. */
+export interface ProjectDocumentLookup {
+  get(ownerId: string, projectId: string): Promise<{ document: { scenes: { assetIds: string[] }[] } }>;
 }
 
 export interface StoredMedia {
@@ -311,7 +317,7 @@ export interface MediaStore {
 const MEDIA_COLUMNS =
   "id,kind,status,scene_key,content_type,byte_size,object_key,upload_expires_at,ready_at,deleted_at,created_at";
 const REFERENCE_COLUMNS = "id,media_id,ref_kind,ref_id,created_at";
-const STORED_OBJECT_COLUMNS = "id,owner_id,object_key,scene_key";
+const STORED_OBJECT_COLUMNS = "id,owner_id,project_id,object_key,scene_key";
 
 function corrupt(field: string): never {
   throw new ApiError(503, "MEDIA_STORE_CORRUPT", `The media store returned a malformed row (${field}).`);
@@ -354,6 +360,7 @@ function toStoredObjectRow(row: Record<string, unknown>): StoredObjectRow {
   return {
     id: rowText(row, "id"),
     ownerId: rowText(row, "owner_id"),
+    projectId: rowText(row, "project_id"),
     objectKey: rowText(row, "object_key"),
     sceneKey: rowNullableText(row, "scene_key"),
   };
@@ -761,6 +768,8 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
 export interface SweepOptions {
   store: MediaStore;
   objects: R2Client;
+  /** Saved documents are checked so an asset they list is never retained away. */
+  projects: ProjectDocumentLookup;
   limits: MediaLimits;
   now?: () => number;
   logger?: { error(message: string): void };
@@ -813,6 +822,34 @@ export async function sweepMedia(options: SweepOptions): Promise<void> {
     byOwner.set(row.ownerId, group);
   }
 
+  // A saved scene asset id is a link like a reference, even when no reference
+  // row exists. Cache one document read per project for the batch; null means
+  // the read failed, so that project's assets are skipped until the next pass.
+  const documentIds = new Map<string, Set<string> | null>();
+  async function savedAssetIds(row: StoredObjectRow): Promise<Set<string> | null> {
+    const key = `${row.ownerId}\n${row.projectId}`;
+    if (documentIds.has(key)) return documentIds.get(key) ?? null;
+    try {
+      const project = await options.projects.get(row.ownerId, row.projectId);
+      const ids = new Set<string>();
+      for (const scene of project.document.scenes) {
+        for (const assetId of scene.assetIds) ids.add(assetId);
+      }
+      documentIds.set(key, ids);
+      return ids;
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) {
+        // The project is already gone, so no saved document can still list it.
+        const empty = new Set<string>();
+        documentIds.set(key, empty);
+        return empty;
+      }
+      log.error("[media] MEDIA_DOCUMENT_CHECK_FAILED");
+      documentIds.set(key, null);
+      return null;
+    }
+  }
+
   for (const [ownerId, rows] of byOwner) {
     const counts = await options.store.referenceCounts(
       ownerId,
@@ -821,6 +858,8 @@ export async function sweepMedia(options: SweepOptions): Promise<void> {
     for (const row of rows) {
       if (row.sceneKey !== null) continue;
       if ((counts.get(row.id) ?? 0) > 0) continue;
+      const listed = await savedAssetIds(row);
+      if (listed === null || listed.has(row.id)) continue;
       if (!(await removeObject(row.objectKey))) continue;
       await options.store.removeRow(row.id).catch(() => log.error("[media] MEDIA_ROW_DELETE_FAILED"));
     }
