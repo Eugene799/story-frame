@@ -685,7 +685,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
 
     // Same ownership rule as every other project route: a foreign project id is
     // answered exactly like a missing one, before any media row is read.
-    await requireProjects().get(user.id, projectId);
+    const project = await requireProjects().get(user.id, projectId);
     await maybeSweepMedia(store, objects);
 
     if (rest.length === 0) {
@@ -764,6 +764,16 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         if (row.status === "deleted") {
           sendJson(response, 200, { ok: true, deletedId: mediaId });
           return;
+        }
+        // References and document asset ids are separate links. A saved scene
+        // can still list the asset after its reference is gone (for example a
+        // release followed by a failed project save), so refuse to strand it.
+        if (project.document.scenes.some((scene) => scene.assetIds.includes(mediaId))) {
+          throw new HttpError(
+            409,
+            "MEDIA_ASSET_IN_DOCUMENT",
+            "This asset is still listed in the saved project document. Detach it and save the project before deleting it.",
+          );
         }
         // A shared asset is removed only after its last reference is released.
         const references = row.referenceCount + (row.sceneKey === null ? 0 : 1);

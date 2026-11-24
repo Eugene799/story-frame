@@ -389,7 +389,7 @@ queueing, retries, and rendering, and is refreshed for a retry rather than persi
 | `POST /api/projects/:id/media/:mediaId/complete` | Verify the stored object and mark the media `ready`. |
 | `GET /api/projects/:id/media/:mediaId/url` | Presigned playback URL for ready media. |
 | `GET /api/projects/:id/media/:mediaId` | One media row plus its references. |
-| `DELETE /api/projects/:id/media/:mediaId` | Delete an unreferenced asset (`409 MEDIA_IN_USE` otherwise). |
+| `DELETE /api/projects/:id/media/:mediaId` | Delete an asset with no references and no saved scene asset id (`409 MEDIA_IN_USE` / `409 MEDIA_ASSET_IN_DOCUMENT` otherwise). |
 | `GET`/`POST /api/projects/:id/media/:mediaId/references` | List or attach a reference (`scene`, `render`, `document`, `other`). Attaching is idempotent. |
 | `DELETE /api/projects/:id/media/:mediaId/references/:referenceId` | Release one reference. |
 
@@ -490,7 +490,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 33/33 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 134/134; `verify:sql` 69/69; `verify:live-routes` exit 0; `verify:r2-live` 6/6; `verify:media-live` 33/33 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 135/135; `verify:sql` 69/69; `verify:live-routes` exit 0; `verify:r2-live` 6/6; `verify:media-live` 33/33 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -499,6 +499,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Hosted browser test cleanup | **PASS** | Reference release then media delete returned `200`, project delete returned the dashboard to 0 projects, the disposable user and every project/media/profile row were deleted, and the R2 object answered `The specified key does not exist` |
 | Project deletion removes uploaded objects | **PASS** | `tests/media.test.ts`: a completed upload exists in the fake bucket, project `DELETE` returns `200`, the object and media rows are gone, and the project reads `404`; a second case seeds 205 objects across two store pages and asserts all are removed. `verify:media-live` also checks this against hosted Supabase and the real bucket |
 | Detach from a scene, then delete the asset | **PASS** | `tests/workspace.test.tsx`: Detach releases the reference, clears `scene.assetIds`, saves, and Delete asset then succeeds; a retry after a failed save releases the already-missing reference and completes the save instead of dead-ending |
+| A document-listed asset cannot be deleted | **PASS** | `tests/media.test.ts`: with no reference but the saved scene still listing the asset id, `DELETE` returns `409 MEDIA_ASSET_IN_DOCUMENT` and keeps the object and row; removing the id lets the same delete return `200` |
 
 The browser run on 2026-11-24 also exposed a double-counted media reference: the Media tab sent `sceneKey` at initiate
 and then attached the same scene as an explicit reference, so the store counted two references while the list showed

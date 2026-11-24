@@ -303,6 +303,43 @@ describe("private media storage", () => {
     }
   });
 
+  it("refuses to delete an asset that the saved project document still lists", async () => {
+    const app = await startTestServer();
+    try {
+      const projectId = await createProject(app.url);
+      const ticket = await initiateUpload(app.url, projectId, {
+        kind: "image",
+        contentType: "image/png",
+        byteSize: PNG.length,
+      });
+      await putObject(ticket, PNG);
+      expect((await complete(app.url, projectId, ticket.media.id)).status).toBe(200);
+
+      // No reference exists, but the saved scene still lists the asset: the state
+      // a released reference and a failed project save leaves behind.
+      const projectRow = app.supabase.projects.find((row) => row.id === projectId);
+      expect(projectRow).toBeDefined();
+      const document = projectRow?.document as { scenes: { assetIds: string[] }[] };
+      document.scenes[0].assetIds.push(ticket.media.id);
+
+      const base = `/api/projects/${projectId}/media/${ticket.media.id}`;
+      const blocked = await apiRequest(app.url, base, { method: "DELETE" });
+      expect(blocked.status).toBe(409);
+      expect(await blocked.json()).toMatchObject({ ok: false, error: { code: "MEDIA_ASSET_IN_DOCUMENT" } });
+      expect(app.r2.objects.size).toBe(1);
+      expect(app.supabase.media[0].status).toBe("ready");
+
+      // Removing the id from the document lets the same delete through.
+      document.scenes[0].assetIds = [];
+      const deleted = await apiRequest(app.url, base, { method: "DELETE" });
+      expect(deleted.status).toBe(200);
+      expect(app.r2.objects.size).toBe(0);
+      expect(app.supabase.media[0].status).toBe("deleted");
+    } finally {
+      await app.close();
+    }
+  });
+
   it("reports a missing object and a pending asset clearly", async () => {
     const app = await startTestServer();
     try {
