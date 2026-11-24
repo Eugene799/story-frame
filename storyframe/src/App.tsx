@@ -3,18 +3,21 @@ import type { Session, SupabaseClient } from "@supabase/supabase-js";
 import { getAccessToken } from "./auth";
 import { ConnectionTestScreen } from "./components/ConnectionTestScreen";
 import { SignInScreen } from "./components/SignInScreen";
-import { supabase } from "./supabase";
+import { supabase, supabaseConfigError } from "./supabase";
 
 export interface AppProps {
   client?: SupabaseClient | null;
+  /** Why the browser client is unavailable, when the VITE_ variables are set but wrong. */
+  configError?: string | null;
 }
 
-export default function App({ client = supabase }: AppProps = {}) {
+export default function App({ client = supabase, configError = supabaseConfigError }: AppProps = {}) {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(Boolean(client));
   const [signingIn, setSigningIn] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [requestBusy, setRequestBusy] = useState(false);
 
   useEffect(() => {
     if (!client) {
@@ -72,7 +75,8 @@ export default function App({ client = supabase }: AppProps = {}) {
         setAuthError("Supabase did not start a session. Confirm your email address, then sign in again.");
         return;
       }
-      setSession(data.session);
+      // onAuthStateChange delivers the signed-in session to the screen, so the
+      // app does not keep a second copy of it here.
     } catch (cause) {
       setAuthError(cause instanceof Error ? cause.message : "Supabase sign-in could not be reached.");
     } finally {
@@ -81,12 +85,13 @@ export default function App({ client = supabase }: AppProps = {}) {
   }
 
   async function handleSignOut() {
-    if (!client) return;
+    if (!client || requestBusy) return;
     setSigningOut(true);
     setAuthError(null);
 
     try {
-      const { error } = await client.auth.signOut();
+      // Local scope: signing out of this tab must not revoke the account's other sessions.
+      const { error } = await client.auth.signOut({ scope: "local" });
       if (error) {
         setAuthError(error.message);
         return;
@@ -109,17 +114,29 @@ export default function App({ client = supabase }: AppProps = {}) {
           <h1>Supabase-authenticated connection test</h1>
           <p className="lede">
             Sign in with your Supabase account. The Node server verifies the session before any AI or project request,
-            and the browser refreshes it automatically before it expires.
+            and the Supabase client refreshes it before it expires.
           </p>
           {signedIn && session && (
             <div className="session-bar">
               <span>
                 Signed in as <strong>{session.user.email ?? session.user.id}</strong>
               </span>
-              <button type="button" className="button-secondary" onClick={handleSignOut} disabled={signingOut}>
+              <button
+                type="button"
+                className="button-secondary"
+                onClick={handleSignOut}
+                disabled={signingOut}
+                aria-disabled={requestBusy}
+                title={requestBusy ? "Wait for the current request to finish before signing out." : undefined}
+              >
                 {signingOut ? "Signing out..." : "Sign out"}
               </button>
             </div>
+          )}
+          {signedIn && requestBusy && (
+            <p className="hint">
+              Sign-out is paused until the current test request finishes, so its reply is not lost.
+            </p>
           )}
         </div>
         <span className="badge">{signedIn ? "Live session" : "Auth required"}</span>
@@ -131,7 +148,13 @@ export default function App({ client = supabase }: AppProps = {}) {
             <p className="muted">Checking your Supabase session...</p>
           </section>
         ) : !client ? (
-          <SignInScreen configured={false} busy={false} error={null} onSignIn={handleSignIn} />
+          <SignInScreen
+            configured={false}
+            configError={configError}
+            busy={false}
+            error={null}
+            onSignIn={handleSignIn}
+          />
         ) : !session ? (
           <SignInScreen configured busy={signingIn} error={authError} onSignIn={handleSignIn} />
         ) : (
@@ -141,7 +164,7 @@ export default function App({ client = supabase }: AppProps = {}) {
                 {authError}
               </div>
             )}
-            <ConnectionTestScreen getAccessToken={() => getAccessToken(client)} />
+            <ConnectionTestScreen getAccessToken={() => getAccessToken(client)} onBusyChange={setRequestBusy} />
           </>
         )}
       </main>

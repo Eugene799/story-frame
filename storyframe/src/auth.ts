@@ -1,8 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
-/** Refresh a little before expiry so a request cannot race the access-token lifetime. */
-const REFRESH_SKEW_MS = 30_000;
-
 export class AuthSessionError extends Error {
   readonly code: string;
   readonly status: number;
@@ -16,11 +13,16 @@ export class AuthSessionError extends Error {
 }
 
 /**
- * Return the current Supabase access token, refreshing it first when it is
- * close to expiring. The server verifies the token on every request; this
- * function only makes sure the browser does not send a stale one.
+ * Return the current Supabase access token.
+ *
+ * The Supabase client already refreshes the access token itself: with
+ * `autoRefreshToken` it refreshes inside a 90-second pre-expiry margin, and
+ * `_callRefreshToken` single-flights concurrent refreshes. Calling
+ * `refreshSession()` here as well would rotate the token a second time on every
+ * request and race that timer, so this function only reads the session and
+ * lets the client decide when to refresh.
  */
-export async function getAccessToken(client: SupabaseClient, now = Date.now()): Promise<string> {
+export async function getAccessToken(client: SupabaseClient): Promise<string> {
   let sessionResult: Awaited<ReturnType<SupabaseClient["auth"]["getSession"]>>;
   try {
     sessionResult = await client.auth.getSession();
@@ -33,11 +35,9 @@ export async function getAccessToken(client: SupabaseClient, now = Date.now()): 
   }
 
   if (sessionResult.error) {
-    throw new AuthSessionError(
-      "AUTH_SESSION_UNAVAILABLE",
-      "Could not read the Supabase session. Try signing in again.",
-      503,
-    );
+    // getSession reports an error only when the stored session could not be
+    // refreshed and is no longer usable, so the user has to sign in again.
+    throw new AuthSessionError("SESSION_EXPIRED", "Your Supabase session expired. Sign in again.", 401);
   }
 
   const session = sessionResult.data.session;
@@ -45,19 +45,8 @@ export async function getAccessToken(client: SupabaseClient, now = Date.now()): 
     throw new AuthSessionError("AUTH_REQUIRED", "Sign in to StoryFrame before sending a request.", 401);
   }
 
-  if (typeof session.expires_at === "number" && session.expires_at * 1000 <= now + REFRESH_SKEW_MS) {
-    let refreshResult: Awaited<ReturnType<SupabaseClient["auth"]["refreshSession"]>>;
-    try {
-      refreshResult = await client.auth.refreshSession();
-    } catch {
-      throw new AuthSessionError("AUTH_REFRESH_FAILED", "Could not refresh the Supabase session. Sign in again.", 503);
-    }
-
-    if (refreshResult.error || !refreshResult.data.session) {
-      throw new AuthSessionError("SESSION_EXPIRED", "Your Supabase session expired. Sign in again.", 401);
-    }
-
-    return refreshResult.data.session.access_token;
+  if (typeof session.expires_at === "number" && session.expires_at * 1000 <= Date.now()) {
+    throw new AuthSessionError("SESSION_EXPIRED", "Your Supabase session expired. Sign in again.", 401);
   }
 
   return session.access_token;

@@ -2,12 +2,14 @@ import { useState, type FormEvent } from "react";
 
 interface SignInScreenProps {
   configured: boolean;
+  /** Set when the browser auth variables are present but unusable. */
+  configError?: string | null;
   busy: boolean;
   error: string | null;
   onSignIn: (email: string, password: string) => Promise<void>;
 }
 
-export function SignInScreen({ configured, busy, error, onSignIn }: SignInScreenProps) {
+export function SignInScreen({ configured, configError = null, busy, error, onSignIn }: SignInScreenProps) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const canSubmit = configured && email.trim().length > 0 && password.length > 0 && !busy;
@@ -26,17 +28,31 @@ export function SignInScreen({ configured, busy, error, onSignIn }: SignInScreen
       </div>
 
       {!configured ? (
-        <>
-          <p className="muted">Browser-side Supabase Auth is not configured.</p>
-          <div className="callout">
-            <strong>Set the browser auth variables.</strong>
-            <p>
-              Add <code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_PUBLISHABLE_KEY</code> to{" "}
-              <code>storyframe/.env</code>, then restart <code>npm run dev</code>. Use only the publishable (or legacy
-              anon) key here; never the service-role key.
-            </p>
-          </div>
-        </>
+        configError ? (
+          <>
+            <p className="muted">Browser-side Supabase Auth configuration is invalid.</p>
+            <div className="alert" role="alert">
+              <strong>Fix the browser auth configuration.</strong>
+              <p>{configError}</p>
+              <p>
+                Correct the value in <code>storyframe/.env</code>, then restart <code>npm run dev</code>. Use only the
+                publishable (or legacy anon) key here; never the service-role key.
+              </p>
+            </div>
+          </>
+        ) : (
+          <>
+            <p className="muted">Browser-side Supabase Auth is not configured.</p>
+            <div className="callout">
+              <strong>Set the browser auth variables.</strong>
+              <p>
+                Add <code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_PUBLISHABLE_KEY</code> to{" "}
+                <code>storyframe/.env</code>, then restart <code>npm run dev</code>. Use only the publishable (or legacy
+                anon) key here; never the service-role key.
+              </p>
+            </div>
+          </>
+        )
       ) : (
         <>
           <p className="muted">

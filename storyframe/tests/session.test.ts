@@ -20,62 +20,72 @@ function makeSession(accessToken: string, expiresAt: number): Session {
   } as Session;
 }
 
-function clientFor(
-  session: Session | null,
-  refreshSession: () => Promise<{
-    data: { session: Session | null; user: Session["user"] | null };
-    error: { message: string } | null;
-  }>,
-): SupabaseClient {
-  return {
-    auth: {
-      getSession: vi.fn(async () => ({ data: { session }, error: null })),
-      refreshSession: vi.fn(refreshSession),
-    },
-  } as unknown as SupabaseClient;
+type SessionResult = {
+  data: { session: Session | null };
+  error: { message: string } | null;
+};
+
+function clientFor(loadSession: () => Promise<SessionResult>) {
+  const getSession = vi.fn(loadSession);
+  const refreshSession = vi.fn();
+  const client = { auth: { getSession, refreshSession } } as unknown as SupabaseClient;
+  return { client, getSession, refreshSession };
+}
+
+/** Seconds since the epoch, `offsetMs` away from now. */
+function expiresIn(offsetMs: number): number {
+  return Math.floor((Date.now() + offsetMs) / 1000);
 }
 
 describe("getAccessToken", () => {
-  it("returns the current access token without refreshing a session that is not near expiry", async () => {
-    const now = 1_760_000_000_000;
-    const session = makeSession("valid-token", Math.floor(now / 1000) + 3600);
-    const refreshSession = vi.fn(async () => ({ data: { session, user: session.user }, error: null }));
+  it("returns the current access token", async () => {
+    const session = makeSession("valid-token", expiresIn(3_600_000));
+    const { client } = clientFor(async () => ({ data: { session }, error: null }));
 
-    await expect(getAccessToken(clientFor(session, refreshSession), now)).resolves.toBe("valid-token");
-    expect(refreshSession).not.toHaveBeenCalled();
+    await expect(getAccessToken(client)).resolves.toBe("valid-token");
   });
 
-  it("refreshes a session that expires within the 30-second request window", async () => {
-    const now = 1_760_000_000_000;
-    const current = makeSession("old-token", Math.floor(now / 1000) + 5);
-    const refreshed = makeSession("refreshed-token", Math.floor(now / 1000) + 3600);
-    const refreshSession = vi.fn(async () => ({ data: { session: refreshed, user: refreshed.user }, error: null }));
+  it("uses the token the Supabase client refreshed to instead of rotating it again", async () => {
+    // The client refreshes inside its own 90-second margin and single-flights
+    // concurrent refreshes. A second, app-driven refresh would race that timer
+    // and rotate the refresh token again, so it must never happen here.
+    const refreshed = makeSession("sdk-refreshed-token", expiresIn(3_600_000));
+    const { client, refreshSession } = clientFor(async () => ({ data: { session: refreshed }, error: null }));
 
-    await expect(getAccessToken(clientFor(current, refreshSession), now)).resolves.toBe("refreshed-token");
-    expect(refreshSession).toHaveBeenCalledTimes(1);
+    await expect(getAccessToken(client)).resolves.toBe("sdk-refreshed-token");
+    expect(refreshSession).not.toHaveBeenCalled();
   });
 
   it("refuses to send a request when there is no session", async () => {
-    const refreshSession = vi.fn(async () => ({ data: { session: null, user: null }, error: null }));
+    const { client } = clientFor(async () => ({ data: { session: null }, error: null }));
 
-    await expect(getAccessToken(clientFor(null, refreshSession), 1_760_000_000_000)).rejects.toMatchObject({
-      code: "AUTH_REQUIRED",
-      status: 401,
-    });
-    expect(refreshSession).not.toHaveBeenCalled();
+    await expect(getAccessToken(client)).rejects.toMatchObject({ code: "AUTH_REQUIRED", status: 401 });
   });
 
-  it("reports an expired session when refresh fails", async () => {
-    const now = 1_760_000_000_000;
-    const current = makeSession("old-token", Math.floor(now / 1000) + 5);
-    const refreshSession = vi.fn(async () => ({
-      data: { session: null, user: null },
+  it("reports an expired session the client could not replace", async () => {
+    const session = makeSession("expired-token", expiresIn(-60_000));
+    const { client } = clientFor(async () => ({ data: { session }, error: null }));
+
+    await expect(getAccessToken(client)).rejects.toMatchObject({ code: "SESSION_EXPIRED", status: 401 });
+  });
+
+  it("reports a session the client could not refresh", async () => {
+    const { client } = clientFor(async () => ({
+      data: { session: null },
       error: { message: "Invalid Refresh Token" },
     }));
 
-    await expect(getAccessToken(clientFor(current, refreshSession), now)).rejects.toMatchObject({
-      code: "SESSION_EXPIRED",
-      status: 401,
+    await expect(getAccessToken(client)).rejects.toMatchObject({ code: "SESSION_EXPIRED", status: 401 });
+  });
+
+  it("reports a session that could not be read", async () => {
+    const { client } = clientFor(async () => {
+      throw new Error("storage unavailable");
+    });
+
+    await expect(getAccessToken(client)).rejects.toMatchObject({
+      code: "AUTH_SESSION_UNAVAILABLE",
+      status: 503,
     });
   });
 });

@@ -21,7 +21,13 @@ function createIdempotencyKey(): string {
   return `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
-export function ConnectionTestScreen({ getAccessToken }: { getAccessToken: () => Promise<string> }) {
+interface ConnectionTestScreenProps {
+  getAccessToken: () => Promise<string>;
+  /** Reports whether a billable request is in flight, so sign-out can wait for it. */
+  onBusyChange?: (busy: boolean) => void;
+}
+
+export function ConnectionTestScreen({ getAccessToken, onBusyChange }: ConnectionTestScreenProps) {
   const [status, setStatus] = useState<AiStatusResponse | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [modelId, setModelId] = useState("");
@@ -36,6 +42,8 @@ export function ConnectionTestScreen({ getAccessToken }: { getAccessToken: () =>
   useEffect(() => {
     idempotencyKeyRef.current = null;
   }, [modelId, prompt]);
+
+  useEffect(() => () => onBusyChange?.(false), [onBusyChange]);
 
   useEffect(() => {
     let cancelled = false;
@@ -65,6 +73,7 @@ export function ConnectionTestScreen({ getAccessToken }: { getAccessToken: () =>
     if (busyRef.current) return;
     busyRef.current = true;
     setBusy(true);
+    onBusyChange?.(true);
     setError(null);
     setResult(null);
 
@@ -88,6 +97,7 @@ export function ConnectionTestScreen({ getAccessToken }: { getAccessToken: () =>
     } finally {
       busyRef.current = false;
       setBusy(false);
+      onBusyChange?.(false);
     }
   }
 

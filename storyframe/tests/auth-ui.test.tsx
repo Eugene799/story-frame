@@ -36,6 +36,17 @@ const STATUS: AiStatusResponse = {
   ],
 };
 
+const SUCCESS = {
+  ok: true,
+  modelId: "gemma",
+  configuredModel: "gemma4:31b",
+  returnedModel: "gemma4:31b",
+  reply: "Welcome to StoryFrame, where rough ideas become finished scenes.",
+  latencyMs: 812,
+  usage: { promptEvalCount: 19, evalCount: 12 },
+  doneReason: "stop",
+};
+
 function jsonResponse(payload: unknown): Response {
   return {
     ok: true,
@@ -152,7 +163,7 @@ describe("App authentication", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
     expect(await screen.findByRole("heading", { name: "Sign in" })).toBeInTheDocument();
-    expect(signOut).toHaveBeenCalledTimes(1);
+    expect(signOut).toHaveBeenCalledWith({ scope: "local" });
   });
 
   it("restores an existing Supabase session on load", async () => {
@@ -194,5 +205,50 @@ describe("App authentication", () => {
     expect(screen.getByText(/Browser-side Supabase Auth is not configured/i)).toBeInTheDocument();
     expect(screen.getByText("VITE_SUPABASE_URL")).toBeInTheDocument();
     expect(screen.queryByLabelText(/Supabase access token/i)).toBeNull();
+  });
+
+  it("reports an invalid browser configuration instead of calling it missing", () => {
+    render(<App client={null} configError="VITE_SUPABASE_URL is not a valid URL." />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent(/VITE_SUPABASE_URL is not a valid URL/i);
+    expect(screen.queryByText(/Browser-side Supabase Auth is not configured/i)).toBeNull();
+  });
+
+  it("keeps sign-out from discarding a request that is still running", async () => {
+    let release: ((response: Response) => void) | undefined;
+    const pending = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/api/ai/status")) return jsonResponse(STATUS);
+        if (url.endsWith("/api/ai/test")) return pending;
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+
+    const { client, signOut } = makeClient();
+    render(<App client={client} />);
+
+    await screen.findByRole("heading", { name: "Sign in" });
+    fillCredentials("ada@example.com", "correct horse battery staple");
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+
+    await screen.findByRole("option", { name: /Gemma 4 31B/ });
+    fireEvent.click(screen.getByRole("button", { name: /Send test request/i }));
+
+    expect(await screen.findByText(/Sign-out is paused until the current test request finishes/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(signOut).not.toHaveBeenCalled();
+
+    release?.(jsonResponse(SUCCESS));
+    expect(await screen.findByTestId("ai-reply")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(await screen.findByRole("heading", { name: "Sign in" })).toBeInTheDocument();
+    expect(signOut).toHaveBeenCalledWith({ scope: "local" });
   });
 });

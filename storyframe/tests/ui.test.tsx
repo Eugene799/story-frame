@@ -206,6 +206,26 @@ describe("ConnectionTestScreen", () => {
     expect(new Headers(testCall?.[1]?.headers).get("Authorization")).toBe("Bearer session-token");
   });
 
+  it("reports when a billable request is in flight so sign-out can wait for it", async () => {
+    let release: ((response: Response) => void) | undefined;
+    const pending = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+    installFetch(() => pending);
+    const onBusyChange = vi.fn();
+    render(
+      <ConnectionTestScreen getAccessToken={async () => "token-value"} onBusyChange={onBusyChange} />,
+    );
+
+    await screen.findByRole("option", { name: /Gemma 4 31B/ });
+    fireEvent.click(fillAndFindButton());
+    await waitFor(() => expect(onBusyChange).toHaveBeenLastCalledWith(true));
+
+    release?.(jsonResponse(SUCCESS));
+    expect(await screen.findByTestId("ai-reply")).toHaveTextContent(SUCCESS.reply);
+    await waitFor(() => expect(onBusyChange).toHaveBeenLastCalledWith(false));
+  });
+
   it("shows a sanitized server error", async () => {
     installFetch(async () =>
       jsonResponse(

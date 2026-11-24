@@ -168,11 +168,13 @@ persists session tokens in browser `localStorage` and sends them only to the Nod
 
 ## Authentication
 
-The browser creates a Supabase client with `persistSession`, `autoRefreshToken`, and `detectSessionInUrl` enabled. The
-sign-in screen posts an email and password to Supabase Auth; an existing session is restored on load. The server still
-verifies the resulting access token on every AI and data route. Before a request, the client reads the current session
-and refreshes it when it is within 30 seconds of expiry. `onAuthStateChange` updates the screen on sign-in, token
-refresh, and sign-out. Sign-out clears the local Supabase session.
+The browser creates a Supabase client with `persistSession` and `autoRefreshToken` enabled. The sign-in screen posts an
+email and password to Supabase Auth; an existing session is restored on load. The server still verifies the resulting
+access token on every AI and data route. Before a request, the app reads the current session with `getSession()` and
+sends the token it returns; the Supabase client refreshes inside its own 90-second pre-expiry margin and single-flights
+concurrent refreshes, so the app never starts a second refresh of its own. `onAuthStateChange` updates the screen on
+sign-in, token refresh, and sign-out. Sign-out uses `scope: "local"`: it clears this browser's stored session and leaves
+the account's other sessions active. Sign-out is paused while a billable request is in flight so its reply is not lost.
 
 There is no sign-up, password-reset, MFA, or OAuth flow yet. The test screen remains a development harness, not a
 production account-management UI.
@@ -448,8 +450,9 @@ Coverage includes:
 - Missing key, unknown/disabled model, oversized prompt/body, provider auth failure, rate limiting, timeout,
   malformed/empty responses, success extraction, secret leakage, and duplicate submission
 - UI reply rendering, error display, and duplicate-submission suppression
-- Supabase Auth UI: initial session restore, email/password sign-in, sign-out, sign-in errors, and the 30-second
-  pre-expiry refresh path
+- Supabase Auth UI: initial session restore, email/password sign-in, local sign-out, sign-in errors, and
+  expired/unreadable sessions. The refresh itself belongs to the Supabase client, and the session tests assert that the
+  app does not start a second one.
 
 ### Repeatable live smoke check
 
@@ -486,7 +489,7 @@ gone. It exits non-zero on failure and never prints access tokens or keys. It do
 
 - Email/password sign-in only; there is no sign-up, password-reset, MFA, OAuth, or account-management UI. The
   Supabase client persists session tokens in browser `localStorage`; production needs an explicit session-storage and
-  CSP review.
+  CSP review. Sign-out is local to this browser and does not revoke the account's other sessions.
 - The migrations and RLS policies are applied to the configured Supabase project. The hosted catalog was checked (11
   tables, RLS, policies, grants, revision trigger), live profile/project/child routes and two-user isolation passed
   39/39 checks on the hardening commit, and the disposable users were deleted afterwards. Rerun these checks with
