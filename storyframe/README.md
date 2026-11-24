@@ -1728,6 +1728,32 @@ users, projects, rows, and objects afterwards and checks that they are gone. It 
 URLs. Cleanup covers the project even if the run fails midway. Run on 2026-11-25: **38/38 checks passed**, including the upload
 ticket's CORS preflight from the `cors.json` preview origin, the document-delete guard, and project-deletion object cleanup.
 
+### Browser account end-to-end check
+
+```bash
+npm run e2e:account
+```
+
+This check drives a real Chromium against the dev server and the configured Supabase project. It is **opt-in** and
+not part of CI because it needs a browser. Start `npm run dev` first, then provide `SUPABASE_URL`,
+`SUPABASE_SERVICE_ROLE_KEY`, and `SUPABASE_ANON_KEY` (or `SUPABASE_PUBLISHABLE_KEY`); set `SMOKE_BASE_URL` if the app
+is not on `http://127.0.0.1:3000`. Install Playwright once with `npm install --no-save playwright` and either run
+`npx playwright install chromium` or point `CHROME_BIN` at an existing Chromium build.
+
+The script creates disposable users, exercises sign-up, the reset request, a recovery link minted with the admin API
+(so no inbox is needed), the password change (the old password must stop working), an unconfirmed account, and the
+expired-session path, then deletes every user it created and verifies the deletion. It never calls the billing route:
+requests to `/api/ai/test` are counted and must stay at zero once the session is gone.
+
+Projects with `mailer_autoconfirm=false` send a confirmation mail, and Supabase rate-limits those sends. When the
+project's mail quota is exhausted (`over_email_send_rate_limit`), the sign-up and reset-request checks are reported
+as `BLOCKED` rather than as passes or failures, and the summary counts them separately. The recovery,
+password-change, and expiry checks need no mail and always run.
+
+Supabase also rejects addresses on domains that cannot receive mail, so the sign-up step is `BLOCKED` by default.
+Set `E2E_SIGNUP_EMAIL` to a throwaway inbox you control to run it for real; the script deletes that account at the
+end, and never deletes an account that existed before the run.
+
 ## Security limitations
 
 - Email/password sign-in only; there is no sign-up, password-reset, MFA, OAuth, or account-management UI. The
