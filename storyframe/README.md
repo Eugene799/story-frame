@@ -63,12 +63,13 @@ first and the current state of the configured project.
 Other commands:
 
 ```bash
-npm run check        # TypeScript type-check (app, server, tests)
-npm test             # Vitest (mocked provider + fake Supabase)
-npm run build        # type-check + production frontend build
-npm run smoke:live   # opt-in: five real requests + ledger check (see Tests)
-npm run verify:sql   # apply every migration to in-memory PostgreSQL and assert RLS, triggers, cascades
-npm run start:server # server without watch
+npm run check             # TypeScript type-check (app, server, scripts, tests)
+npm test                  # Vitest (mocked provider + fake Supabase)
+npm run build             # type-check + production frontend build
+npm run smoke:live        # opt-in: five real requests + ledger check (see Tests)
+npm run verify:live-routes # provider-free two-user live route + ledger checks
+npm run verify:sql        # apply every migration to in-memory PostgreSQL and assert RLS, triggers, cascades
+npm run start:server      # server without watch
 ```
 
 For an external preview hostname, allow it explicitly instead of using a blanket allowlist:
@@ -438,13 +439,29 @@ ignores object key order. It exits non-zero on failure, performs no retries, and
 session token. Nemotron is checked only for its disabled status and is
 never called.
 
+### Provider-free live route checks
+
+```bash
+npm run verify:live-routes
+```
+
+This check is **provider-free**: it never calls Ollama and spends no billable tokens. It requires `SUPABASE_URL`,
+`SUPABASE_SERVICE_ROLE_KEY`, and `SUPABASE_PUBLISHABLE_KEY` (or the legacy `SUPABASE_ANON_KEY`) in the environment
+or `storyframe/.env`. It creates two disposable auth users, starts an isolated API server on an ephemeral loopback
+port, and checks the hosted schema through the real routes: profile isolation, project IDOR refusals, optimistic
+conflict, every child table, cross-owner source rejection, render revisions, ledger completion ownership, and usage
+isolation. It seeds its own rows, then deletes both users and verifies their ledger, profile, and project rows are
+gone. It exits non-zero on failure and never prints access tokens or keys. It does not require or use
+`OLLAMA_API_KEY`, and must not be pointed at a project whose data it should not create temporary users in.
+
 ## Security limitations
 
 - No sign-in UI yet; the development screen accepts a pasted Supabase access token. That is not a production login
   flow.
 - The migrations and RLS policies are applied to the configured Supabase project. The hosted catalog was checked (11
   tables, RLS, policies, grants, revision trigger), live profile/project/child routes and two-user isolation passed
-  37/37 checks, and the disposable users were deleted afterwards. `smoke:live` exposed a live-only missing-column
+  39/39 checks on the hardening commit, and the disposable users were deleted afterwards. Rerun these checks with
+  `npm run verify:live-routes`. `smoke:live` exposed a live-only missing-column
   bug; after the fix a clean five-call run exited 0 with 5/5 families and an identical stored replay.
 - Pending reservations are recovered only lazily, when a retry with the same key arrives after `AI_ABANDON_AFTER_MS`.
   There is no background sweeper, so a key nobody retries stays `pending`, and the original attempt's outcome is never

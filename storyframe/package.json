@@ -13,6 +13,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "smoke:live": "tsx scripts/smoke-live.ts",
+    "verify:live-routes": "tsx scripts/verify-live-routes.ts",
     "verify:sql": "tsx scripts/verify-sql.ts",
     "start:server": "tsx server/index.ts"
   },
