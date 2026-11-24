@@ -531,7 +531,7 @@ export async function startFakeSupabase(
 
           // PostgREST filters every update/read itself. These are the operator
           // shapes the server uses: eq, lt, neq, in, and is.null.
-          const RESERVED = new Set(["select", "order", "limit", "on_conflict"]);
+          const RESERVED = new Set(["select", "order", "limit", "offset", "on_conflict"]);
           const matches = (row: Record<string, unknown>) => {
             for (const [name, raw] of url.searchParams) {
               if (RESERVED.has(name)) continue;
@@ -676,17 +676,22 @@ export async function startFakeSupabase(
 
           if (request.method === "GET") {
             let rows = data.filter(matches);
-            if (url.searchParams.get("order") === "position.asc") {
+            const order = url.searchParams.get("order");
+            if (order === "position.asc") {
               rows = rows.slice().sort((a, b) => Number(a.position) - Number(b.position));
+            } else if (order === "id.asc") {
+              rows = rows.slice().sort((a, b) => String(a.id).localeCompare(String(b.id)));
             }
             const rawLimit = Number(url.searchParams.get("limit") ?? "100");
             const limit = Number.isFinite(rawLimit) ? Math.max(0, Math.min(200, Math.floor(rawLimit))) : 100;
+            const rawOffset = Number(url.searchParams.get("offset") ?? "0");
+            const offset = Number.isFinite(rawOffset) ? Math.max(0, Math.floor(rawOffset)) : 0;
 
             // PostgREST returns only the selected columns. A select list that
             // omits a column the server reads must fail here, not only live.
             const select = url.searchParams.get("select");
             const columns = select ? select.split(",").map((column) => column.trim()).filter(Boolean) : null;
-            const page = rows.slice(0, limit).map((row) => {
+            const page = rows.slice(offset, offset + limit).map((row) => {
               if (!columns || columns.includes("*")) return row;
               return Object.fromEntries(columns.map((column) => [column, row[column]]));
             });

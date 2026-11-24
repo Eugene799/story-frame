@@ -497,7 +497,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Real browser sign-in and upload against hosted Supabase/R2 | **PASS** | Disposable hosted user signed in through the browser; a 7.7 KiB PNG went initiate `201` → direct presigned `PUT 200` to the `story-frame` bucket → complete `200` → scene reference `201` → saved asset id → presigned playback `GET 200`, with the image decoding at 64 px and a one-reference count |
 | JSON/script download clicked in a browser | **PASS** | Both export buttons downloaded through the browser; the JSON parsed as a schema 2 document with the saved brief, scene ids, durations, asset id, and approvals, and the script text matched the stored narration and visual direction |
 | Hosted browser test cleanup | **PASS** | Reference release then media delete returned `200`, project delete returned the dashboard to 0 projects, the disposable user and every project/media/profile row were deleted, and the R2 object answered `The specified key does not exist` |
-| Project deletion removes uploaded objects | **PASS** | `tests/media.test.ts`: a completed upload exists in the fake bucket, project `DELETE` returns `200`, the object and media rows are gone, and the project reads `404` |
+| Project deletion removes uploaded objects | **PASS** | `tests/media.test.ts`: a completed upload exists in the fake bucket, project `DELETE` returns `200`, the object and media rows are gone, and the project reads `404`; a second case seeds 205 objects across two store pages and asserts all are removed |
 | Detach from a scene, then delete the asset | **PASS** | `tests/workspace.test.tsx`: Detach releases the reference, clears `scene.assetIds`, saves, and Delete asset then succeeds |
 
 The browser run on 2026-11-24 also exposed a double-counted media reference: the Media tab sent `sceneKey` at initiate
@@ -637,8 +637,8 @@ Coverage includes:
 - Missing objects, pending playback, expired upload windows, interrupted-upload cleanup, deleted-row retention, and
   unreferenced-asset cleanup
 - Media routes refused with `503 MEDIA_NOT_CONFIGURED` when the bucket is not configured
-- Project deletion reads the project's object keys before the rows cascade and removes each object from the bucket,
-  leaving no orphaned upload behind
+- Project deletion reads every page of the project's object keys before the rows cascade and removes each object from
+  the bucket, leaving no orphaned upload behind even past one store page (205-row regression case)
 - Workspace detach: releases the scene reference, removes the asset id, saves the document, and then deletes the now
   unreferenced asset
 - Missing key, unknown/disabled model, oversized prompt/body, provider auth failure, rate limiting, timeout,

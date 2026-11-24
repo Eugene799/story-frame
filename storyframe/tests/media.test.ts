@@ -374,6 +374,33 @@ describe("private media storage", () => {
     }
   });
 
+  it("removes every uploaded object across more than one store page", async () => {
+    const app = await startTestServer();
+    try {
+      const projectId = await createProject(app.url);
+      // 205 rows exceed the 200-row page the store reads at a time.
+      for (let index = 0; index < 205; index += 1) {
+        const id = `seeded-${String(index).padStart(3, "0")}`;
+        const objectKey = `media/${USER_A.id}/${id}`;
+        app.supabase.media.push({
+          id,
+          owner_id: USER_A.id,
+          project_id: projectId,
+          object_key: objectKey,
+        });
+        app.r2.objects.set(objectKey, { body: PNG, contentType: "image/png" });
+      }
+      expect(app.r2.objects.size).toBe(205);
+
+      const deleted = await apiRequest(app.url, `/api/projects/${projectId}`, { method: "DELETE" });
+      expect(deleted.status).toBe(200);
+      expect(app.r2.objects.size).toBe(0);
+      expect(app.supabase.media).toHaveLength(0);
+    } finally {
+      await app.close();
+    }
+  });
+
   it("removes a project's uploaded objects when the project is deleted", async () => {
     const app = await startTestServer();
     try {

@@ -558,19 +558,30 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
     },
 
     async listObjectKeys(ownerId, projectId) {
-      const found = rows(
-        await request(
-          tableUrl("media_metadata", {
-            select: "object_key",
-            owner_id: `eq.${ownerId}`,
-            project_id: `eq.${projectId}`,
-            limit: "1000",
-          }),
-          { headers: readHeaders },
-          "the project object list",
-        ),
-      );
-      return found.map((row) => rowText(row, "object_key"));
+      // PostgREST caps a page, so a single read would silently leave every
+      // object past the cap behind when the project rows cascade. Page through
+      // by primary key until a short page proves the list is complete.
+      const pageSize = 200;
+      const keys: string[] = [];
+      for (let offset = 0; offset < 100_000; offset += pageSize) {
+        const found = rows(
+          await request(
+            tableUrl("media_metadata", {
+              select: "object_key",
+              owner_id: `eq.${ownerId}`,
+              project_id: `eq.${projectId}`,
+              order: "id.asc",
+              limit: String(pageSize),
+              offset: String(offset),
+            }),
+            { headers: readHeaders },
+            "the project object list",
+          ),
+        );
+        for (const row of found) keys.push(rowText(row, "object_key"));
+        if (found.length < pageSize) break;
+      }
+      return keys;
     },
 
     async markReady(ownerId, projectId, mediaId, update) {
