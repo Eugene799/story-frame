@@ -29,28 +29,24 @@ export interface PresignedUrl {
   expiresAt: string;
 }
 
-export interface R2ObjectHead {
+export interface R2ObjectInfo {
   byteSize: number;
-  contentType: string | null;
-  etag: string | null;
 }
 
 export class R2Error extends Error {
   readonly code: string;
-  readonly status: number | null;
 
-  constructor(code: string, message: string, status: number | null = null) {
+  constructor(code: string, message: string) {
     super(message);
     this.name = "R2Error";
     this.code = code;
-    this.status = status;
   }
 }
 
 export interface R2Client {
   presignPut(key: string, expiresInSeconds: number): PresignedUrl;
   presignGet(key: string, expiresInSeconds: number): PresignedUrl;
-  head(key: string): Promise<R2ObjectHead | null>;
+  head(key: string): Promise<R2ObjectInfo | null>;
   /** Reads the first bytes of an object. Null when the object does not exist. */
   readRange(key: string, byteCount: number): Promise<Buffer | null>;
   delete(key: string): Promise<boolean>;
@@ -181,11 +177,7 @@ export function createR2Client(config: R2Config, options: { fetchImpl?: typeof f
       if (!Number.isFinite(byteSize) || byteSize < 0) {
         throw new R2Error("R2_UNAVAILABLE", "The media bucket returned an unreadable object size.");
       }
-      return {
-        byteSize,
-        contentType: response.headers.get("content-type"),
-        etag: response.headers.get("etag"),
-      };
+      return { byteSize };
     },
 
     async readRange(key, byteCount) {

@@ -143,6 +143,10 @@ async function cleanup(): Promise<void> {
         }
       }
     }
+    // Delete the project while its owner's session is still valid; the users go last.
+    if (projectA && userA) {
+      await api(`/api/projects/${projectA}`, userA.token, { method: "DELETE" }).catch(() => undefined);
+    }
     for (const user of [userA, userB]) {
       if (!user) continue;
       await fetch(`${supabaseUrl}/auth/v1/admin/users/${user.id}`, {
@@ -150,7 +154,6 @@ async function cleanup(): Promise<void> {
         headers: adminHeaders,
       }).catch(() => undefined);
     }
-    if (projectA && userA) await api(`/api/projects/${projectA}`, userA.token, { method: "DELETE" }).catch(() => undefined);
   } catch {
     console.error("[media-live] cleanup did not finish cleanly");
   }

@@ -25,6 +25,8 @@ import type { R2Client } from "./r2";
 
 export const MEDIA_KINDS: readonly MediaKind[] = ["image", "audio", "video"];
 export const MEDIA_REF_KINDS: readonly MediaRefKind[] = ["scene", "render", "document", "other"];
+/** One message for "missing" and "not yours" alike, so the two do not differ. */
+export const MEDIA_NOT_FOUND_MESSAGE = "No media with that id is owned by this account.";
 
 /** Content types accepted for each kind. The declared type is only a claim. */
 const ALLOWED_CONTENT_TYPES: Record<MediaKind, readonly string[]> = {
@@ -248,16 +250,11 @@ export function newMediaId(): string {
 
 // ---- Store ------------------------------------------------------------------
 
-export interface MediaReferenceCounts {
-  counts: Map<string, number>;
-}
-
 export interface StoredObjectRow {
   id: string;
   ownerId: string;
   objectKey: string;
   sceneKey: string | null;
-  createdAt: string;
 }
 
 export interface StoredMedia {
@@ -312,6 +309,7 @@ export interface MediaStore {
 const MEDIA_COLUMNS =
   "id,kind,status,scene_key,content_type,byte_size,object_key,upload_expires_at,ready_at,deleted_at,created_at";
 const REFERENCE_COLUMNS = "id,media_id,ref_kind,ref_id,created_at";
+const STORED_OBJECT_COLUMNS = "id,owner_id,object_key,scene_key";
 
 function corrupt(field: string): never {
   throw new ApiError(503, "MEDIA_STORE_CORRUPT", `The media store returned a malformed row (${field}).`);
@@ -347,6 +345,15 @@ function toMedia(row: Record<string, unknown>, referenceCount: number): MediaRec
     deletedAt: rowNullableText(row, "deleted_at"),
     createdAt: rowText(row, "created_at"),
     referenceCount,
+  };
+}
+
+function toStoredObjectRow(row: Record<string, unknown>): StoredObjectRow {
+  return {
+    id: rowText(row, "id"),
+    ownerId: rowText(row, "owner_id"),
+    objectKey: rowText(row, "object_key"),
+    sceneKey: rowNullableText(row, "scene_key"),
   };
 }
 
@@ -674,7 +681,7 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
       const found = rows(
         await request(
           tableUrl("media_metadata", {
-            select: "id,owner_id,object_key,scene_key,created_at",
+            select: STORED_OBJECT_COLUMNS,
             status: "eq.pending",
             upload_expires_at: `lt.${nowIso}`,
             limit: String(limit),
@@ -683,20 +690,14 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
           "the expired upload list",
         ),
       );
-      return found.map((row) => ({
-        id: rowText(row, "id"),
-        ownerId: rowText(row, "owner_id"),
-        objectKey: rowText(row, "object_key"),
-        sceneKey: rowNullableText(row, "scene_key"),
-        createdAt: rowText(row, "created_at"),
-      }));
+      return found.map(toStoredObjectRow);
     },
 
     async expiredDeleted(cutoffIso, limit) {
       const found = rows(
         await request(
           tableUrl("media_metadata", {
-            select: "id,owner_id,object_key,scene_key,created_at",
+            select: STORED_OBJECT_COLUMNS,
             status: "eq.deleted",
             deleted_at: `lt.${cutoffIso}`,
             limit: String(limit),
@@ -705,20 +706,14 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
           "the deleted media list",
         ),
       );
-      return found.map((row) => ({
-        id: rowText(row, "id"),
-        ownerId: rowText(row, "owner_id"),
-        objectKey: rowText(row, "object_key"),
-        sceneKey: rowNullableText(row, "scene_key"),
-        createdAt: rowText(row, "created_at"),
-      }));
+      return found.map(toStoredObjectRow);
     },
 
     async unreferencedReady(cutoffIso, limit) {
       const found = rows(
         await request(
           tableUrl("media_metadata", {
-            select: "id,owner_id,object_key,scene_key,created_at",
+            select: STORED_OBJECT_COLUMNS,
             status: "eq.ready",
             created_at: `lt.${cutoffIso}`,
             limit: String(limit),
@@ -727,13 +722,7 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
           "the unreferenced media list",
         ),
       );
-      return found.map((row) => ({
-        id: rowText(row, "id"),
-        ownerId: rowText(row, "owner_id"),
-        objectKey: rowText(row, "object_key"),
-        sceneKey: rowNullableText(row, "scene_key"),
-        createdAt: rowText(row, "created_at"),
-      }));
+      return found.map(toStoredObjectRow);
     },
   };
 }

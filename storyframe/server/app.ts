@@ -41,6 +41,7 @@ import {
 } from "./projects";
 import { ApiError } from "./api-error";
 import {
+  MEDIA_NOT_FOUND_MESSAGE,
   createSupabaseMediaStore,
   detectMediaType,
   limitForKind,
@@ -674,6 +675,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         const mediaId = newMediaId();
         const objectKey = mediaObjectKey(user.id, mediaId);
         const upload = objects.presignPut(objectKey, config.media.uploadUrlSeconds);
+        // The upload window can be shorter than the signed URL's lifetime; both bounds apply.
         const uploadExpiresAt = new Date(
           now() + Math.min(config.media.uploadTtlMs, config.media.uploadUrlSeconds * 1000),
         ).toISOString();
@@ -705,12 +707,12 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
 
     const [mediaId, action, referenceId, ...extra] = rest;
     if (!isChildId(mediaId) || extra.length > 0) {
-      throw new HttpError(404, "MEDIA_NOT_FOUND", "No media with that id is owned by this account.");
+      throw new HttpError(404, "MEDIA_NOT_FOUND", MEDIA_NOT_FOUND_MESSAGE);
     }
 
     const stored = await store.get(user.id, projectId, mediaId);
     if (!stored) {
-      throw new HttpError(404, "MEDIA_NOT_FOUND", "No media with that id is owned by this account.");
+      throw new HttpError(404, "MEDIA_NOT_FOUND", MEDIA_NOT_FOUND_MESSAGE);
     }
     const row = stored.media;
     const objectKey = stored.objectKey;
@@ -738,9 +740,15 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
             `This media is still referenced ${references} time(s). Remove those references before deleting it.`,
           );
         }
-        await requireMediaBucket(() => objects.delete(objectKey));
         if (!(await store.markDeleted(user.id, projectId, mediaId))) {
           throw new HttpError(409, "MEDIA_STATE_CHANGED", "This media changed while it was being deleted.");
+        }
+        // The row is already deleted, so a bucket failure cannot expose a ready
+        // row without its object; retention retries the object removal.
+        try {
+          await objects.delete(objectKey);
+        } catch {
+          log.error("[media] R2_DELETE_FAILED");
         }
         sendJson(response, 200, { ok: true, deletedId: mediaId });
         return;
@@ -786,7 +794,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         throw new HttpError(409, "MEDIA_OBJECT_MISSING", "The uploaded object was not found in the bucket.");
       }
       const detected = detectMediaType(leading);
-      if (!mediaTypeMatches(row.kind, detected)) {
+      if (!detected || !mediaTypeMatches(row.kind, detected)) {
         await discardMedia(store, objects, user.id, projectId, row.id, objectKey);
         throw new HttpError(
           422,
@@ -796,7 +804,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       }
 
       const media = await store.markReady(user.id, projectId, mediaId, {
-        contentType: detected!.contentType,
+        contentType: detected.contentType,
         byteSize: head.byteSize,
       });
       if (!media) {

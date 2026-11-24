@@ -419,7 +419,8 @@ returned `403` with no allow-origin header, and a presigned `GET` carried the al
 
 Deleting an asset first counts its references: explicit rows in `media_references` plus its `scene_key`. While any
 reference remains the object and row stay untouched (`409 MEDIA_IN_USE`); removing one reference leaves the others
-valid. Once the last reference is released, `DELETE` removes the object and marks the row `deleted`.
+valid. Once the last reference is released, `DELETE` marks the row `deleted` and then removes the object, so a bucket
+failure cannot leave a ready row without its file; retention retries that removal.
 
 Cleanup is opportunistic and bounded (one batch per pass, at most every `MEDIA_SWEEP_INTERVAL_MS`):
 
