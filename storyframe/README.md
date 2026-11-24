@@ -528,6 +528,34 @@ anon) key; never the service-role key.
 | `VITE_SUPABASE_URL` | Supabase project URL used by the browser auth client. |
 | `VITE_SUPABASE_PUBLISHABLE_KEY` | Publishable key used by the browser auth client. `VITE_SUPABASE_ANON_KEY` is accepted as a fallback. |
 
+#### Redirect allowlist for non-localhost origins
+
+Recovery and confirmation links only return to an origin that Supabase lists under **Authentication → URL
+Configuration → Redirect URLs**. Any other `redirect_to` is silently rewritten to the project's Site URL (currently
+`http://localhost:3000`), so a hosted preview needs its origin allowlisted. The app asks for
+`window.location.origin`, and the `style.dev` preview hostname changes whenever the VM is restored
+(`pv-<chat>-<random>.style.dev`), so allowlist a pattern rather than one exact host:
+
+```
+https://pv-*.style.dev/**
+```
+
+Vite also has to accept the hostname: start the dev server with
+`__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=<preview host>`, otherwise loopback requests with that `Host` header get a 403.
+
+Checking an origin costs nothing and sends no mail. `generate_link` returns the `redirect_to` the emailed link will
+actually use:
+
+```bash
+curl -s -X POST "$SUPABASE_URL/auth/v1/admin/generate_link" \
+  -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"recovery","email":"someone@example.com","redirect_to":"https://your-preview-origin"}'
+```
+
+It comes back unchanged when the origin is allowed and as the Site URL when it is not. Changing the allowlist itself
+needs the Supabase dashboard; the service-role key cannot edit URL configuration.
+
 ### Server-only
 
 | Name | Purpose |
