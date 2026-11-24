@@ -5,13 +5,15 @@ This repository state implements the first Phase 2 slices: a **server-verified S
 `project_revisions`, their child tables, and per-user profiles) with owner-scoped access. The Phase 1 Ollama connection and its bounded test endpoint remain, now
 behind real sessions and request-level idempotency keys.
 
-The workspace UI, scene generation, R2, rendering, billing, discovery, and deployment are **not** started here. The
-existing connection-test screen remains a development harness only.
+The connection-test screen now uses real Supabase email/password sign-in, refreshes its session through the Supabase
+client, and signs out. It remains a development harness only. The workspace UI, scene generation, R2, rendering,
+billing, discovery, and deployment are **not** started here.
 
 ## Architecture
 
 ```
-Browser (Vite + React) → /api/ai/test        (Supabase access token)
+Browser (Vite + React) → Supabase Auth      (email/password, refresh, sign-out)
+      └─ /api/ai/test       (current Supabase access token)
       ↓ Vite dev proxy (development only)
 Node server (127.0.0.1:8787)
       ├─ Supabase Auth  GET /auth/v1/user  → verified user id
@@ -38,8 +40,8 @@ with the server-only service role. Server-side isolation is also enforced explic
 verified user id.
 
 **This is still a development arrangement, not a production hosting solution.** The Node process is loopback-only and
-reached through the Vite dev proxy. Production hosting, durable cross-instance quotas, and a real sign-in UI remain
-future work.
+reached through the Vite dev proxy. Production hosting, durable cross-instance quotas, and broader account flows (sign-up, password reset, MFA, OAuth)
+remain future work.
 
 ## Run locally
 
@@ -47,7 +49,7 @@ future work.
 cd storyframe
 npm install
 cp .env.example .env
-# fill in Ollama + Supabase values
+# fill in Ollama + server Supabase values, plus the two VITE_ browser auth values
 npm run dev
 ```
 
@@ -132,7 +134,19 @@ deleted afterwards. `npm run smoke:live` was run twice: the first five-call run 
 5/5 families and an identical stored replay. The project is empty again. Keep the compatibility
 check above for any other project.
 
-## Environment (server-only)
+## Environment
+
+### Browser-visible Supabase Auth
+
+These values are compiled into the Vite client and are public configuration. Use only the publishable (or legacy
+anon) key; never the service-role key.
+
+| Name | Purpose |
+| --- | --- |
+| `VITE_SUPABASE_URL` | Supabase project URL used by the browser auth client. |
+| `VITE_SUPABASE_PUBLISHABLE_KEY` | Publishable key used by the browser auth client. `VITE_SUPABASE_ANON_KEY` is accepted as a fallback. |
+
+### Server-only
 
 | Name | Purpose |
 | --- | --- |
@@ -148,8 +162,20 @@ check above for any other project.
 | `APP_ORIGIN` | Optional additional origin restriction for API calls. |
 | `SMOKE_SUPABASE_ACCESS_TOKEN` | Only for `npm run smoke:live`; a valid session token. Never commit it. |
 
-`.env` is git-ignored; `.env.example` contains placeholders only. No secret is prefixed with `VITE_`, stored in
-`localStorage`, returned by the API, logged, or placed in a URL.
+`.env` is git-ignored; `.env.example` contains placeholders only. Only public Supabase auth configuration uses a
+`VITE_` name; no secret is prefixed with `VITE_`, returned by the API, logged, or placed in a URL. The Supabase client
+persists session tokens in browser `localStorage` and sends them only to the Node server in the `Authorization` header.
+
+## Authentication
+
+The browser creates a Supabase client with `persistSession`, `autoRefreshToken`, and `detectSessionInUrl` enabled. The
+sign-in screen posts an email and password to Supabase Auth; an existing session is restored on load. The server still
+verifies the resulting access token on every AI and data route. Before a request, the client reads the current session
+and refreshes it when it is within 30 seconds of expiry. `onAuthStateChange` updates the screen on sign-in, token
+refresh, and sign-out. Sign-out clears the local Supabase session.
+
+There is no sign-up, password-reset, MFA, or OAuth flow yet. The test screen remains a development harness, not a
+production account-management UI.
 
 ## API
 
@@ -422,6 +448,8 @@ Coverage includes:
 - Missing key, unknown/disabled model, oversized prompt/body, provider auth failure, rate limiting, timeout,
   malformed/empty responses, success extraction, secret leakage, and duplicate submission
 - UI reply rendering, error display, and duplicate-submission suppression
+- Supabase Auth UI: initial session restore, email/password sign-in, sign-out, sign-in errors, and the 30-second
+  pre-expiry refresh path
 
 ### Repeatable live smoke check
 
@@ -456,8 +484,9 @@ gone. It exits non-zero on failure and never prints access tokens or keys. It do
 
 ## Security limitations
 
-- No sign-in UI yet; the development screen accepts a pasted Supabase access token. That is not a production login
-  flow.
+- Email/password sign-in only; there is no sign-up, password-reset, MFA, OAuth, or account-management UI. The
+  Supabase client persists session tokens in browser `localStorage`; production needs an explicit session-storage and
+  CSP review.
 - The migrations and RLS policies are applied to the configured Supabase project. The hosted catalog was checked (11
   tables, RLS, policies, grants, revision trigger), live profile/project/child routes and two-user isolation passed
   39/39 checks on the hardening commit, and the disposable users were deleted afterwards. Rerun these checks with

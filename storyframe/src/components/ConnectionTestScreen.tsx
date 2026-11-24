@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { AiStatusResponse, AiTestSuccess } from "../../shared/ai-contract";
 import { AiRequestError, fetchStatus, runModelTest } from "../api";
+import { AuthSessionError } from "../auth";
 
 const DEFAULT_PROMPT = "Write one short welcome sentence for StoryFrame.";
 
@@ -20,10 +21,9 @@ function createIdempotencyKey(): string {
   return `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
-export function ConnectionTestScreen() {
+export function ConnectionTestScreen({ getAccessToken }: { getAccessToken: () => Promise<string> }) {
   const [status, setStatus] = useState<AiStatusResponse | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
-  const [accessToken, setAccessToken] = useState("");
   const [modelId, setModelId] = useState("");
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
   const [busy, setBusy] = useState(false);
@@ -35,7 +35,7 @@ export function ConnectionTestScreen() {
 
   useEffect(() => {
     idempotencyKeyRef.current = null;
-  }, [accessToken, modelId, prompt]);
+  }, [modelId, prompt]);
 
   useEffect(() => {
     let cancelled = false;
@@ -58,7 +58,7 @@ export function ConnectionTestScreen() {
   const availableModels = status?.models.filter((model) => model.available) ?? [];
   const unavailableModels = status?.models.filter((model) => !model.available) ?? [];
   const promptLimit = status?.limits.promptMaxChars ?? 500;
-  const canSubmit = Boolean(modelId) && Boolean(accessToken.trim()) && !busy;
+  const canSubmit = Boolean(modelId) && !busy;
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -69,6 +69,7 @@ export function ConnectionTestScreen() {
     setResult(null);
 
     try {
+      const accessToken = await getAccessToken();
       const idempotencyKey = idempotencyKeyRef.current ?? createIdempotencyKey();
       idempotencyKeyRef.current = idempotencyKey;
       const outcome = await runModelTest(accessToken, modelId, prompt, idempotencyKey);
@@ -79,7 +80,9 @@ export function ConnectionTestScreen() {
       const requestError =
         cause instanceof AiRequestError
           ? cause
-          : new AiRequestError("NETWORK_ERROR", "The StoryFrame development server could not be reached.", 0);
+          : cause instanceof AuthSessionError
+            ? new AiRequestError(cause.code, cause.message, cause.status)
+            : new AiRequestError("NETWORK_ERROR", "The StoryFrame development server could not be reached.", 0);
       if (!KEY_RETAINING_ERROR_CODES.has(requestError.code)) idempotencyKeyRef.current = null;
       setError(requestError);
     } finally {
@@ -215,22 +218,9 @@ export function ConnectionTestScreen() {
         </div>
 
         <form onSubmit={handleSubmit} noValidate>
-          <label className="field" htmlFor="access-token">
-            <span className="field-label">Supabase access token</span>
-            <input
-              id="access-token"
-              name="access-token"
-              type="password"
-              autoComplete="off"
-              spellCheck={false}
-              value={accessToken}
-              onChange={(event) => setAccessToken(event.target.value)}
-              placeholder="Session access token"
-            />
-            <span className="hint">
-              Paste a valid session token for this development check. It is held in memory for this tab only.
-            </span>
-          </label>
+          <p className="hint session-hint">
+            Requests use the signed-in Supabase session; no token is pasted or displayed here.
+          </p>
 
           <label className="field" htmlFor="model">
             <span className="field-label">Model</span>
