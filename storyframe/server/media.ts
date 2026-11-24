@@ -295,6 +295,8 @@ export interface MediaStore {
   ): Promise<MediaRecord | null>;
   markDeleted(ownerId: string, projectId: string, mediaId: string): Promise<boolean>;
   removeRow(id: string): Promise<void>;
+  /** Ids among mediaIds that are ready in this owner's project. */
+  readyAssetIds(ownerId: string, projectId: string, mediaIds: string[]): Promise<Set<string>>;
 
   listReferences(ownerId: string, projectId: string, mediaId: string): Promise<MediaReferenceRecord[]>;
   addReference(
@@ -563,6 +565,31 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
         found.map((row) => rowText(row, "id")),
       );
       return found.map((row) => toMedia(row, counts.get(rowText(row, "id")) ?? 0));
+    },
+
+    async readyAssetIds(ownerId, projectId, mediaIds) {
+      const ready = new Set<string>();
+      const unique = [...new Set(mediaIds)];
+      // Keep each filter URL bounded; a document can hold up to 1000 ids.
+      for (let index = 0; index < unique.length; index += 100) {
+        const chunk = unique.slice(index, index + 100);
+        const found = rows(
+          await request(
+            tableUrl("media_metadata", {
+              select: "id",
+              id: `in.(${chunk.join(",")})`,
+              project_id: `eq.${projectId}`,
+              owner_id: `eq.${ownerId}`,
+              status: "eq.ready",
+              limit: String(chunk.length),
+            }),
+            { headers: readHeaders },
+            "the ready asset list",
+          ),
+        );
+        for (const row of found) ready.add(rowText(row, "id"));
+      }
+      return ready;
     },
 
     async listObjectKeys(ownerId, projectId) {

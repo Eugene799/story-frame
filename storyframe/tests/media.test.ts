@@ -303,6 +303,149 @@ describe("private media storage", () => {
     }
   });
 
+  it("refuses saved scene asset ids that are not ready media in this project", async () => {
+    const app = await startTestServer();
+    try {
+      const projectId = await createProject(app.url);
+      const valid = await initiateUpload(app.url, projectId, {
+        kind: "image",
+        contentType: "image/png",
+        byteSize: PNG.length,
+      });
+      await putObject(valid, PNG);
+      expect((await complete(app.url, projectId, valid.media.id)).status).toBe(200);
+
+      const read = await apiRequest(app.url, `/api/projects/${projectId}`);
+      const project = ((await read.json()) as {
+        project: {
+          title: string;
+          version: number;
+          document: { scenes: Record<string, unknown>[] };
+        };
+      }).project;
+      const scene = project.document.scenes[0];
+      const save = (assetIds: string[], version: number) =>
+        apiRequest(app.url, `/api/projects/${projectId}`, {
+          method: "PUT",
+          body: JSON.stringify({
+            title: project.title,
+            document: { ...project.document, scenes: [{ ...scene, assetIds }] },
+            version,
+          }),
+        });
+
+      const accepted = await save([valid.media.id], project.version);
+      expect(accepted.status).toBe(200);
+      const savedVersion = project.version + 1;
+
+      const unknown = await save(["11111111-1111-4111-8111-111111111111"], savedVersion);
+      expect(unknown.status).toBe(422);
+      expect(await unknown.json()).toMatchObject({ ok: false, error: { code: "MEDIA_ASSET_INVALID" } });
+
+      const pending = await initiateUpload(app.url, projectId, {
+        kind: "image",
+        contentType: "image/png",
+        byteSize: PNG.length,
+      });
+      const pendingSave = await save([pending.media.id], savedVersion);
+      expect(pendingSave.status).toBe(422);
+      expect(await pendingSave.json()).toMatchObject({ ok: false, error: { code: "MEDIA_ASSET_INVALID" } });
+
+      const otherProject = await createProject(app.url);
+      const foreign = await initiateUpload(app.url, otherProject, {
+        kind: "image",
+        contentType: "image/png",
+        byteSize: PNG.length,
+      });
+      await putObject(foreign, PNG);
+      expect((await complete(app.url, otherProject, foreign.media.id)).status).toBe(200);
+      const foreignSave = await save([foreign.media.id], savedVersion);
+      expect(foreignSave.status).toBe(422);
+      expect(await foreignSave.json()).toMatchObject({ ok: false, error: { code: "MEDIA_ASSET_INVALID" } });
+
+      const deleted = await initiateUpload(app.url, projectId, {
+        kind: "image",
+        contentType: "image/png",
+        byteSize: PNG.length,
+      });
+      await putObject(deleted, PNG);
+      expect((await complete(app.url, projectId, deleted.media.id)).status).toBe(200);
+      expect(
+        (await apiRequest(app.url, `/api/projects/${projectId}/media/${deleted.media.id}`, { method: "DELETE" })).status,
+      ).toBe(200);
+      const deletedSave = await save([deleted.media.id], savedVersion);
+      expect(deletedSave.status).toBe(422);
+      expect(await deletedSave.json()).toMatchObject({ ok: false, error: { code: "MEDIA_ASSET_INVALID" } });
+
+      const createWithAsset = await apiRequest(app.url, "/api/projects", {
+        method: "POST",
+        body: JSON.stringify({
+          projectType: "story",
+          title: "Dangling on create",
+          document: { ...DOCUMENT, scenes: [{ ...DOCUMENT.scenes[0], assetIds: [valid.media.id] }] },
+        }),
+      });
+      expect(createWithAsset.status).toBe(422);
+      expect(await createWithAsset.json()).toMatchObject({ ok: false, error: { code: "MEDIA_ASSET_INVALID" } });
+
+      const after = await apiRequest(app.url, `/api/projects/${projectId}`);
+      const reread = ((await after.json()) as { project: { version: number; document: { scenes: { assetIds: string[] }[] } } })
+        .project;
+      expect(reread.version).toBe(savedVersion);
+      expect(reread.document.scenes[0].assetIds).toEqual([valid.media.id]);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("checks ready asset ids past the first 100-id chunk", async () => {
+    const app = await startTestServer();
+    try {
+      const projectId = await createProject(app.url);
+      const assetIds = Array.from({ length: 101 }, (_, index) => `bulk-${String(index).padStart(3, "0")}`);
+      for (const id of assetIds) {
+        app.supabase.media.push({ id, owner_id: USER_A.id, project_id: projectId, status: "ready" });
+      }
+
+      const read = await apiRequest(app.url, `/api/projects/${projectId}`);
+      const project = ((await read.json()) as {
+        project: { title: string; version: number; document: { scenes: Record<string, unknown>[] } };
+      }).project;
+      const scene = project.document.scenes[0];
+      const documentWith = (ids: string[]) => ({
+        ...project.document,
+        scenes: Array.from({ length: 6 }, (_, index) => ({
+          ...scene,
+          id: `scene-${index + 1}`,
+          assetIds: ids.slice(index * 20, index * 20 + 20),
+        })),
+      });
+      const save = (ids: string[], version: number) =>
+        apiRequest(app.url, `/api/projects/${projectId}`, {
+          method: "PUT",
+          body: JSON.stringify({ title: project.title, document: documentWith(ids), version }),
+        });
+
+      // 100 ids fill the first request and the 101st needs the second chunk.
+      const accepted = await save(assetIds, project.version);
+      expect(accepted.status).toBe(200);
+
+      const broken = [...assetIds.slice(0, 100), "bulk-missing"];
+      const rejected = await save(broken, project.version + 1);
+      expect(rejected.status).toBe(422);
+      expect(await rejected.json()).toMatchObject({ ok: false, error: { code: "MEDIA_ASSET_INVALID" } });
+
+      const after = await apiRequest(app.url, `/api/projects/${projectId}`);
+      const reread = ((await after.json()) as {
+        project: { version: number; document: { scenes: { assetIds: string[] }[] } };
+      }).project;
+      expect(reread.version).toBe(project.version + 1);
+      expect(reread.document.scenes.flatMap((item) => item.assetIds)).toEqual(assetIds);
+    } finally {
+      await app.close();
+    }
+  });
+
   it("refuses to delete an asset that the saved project document still lists", async () => {
     const app = await startTestServer();
     try {

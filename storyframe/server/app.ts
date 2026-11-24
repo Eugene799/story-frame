@@ -595,7 +595,17 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       }
       if (method === "POST") {
         const body = await readJsonBody(request, PROJECT_LIMITS.bodyBytes);
-        const project = await store.create(user.id, parseProjectWrite(body));
+        const write = parseProjectWrite(body);
+        // Media is scoped to an existing project, so a new project cannot
+        // legitimately list any asset ids yet.
+        if (write.document.scenes.some((scene) => scene.assetIds.length > 0)) {
+          throw new HttpError(
+            422,
+            "MEDIA_ASSET_INVALID",
+            "A new project cannot list scene asset ids. Create the project, upload the media, then save it.",
+          );
+        }
+        const project = await store.create(user.id, write);
         sendJson(response, 201, { ok: true, project });
         return;
       }
@@ -644,6 +654,21 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       // client's version number, so no save path can overwrite them.
       const current = await store.get(user.id, projectId);
       assertSceneLocks(current.document, update.document);
+      // The document's scene asset ids are the other half of the media link.
+      // Refuse a save that would store an id with no ready media behind it, so
+      // an API write cannot create a dangling reference.
+      const assetIds = [...new Set(update.document.scenes.flatMap((scene) => scene.assetIds))];
+      if (assetIds.length > 0) {
+        const ready = await requireMediaStore().readyAssetIds(user.id, projectId, assetIds);
+        const unknown = assetIds.find((assetId) => !ready.has(assetId));
+        if (unknown) {
+          throw new HttpError(
+            422,
+            "MEDIA_ASSET_INVALID",
+            `Scene asset id ${unknown} is not ready media in this project.`,
+          );
+        }
+      }
       const project = await store.update(user.id, projectId, update);
       sendJson(response, 200, { ok: true, project });
       return;
