@@ -76,7 +76,7 @@ afterEach(() => {
 });
 
 function installFetch(testHandler: () => Promise<Response>) {
-  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
     const url = String(input);
     if (url.endsWith("/api/ai/status")) return jsonResponse(STATUS);
     if (url.endsWith("/api/ai/test")) return testHandler();
@@ -86,17 +86,18 @@ function installFetch(testHandler: () => Promise<Response>) {
   return fetchMock;
 }
 
+function renderScreen(getAccessToken: () => Promise<string> = async () => "token-value") {
+  return render(<ConnectionTestScreen getAccessToken={getAccessToken} />);
+}
+
 function fillAndFindButton() {
-  fireEvent.change(screen.getByLabelText(/Supabase access token/i), {
-    target: { value: "token-value" },
-  });
   return screen.getByRole("button", { name: /Send test request/i });
 }
 
 describe("ConnectionTestScreen", () => {
   it("displays the actual final reply, returned model, latency, and supplied usage", async () => {
     installFetch(async () => jsonResponse(SUCCESS));
-    render(<ConnectionTestScreen />);
+    renderScreen();
 
     await screen.findByRole("option", { name: /Gemma 4 31B/ });
     fireEvent.click(fillAndFindButton());
@@ -110,7 +111,7 @@ describe("ConnectionTestScreen", () => {
 
   it("does not present an unrecorded reply as an ordinary success", async () => {
     installFetch(async () => jsonResponse(SUCCESS, 200, { "X-Storyframe-Usage": "unrecorded" }));
-    render(<ConnectionTestScreen />);
+    renderScreen();
 
     await screen.findByRole("option", { name: /Gemma 4 31B/ });
     fireEvent.click(fillAndFindButton());
@@ -128,7 +129,7 @@ describe("ConnectionTestScreen", () => {
     });
     const fetchMock = installFetch(() => pending);
 
-    render(<ConnectionTestScreen />);
+    renderScreen();
     await screen.findByRole("option", { name: /Gemma 4 31B/ });
     const button = fillAndFindButton();
 
@@ -171,7 +172,7 @@ describe("ConnectionTestScreen", () => {
       }),
     );
 
-    render(<ConnectionTestScreen />);
+    renderScreen();
     await screen.findByRole("option", { name: /Gemma 4 31B/ });
     const button = fillAndFindButton();
 
@@ -191,6 +192,40 @@ describe("ConnectionTestScreen", () => {
     expect(keys[2]).not.toBe(keys[1]);
   });
 
+  it("uses the current Supabase session token for the request", async () => {
+    const fetchMock = installFetch(async () => jsonResponse(SUCCESS));
+    const getAccessToken = vi.fn(async () => "session-token");
+    renderScreen(getAccessToken);
+
+    await screen.findByRole("option", { name: /Gemma 4 31B/ });
+    fireEvent.click(fillAndFindButton());
+
+    expect(await screen.findByTestId("ai-reply")).toHaveTextContent(SUCCESS.reply);
+    expect(getAccessToken).toHaveBeenCalledTimes(1);
+    const testCall = fetchMock.mock.calls.find(([input]) => String(input).endsWith("/api/ai/test"));
+    expect(new Headers(testCall?.[1]?.headers).get("Authorization")).toBe("Bearer session-token");
+  });
+
+  it("reports when a billable request is in flight so sign-out can wait for it", async () => {
+    let release: ((response: Response) => void) | undefined;
+    const pending = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+    installFetch(() => pending);
+    const onBusyChange = vi.fn();
+    render(
+      <ConnectionTestScreen getAccessToken={async () => "token-value"} onBusyChange={onBusyChange} />,
+    );
+
+    await screen.findByRole("option", { name: /Gemma 4 31B/ });
+    fireEvent.click(fillAndFindButton());
+    await waitFor(() => expect(onBusyChange).toHaveBeenLastCalledWith(true));
+
+    release?.(jsonResponse(SUCCESS));
+    expect(await screen.findByTestId("ai-reply")).toHaveTextContent(SUCCESS.reply);
+    await waitFor(() => expect(onBusyChange).toHaveBeenLastCalledWith(false));
+  });
+
   it("shows a sanitized server error", async () => {
     installFetch(async () =>
       jsonResponse(
@@ -206,7 +241,7 @@ describe("ConnectionTestScreen", () => {
       ),
     );
 
-    render(<ConnectionTestScreen />);
+    renderScreen();
     await screen.findByRole("option", { name: /Gemma 4 31B/ });
     fireEvent.click(fillAndFindButton());
 
@@ -226,7 +261,7 @@ describe("ConnectionTestScreen", () => {
       throw new Error("unexpected");
     });
 
-    render(<ConnectionTestScreen />);
+    renderScreen();
     expect(await screen.findByRole("option", { name: /Gemma 4 31B/ })).toBeInTheDocument();
     expect(await screen.findByText(/Configure the key on the server/i)).toBeInTheDocument();
     expect(screen.getByText(/storyframe\/.env/)).toBeInTheDocument();
