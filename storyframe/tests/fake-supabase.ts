@@ -87,6 +87,8 @@ export interface FakeSupabase {
   proposals: Record<string, unknown>[];
   jobs: Record<string, unknown>[];
   renders: Record<string, unknown>[];
+  media: Record<string, unknown>[];
+  mediaReferences: Record<string, unknown>[];
   close: () => Promise<void>;
 }
 
@@ -137,6 +139,8 @@ export async function startFakeSupabase(
   const proposals: Record<string, unknown>[] = [];
   const jobs: Record<string, unknown>[] = [];
   const renders: Record<string, unknown>[] = [];
+  const media: Record<string, unknown>[] = [];
+  const mediaReferences: Record<string, unknown>[] = [];
   const childTables: Record<string, Record<string, unknown>[]> = {
     scenes,
     sources,
@@ -144,6 +148,8 @@ export async function startFakeSupabase(
     generation_proposals: proposals,
     provider_jobs: jobs,
     render_snapshots: renders,
+    media_metadata: media,
+    media_references: mediaReferences,
   };
   let failWritesRemaining = options.failWrites ?? 0;
 
@@ -523,15 +529,29 @@ export async function startFakeSupabase(
             }
           };
 
-          const id = eqFilter(url.searchParams.get("id"));
-          const projectId = eqFilter(url.searchParams.get("project_id"));
-          const ownerId = eqFilter(url.searchParams.get("owner_id"));
-          const sceneKey = eqFilter(url.searchParams.get("scene_key"));
-          const matches = (row: Record<string, unknown>) =>
-            (id === null || row.id === id) &&
-            (projectId === null || row.project_id === projectId) &&
-            (ownerId === null || row.owner_id === ownerId) &&
-            (sceneKey === null || row.scene_key === sceneKey);
+          // PostgREST filters every update/read itself. These are the operator
+          // shapes the server uses: eq, lt, neq, in, and is.null.
+          const RESERVED = new Set(["select", "order", "limit", "on_conflict"]);
+          const matches = (row: Record<string, unknown>) => {
+            for (const [name, raw] of url.searchParams) {
+              if (RESERVED.has(name)) continue;
+              const value = row[name];
+              if (raw.startsWith("eq.")) {
+                if (String(value ?? "") !== raw.slice(3)) return false;
+              } else if (raw.startsWith("lt.")) {
+                if (value === null || value === undefined || String(value) >= raw.slice(3)) return false;
+              } else if (raw.startsWith("neq.")) {
+                if (String(value ?? "") === raw.slice(4)) return false;
+              } else if (raw.startsWith("in.(") && raw.endsWith(")")) {
+                if (!raw.slice(4, -1).split(",").includes(String(value ?? ""))) return false;
+              } else if (raw === "is.null") {
+                if (value !== null && value !== undefined) return false;
+              } else {
+                return false;
+              }
+            }
+            return true;
+          };
 
           if (request.method === "POST") {
             // PostgREST accepts one object or an array of rows in the same call.
@@ -541,6 +561,27 @@ export async function startFakeSupabase(
             const created: Record<string, unknown>[] = [];
 
             for (const body of bodies) {
+              // Uniqueness the server relies on for idempotent media writes.
+              if (
+                table === "media_metadata" &&
+                data.some((row) => row.object_key === body.object_key)
+              ) {
+                sendJson(response, 409, { code: "23505", message: "duplicate object key" });
+                return;
+              }
+              if (
+                table === "media_references" &&
+                data.some(
+                  (row) =>
+                    row.media_id === body.media_id &&
+                    row.ref_kind === body.ref_kind &&
+                    row.ref_id === body.ref_id,
+                )
+              ) {
+                sendJson(response, 409, { code: "23505", message: "duplicate media reference" });
+                return;
+              }
+
               // The render table's composite foreign key: a revision must exist.
               if (table === "render_snapshots") {
                 const revisionExists = revisions.some(
@@ -569,7 +610,11 @@ export async function startFakeSupabase(
                 }
               }
 
-              const row: Record<string, unknown> = { ...body, id: randomUUID(), created_at: now };
+              const row: Record<string, unknown> = {
+                ...body,
+                id: typeof body.id === "string" ? body.id : randomUUID(),
+                created_at: now,
+              };
               switch (table) {
                 case "scenes":
                   row.created_at = now;
@@ -590,6 +635,13 @@ export async function startFakeSupabase(
                   break;
                 case "render_snapshots":
                   row.status = body.status ?? "pending";
+                  break;
+                case "media_metadata":
+                  row.status = body.status ?? "pending";
+                  row.ready_at = null;
+                  row.deleted_at = null;
+                  row.upload_expires_at = body.upload_expires_at ?? null;
+                  row.updated_at = now;
                   break;
               }
               data.push(row);
@@ -629,7 +681,16 @@ export async function startFakeSupabase(
             }
             const rawLimit = Number(url.searchParams.get("limit") ?? "100");
             const limit = Number.isFinite(rawLimit) ? Math.max(0, Math.min(200, Math.floor(rawLimit))) : 100;
-            sendJson(response, 200, rows.slice(0, limit));
+
+            // PostgREST returns only the selected columns. A select list that
+            // omits a column the server reads must fail here, not only live.
+            const select = url.searchParams.get("select");
+            const columns = select ? select.split(",").map((column) => column.trim()).filter(Boolean) : null;
+            const page = rows.slice(0, limit).map((row) => {
+              if (!columns || columns.includes("*")) return row;
+              return Object.fromEntries(columns.map((column) => [column, row[column]]));
+            });
+            sendJson(response, 200, page);
             return;
           }
         }
@@ -656,6 +717,8 @@ export async function startFakeSupabase(
     proposals,
     jobs,
     renders,
+    media,
+    mediaReferences,
     close: () =>
       new Promise<void>((resolve, reject) => {
         server.closeAllConnections();

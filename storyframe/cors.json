@@ -1,0 +1,17 @@
+{
+  "rules": [
+    {
+      "id": "storyframe-studio-origins",
+      "allowed": {
+        "origins": [
+          "http://localhost:3000",
+          "https://pv-2ad413f7aefe-3a226257-21b4-4376-a3ff-f26b6e10f32c.style.dev"
+        ],
+        "methods": ["GET", "PUT", "HEAD"],
+        "headers": ["Content-Type"]
+      },
+      "exposeHeaders": ["ETag", "Content-Length"],
+      "maxAgeSeconds": 3600
+    }
+  ]
+}

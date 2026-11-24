@@ -18,6 +18,7 @@ const MIGRATIONS = [
   "20261124120000_create_projects.sql",
   "20261124140000_create_project_children.sql",
   "20261124150000_create_profiles.sql",
+  "20261124160000_create_media_storage.sql",
 ];
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "supabase", "migrations");
 
@@ -256,6 +257,29 @@ for (const child of CHILD_ROWS) {
       [PROJECT_A, USER_A, ...child.params(`${key}-denied`)]))) === "42501");
 }
 
+// 8b. Phase 3: media references follow the same pattern and cascade.
+const mediaRows = await as<{ id: string }>("service_role", null,
+  "select id from public.media_metadata where project_id = $1 limit 1", [PROJECT_A]);
+await as("service_role", null,
+  `insert into public.media_references (media_id, project_id, owner_id, ref_kind, ref_id)
+   values ($1, $2, $3, 'scene', 'scene-1')`, [mediaRows[0].id, PROJECT_A, USER_A]);
+check("media_references: owner reads their reference",
+  (await count("media_references", "project_id = $1", [PROJECT_A], "authenticated", USER_A)) === 1);
+check("media_references: another account reads nothing",
+  (await count("media_references", "project_id = $1", [PROJECT_A], "authenticated", USER_B)) === 0);
+check("media_references: authenticated write is refused (42501)",
+  (await errorCode(() => as("authenticated", USER_A,
+    `insert into public.media_references (media_id, project_id, owner_id, ref_kind, ref_id)
+     values ($1, $2, $3, 'scene', 'scene-2')`, [mediaRows[0].id, PROJECT_A, USER_A]))) === "42501");
+check("media_references: duplicate reference is rejected (23505)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.media_references (media_id, project_id, owner_id, ref_kind, ref_id)
+     values ($1, $2, $3, 'scene', 'scene-1')`, [mediaRows[0].id, PROJECT_A, USER_A]))) === "23505");
+check("media_metadata: upload timestamps default to null",
+  (await as<{ ok: boolean }>("service_role", null,
+    `select (upload_expires_at is null and ready_at is null and deleted_at is null) as ok
+       from public.media_metadata where project_id = $1`, [PROJECT_A]))[0].ok === true);
+
 check("render_snapshots rejects a revision that does not exist (23503)",
   (await errorCode(() => as("service_role", null,
     `insert into public.render_snapshots (project_id, owner_id, project_revision)
@@ -284,6 +308,8 @@ for (const child of CHILD_ROWS) {
   check(`deleting the project removed its ${child.table} rows`,
     (await count(child.table, "project_id = $1", [PROJECT_A])) === 0);
 }
+check("deleting the project removed its media references",
+  (await count("media_references", "project_id = $1", [PROJECT_A])) === 0);
 
 // 11. Deleting the auth user cascades projects, revisions, child rows and the profile.
 await as("service_role", null,

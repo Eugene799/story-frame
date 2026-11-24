@@ -41,6 +41,19 @@ import {
 } from "./projects";
 import { ApiError } from "./api-error";
 import {
+  createSupabaseMediaStore,
+  detectMediaType,
+  limitForKind,
+  mediaObjectKey,
+  mediaTypeMatches,
+  newMediaId,
+  parseMediaInitiate,
+  parseMediaReferenceWrite,
+  sweepMedia,
+  type MediaStore,
+} from "./media";
+import { R2Error, createR2Client, type R2Client } from "./r2";
+import {
   PROFILE_LIMITS,
   createSupabaseProfileStore,
   parseProfileUpdate,
@@ -172,6 +185,15 @@ function failure(code: string, message: string, upstreamStatus?: number): AiErro
     ok: false,
     error: { code, message, ...(upstreamStatus !== undefined ? { upstreamStatus } : {}) },
   };
+}
+
+function requireMediaBucket<T>(action: () => Promise<T>): Promise<T> {
+  return action().catch((error: unknown) => {
+    if (error instanceof R2Error) {
+      throw new HttpError(503, "MEDIA_STORAGE_UNAVAILABLE", "The private media bucket is temporarily unavailable.");
+    }
+    throw error;
+  });
 }
 
 function toErrorResponse(error: unknown): { status: number; body: AiErrorResponse } {
@@ -342,6 +364,18 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         })
       : null;
 
+  const mediaStore: MediaStore | null =
+    config.supabaseUrl && config.supabaseServiceRoleKey
+      ? createSupabaseMediaStore({
+          url: config.supabaseUrl,
+          serviceRoleKey: config.supabaseServiceRoleKey,
+          timeoutMs: config.authTimeoutMs,
+        })
+      : null;
+
+  const mediaObjects: R2Client | null = config.r2 ? createR2Client(config.r2, { fetchImpl, now }) : null;
+  let lastMediaSweep = 0;
+
   const server = createHttpServer((request, response) => {
     void handleRequest(request, response).catch((error: unknown) => {
       const { status, body } = toErrorResponse(error);
@@ -459,6 +493,39 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     return childStore;
   }
 
+  function requireMediaStore(): MediaStore {
+    if (!mediaStore) {
+      throw new HttpError(
+        503,
+        "MEDIA_NOT_CONFIGURED",
+        "Media storage is not configured on the server. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.",
+      );
+    }
+    return mediaStore;
+  }
+
+  function requireMediaObjects(): R2Client {
+    if (!mediaObjects) {
+      throw new HttpError(
+        503,
+        "MEDIA_NOT_CONFIGURED",
+        "Private media storage is not configured on the server. Set the R2 endpoint, bucket, access key, and secret.",
+      );
+    }
+    return mediaObjects;
+  }
+
+  async function maybeSweepMedia(store: MediaStore, objects: R2Client): Promise<void> {
+    if (now() - lastMediaSweep < config.media.sweepIntervalMs) return;
+    lastMediaSweep = now();
+    try {
+      await sweepMedia({ store, objects, limits: config.media, now, logger: log });
+    } catch {
+      // Cleanup is opportunistic; it must never fail the request that triggered it.
+      log.error("[media] MEDIA_SWEEP_FAILED");
+    }
+  }
+
   function requireProfile(): ProfileStore {
     if (!profileStore) {
       throw new HttpError(
@@ -538,6 +605,11 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       throw new HttpError(404, "PROJECT_NOT_FOUND", PROJECT_NOT_FOUND_MESSAGE);
     }
 
+    if (segments.length > 1 && segments[1] === "media") {
+      await handleMedia(request, response, user, projectId, segments.slice(2));
+      return;
+    }
+
     if (segments.length > 1) {
       const [, resource, childId, ...rest] = segments;
       if (rest.length > 0 || !CHILD_RESOURCES.has(resource)) {
@@ -563,6 +635,247 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       return;
     }
     throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET, PUT, or DELETE for this endpoint.");
+  }
+
+  async function handleMedia(
+    request: IncomingMessage,
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+    rest: string[],
+  ): Promise<void> {
+    const store = requireMediaStore();
+    const objects = requireMediaObjects();
+    const method = request.method ?? "GET";
+
+    // Same ownership rule as every other project route: a foreign project id is
+    // answered exactly like a missing one, before any media row is read.
+    await requireProjects().get(user.id, projectId);
+    await maybeSweepMedia(store, objects);
+
+    if (rest.length === 0) {
+      if (method === "GET") {
+        const media = await store.list(user.id, projectId, config.media.listLimit);
+        sendJson(response, 200, { ok: true, media });
+        return;
+      }
+      if (method === "POST") {
+        const write = parseMediaInitiate(await readJsonBody(request, config.media.bodyBytes), config.media);
+
+        const used = await store.usedBytes(user.id);
+        if (used + write.byteSize > config.media.ownerStorageBytes) {
+          throw new HttpError(
+            413,
+            "MEDIA_STORAGE_LIMIT",
+            `This account's media storage limit is ${config.media.ownerStorageBytes} bytes.`,
+          );
+        }
+
+        const mediaId = newMediaId();
+        const objectKey = mediaObjectKey(user.id, mediaId);
+        const upload = objects.presignPut(objectKey, config.media.uploadUrlSeconds);
+        const uploadExpiresAt = new Date(
+          now() + Math.min(config.media.uploadTtlMs, config.media.uploadUrlSeconds * 1000),
+        ).toISOString();
+
+        const media = await store.createPending(user.id, projectId, {
+          id: mediaId,
+          kind: write.kind,
+          contentType: write.contentType,
+          byteSize: write.byteSize,
+          sceneKey: write.sceneKey,
+          objectKey,
+          uploadExpiresAt,
+        });
+
+        sendJson(response, 201, {
+          ok: true,
+          media,
+          upload: {
+            url: upload.url,
+            method: "PUT",
+            headers: { "Content-Type": write.contentType },
+            expiresAt: upload.expiresAt,
+          },
+        });
+        return;
+      }
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET or POST for the media of a project.");
+    }
+
+    const [mediaId, action, referenceId, ...extra] = rest;
+    if (!isChildId(mediaId) || extra.length > 0) {
+      throw new HttpError(404, "MEDIA_NOT_FOUND", "No media with that id is owned by this account.");
+    }
+
+    const stored = await store.get(user.id, projectId, mediaId);
+    if (!stored) {
+      throw new HttpError(404, "MEDIA_NOT_FOUND", "No media with that id is owned by this account.");
+    }
+    const row = stored.media;
+    const objectKey = stored.objectKey;
+
+    if (action === undefined) {
+      if (method === "GET") {
+        sendJson(response, 200, {
+          ok: true,
+          media: row,
+          references: await store.listReferences(user.id, projectId, mediaId),
+        });
+        return;
+      }
+      if (method === "DELETE") {
+        if (row.status === "deleted") {
+          sendJson(response, 200, { ok: true, deletedId: mediaId });
+          return;
+        }
+        // A shared asset is removed only after its last reference is released.
+        const references = row.referenceCount + (row.sceneKey === null ? 0 : 1);
+        if (references > 0) {
+          throw new HttpError(
+            409,
+            "MEDIA_IN_USE",
+            `This media is still referenced ${references} time(s). Remove those references before deleting it.`,
+          );
+        }
+        await requireMediaBucket(() => objects.delete(objectKey));
+        if (!(await store.markDeleted(user.id, projectId, mediaId))) {
+          throw new HttpError(409, "MEDIA_STATE_CHANGED", "This media changed while it was being deleted.");
+        }
+        sendJson(response, 200, { ok: true, deletedId: mediaId });
+        return;
+      }
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET or DELETE for one media record.");
+    }
+
+    if (action === "complete") {
+      if (method !== "POST") throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to complete an upload.");
+
+      if (row.status === "deleted") {
+        throw new HttpError(409, "MEDIA_DELETED", "This media was deleted; start a new upload.");
+      }
+      if (row.status === "ready") {
+        sendJson(response, 200, { ok: true, media: row });
+        return;
+      }
+      if (row.uploadExpiresAt !== null && Date.parse(row.uploadExpiresAt) <= now()) {
+        await discardMedia(store, objects, user.id, projectId, row.id, objectKey);
+        throw new HttpError(409, "MEDIA_UPLOAD_EXPIRED", "This upload window has expired; start a new upload.");
+      }
+
+      const head = await requireMediaBucket(() => objects.head(objectKey));
+      if (head === null) {
+        throw new HttpError(409, "MEDIA_OBJECT_MISSING", "The uploaded object was not found in the bucket.");
+      }
+      if (head.byteSize === 0) {
+        await discardMedia(store, objects, user.id, projectId, row.id, objectKey);
+        throw new HttpError(422, "MEDIA_EMPTY", "The uploaded object is empty.");
+      }
+      if (head.byteSize > row.byteSize) {
+        await discardMedia(store, objects, user.id, projectId, row.id, objectKey);
+        throw new HttpError(409, "MEDIA_SIZE_MISMATCH", "The uploaded object is larger than the declared size.");
+      }
+      const declaredLimit = limitForKind(config.media, row.kind);
+      if (head.byteSize > declaredLimit) {
+        await discardMedia(store, objects, user.id, projectId, row.id, objectKey);
+        throw new HttpError(413, "MEDIA_TOO_LARGE", `This upload exceeds the ${declaredLimit}-byte limit.`);
+      }
+
+      const leading = await requireMediaBucket(() => objects.readRange(objectKey, config.media.sniffBytes));
+      if (leading === null) {
+        throw new HttpError(409, "MEDIA_OBJECT_MISSING", "The uploaded object was not found in the bucket.");
+      }
+      const detected = detectMediaType(leading);
+      if (!mediaTypeMatches(row.kind, detected)) {
+        await discardMedia(store, objects, user.id, projectId, row.id, objectKey);
+        throw new HttpError(
+          422,
+          "MEDIA_TYPE_MISMATCH",
+          "The uploaded file is not a supported image, audio, or video of the declared kind.",
+        );
+      }
+
+      const media = await store.markReady(user.id, projectId, mediaId, {
+        contentType: detected!.contentType,
+        byteSize: head.byteSize,
+      });
+      if (!media) {
+        throw new HttpError(409, "MEDIA_STATE_CHANGED", "This upload changed while it was being completed.");
+      }
+      sendJson(response, 200, { ok: true, media });
+      return;
+    }
+
+    if (action === "url") {
+      if (method !== "GET") throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for a playback URL.");
+      if (row.status !== "ready") {
+        throw new HttpError(409, "MEDIA_NOT_READY", "This media is not ready for playback yet.");
+      }
+      const head = await requireMediaBucket(() => objects.head(objectKey));
+      if (head === null) {
+        throw new HttpError(409, "MEDIA_OBJECT_MISSING", "The stored object is missing from the bucket.");
+      }
+      const playback = objects.presignGet(objectKey, config.media.downloadUrlSeconds);
+      sendJson(response, 200, {
+        ok: true,
+        url: playback.url,
+        expiresAt: playback.expiresAt,
+        contentType: row.contentType,
+        byteSize: head.byteSize,
+      });
+      return;
+    }
+
+    if (action === "references") {
+      if (referenceId === undefined) {
+        if (method === "GET") {
+          sendJson(response, 200, {
+            ok: true,
+            references: await store.listReferences(user.id, projectId, mediaId),
+          });
+          return;
+        }
+        if (method === "POST") {
+          if (row.status !== "ready") {
+            throw new HttpError(409, "MEDIA_NOT_READY", "Only ready media can be referenced.");
+          }
+          const write = parseMediaReferenceWrite(await readJsonBody(request, config.media.bodyBytes));
+          const reference = await store.addReference(user.id, projectId, mediaId, write);
+          sendJson(response, 201, { ok: true, reference });
+          return;
+        }
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET or POST for media references.");
+      }
+
+      if (method !== "DELETE") throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use DELETE for one media reference.");
+      if (!isChildId(referenceId)) {
+        throw new HttpError(404, "MEDIA_REFERENCE_NOT_FOUND", "No reference with that id belongs to this media.");
+      }
+      if (!(await store.removeReference(user.id, projectId, mediaId, referenceId))) {
+        throw new HttpError(404, "MEDIA_REFERENCE_NOT_FOUND", "No reference with that id belongs to this media.");
+      }
+      sendJson(response, 200, { ok: true, deletedId: referenceId });
+      return;
+    }
+
+    throw new HttpError(404, "NOT_FOUND", "Unknown endpoint.");
+  }
+
+  /** Removes an object that failed validation, then settles its row as deleted. */
+  async function discardMedia(
+    store: MediaStore,
+    objects: R2Client,
+    ownerId: string,
+    projectId: string,
+    mediaId: string,
+    objectKey: string,
+  ): Promise<void> {
+    try {
+      await objects.delete(objectKey);
+    } catch {
+      log.error("[media] R2_DELETE_FAILED");
+    }
+    await store.markDeleted(ownerId, projectId, mediaId).catch(() => undefined);
   }
 
   async function handleChild(

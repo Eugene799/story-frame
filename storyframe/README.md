@@ -1,13 +1,12 @@
-# StoryFrame — Phase 2: Supabase auth, usage ledger, and project data model
+# StoryFrame — Phase 3: private R2 media
 
-This repository state implements the first Phase 2 slices: a **server-verified Supabase session boundary**, a
-**durable, idempotent usage ledger** for the existing AI endpoints, and the **project data model** (`projects`,
-`project_revisions`, their child tables, and per-user profiles) with owner-scoped access. The Phase 1 Ollama connection and its bounded test endpoint remain, now
-behind real sessions and request-level idempotency keys.
+This repository state keeps the Phase 2 pieces — a **server-verified Supabase session boundary**, a **durable,
+idempotent usage ledger**, and the **project data model** with owner-scoped access — and adds Phase 3: **private
+media storage in Cloudflare R2**, reached only through short-lived presigned URLs and always tied to the verified
+owner.
 
-The connection-test screen now uses real Supabase email/password sign-in, refreshes its session through the Supabase
-client, and signs out. It remains a development harness only. The workspace UI, scene generation, R2, rendering,
-billing, discovery, and deployment are **not** started here.
+The connection-test screen still uses real Supabase email/password sign-in and remains a development harness only.
+The workspace UI, scene generation, rendering, billing, discovery, and deployment are **not** started here.
 
 ## Architecture
 
@@ -58,7 +57,7 @@ npm run dev
 - API: `http://127.0.0.1:8787`
 - Web: `http://localhost:3000` (Vite proxies `/api` to the API)
 
-Before using the ledger or any project route, apply the five migrations in order. See
+Before using the ledger or any project route, apply the six migrations in order. See
 [Applying the migrations](#applying-the-migrations) for the compatibility check that must pass
 first and the current state of the configured project.
 
@@ -70,6 +69,8 @@ npm test                  # Vitest (mocked provider + fake Supabase)
 npm run build             # type-check + production frontend build
 npm run smoke:live        # opt-in: five real requests + ledger check (see Tests)
 npm run verify:live-routes # provider-free two-user live route + ledger checks
+npm run verify:media-live # opt-in: two disposable accounts, real upload + playback through the routes
+npm run verify:r2-live    # opt-in: real R2 presign/upload/read/delete check (no bucket is created)
 npm run verify:sql        # apply every migration to in-memory PostgreSQL and assert RLS, triggers, cascades
 npm run start:server      # server without watch
 ```
@@ -82,7 +83,7 @@ __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=<preview-hostname> npm run dev
 
 ## Applying the migrations
 
-`npm run verify:sql` proves the five files against a real PostgreSQL engine before they touch a
+`npm run verify:sql` proves the migration files against a real PostgreSQL engine before they touch a
 hosted project. They are written for a project whose `public` schema does not already contain
 these tables. Apply them in filename order:
 
@@ -91,6 +92,7 @@ these tables. Apply them in filename order:
 3. `20261124120000_create_projects.sql`
 4. `20261124140000_create_project_children.sql`
 5. `20261124150000_create_profiles.sql`
+6. `20261124160000_create_media_storage.sql` (Phase 3: upload timestamps, `media_references`)
 
 Run the compatibility check first. It must return no rows:
 
@@ -100,8 +102,8 @@ from information_schema.tables
 where table_schema = 'public'
   and table_name in (
     'ai_usage', 'projects', 'project_revisions', 'scenes', 'media_metadata',
-    'sources', 'claims', 'generation_proposals', 'provider_jobs',
-    'render_snapshots', 'profiles'
+    'media_references', 'sources', 'claims', 'generation_proposals',
+    'provider_jobs', 'render_snapshots', 'profiles'
   );
 ```
 
@@ -122,12 +124,15 @@ Afterwards, check the running server rather than assuming the schema is ready:
 3. Set `SMOKE_SUPABASE_ACCESS_TOKEN` to a session token and run `npm run smoke:live` (five
    billable calls, described under Tests).
 
-**Applied to the configured project on 2026-11-24.** The obsolete `public` schema in
+**All six migrations are applied to the configured project (`myrohtkfsuppcabedwmn`), the sixth on 2026-11-24.** After
+applying it, the hosted catalog was checked directly: `media_metadata` has the four added columns, `media_references`
+exists with RLS enabled, one `select` policy for `authenticated`, and only `select` granted to `authenticated`. The
+obsolete `public` schema in
 `myrohtkfsuppcabedwmn` (16 tables from an earlier project, plus `public.handle_new_user()` attached
 to `auth.users`) was exported first — six `model_registry` rows and a catalog snapshot — and then
-replaced with these five migrations. The hosted schema now has the 11 tables listed above, RLS and
-one select-own policy on each, and the `projects_record_revision` trigger; the old `auth.users`
-trigger is gone. `GET /api/ai/status` reports `ledger.ready: true`. Live profile, project, child, and
+replaced with the first five migrations (the sixth followed on 2026-11-24). The hosted schema now has
+the 12 tables listed above, RLS and one select-own policy on each, and the `projects_record_revision`
+trigger; the old `auth.users` trigger is gone. `GET /api/ai/status` reports `ledger.ready: true`. Live profile, project, child, and
 two-user isolation routes were then exercised with disposable users; those users and their rows were
 deleted afterwards. `npm run smoke:live` was run twice: the first five-call run exposed a missing
 `status` column in the reservation lookup, and after the fix the second five-call run exited 0 with
@@ -161,6 +166,13 @@ anon) key; never the service-role key.
 | `AI_ABANDON_AFTER_MS` | Age at which a pending reservation may be settled as abandoned instead of retried (default 90000, floored at the provider timeout plus three auth timeouts). |
 | `APP_ORIGIN` | Optional additional origin restriction for API calls. |
 | `SMOKE_SUPABASE_ACCESS_TOKEN` | Only for `npm run smoke:live`; a valid session token. Never commit it. |
+| `R2_ENDPOINT` | R2 S3 endpoint (`https://<account-id>.r2.cloudflarestorage.com`). `CLOUDFLARE_S3_ENDPOINT_URL` is accepted as a fallback. |
+| `R2_BUCKET_NAME` | Private media bucket. `CLOUDFLARE_R2_BUCKET_NAME` is accepted as a fallback. |
+| `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 S3 credentials. Read only in the Node process; never sent to the browser. `CLOUDFLARE_ACCESS_ID` / `CLOUDFLARE_SECRET_ACCESS_KEY` are accepted as fallbacks. |
+| `MEDIA_IMAGE_MAX_BYTES`, `MEDIA_AUDIO_MAX_BYTES`, `MEDIA_VIDEO_MAX_BYTES` | Per-file bounds (defaults 10 MiB, 25 MiB, 200 MiB). |
+| `MEDIA_OWNER_STORAGE_BYTES` | Total pending + ready bytes per account (default 2 GiB). |
+| `MEDIA_UPLOAD_URL_SECONDS`, `MEDIA_DOWNLOAD_URL_SECONDS`, `MEDIA_UPLOAD_TTL_MS` | Presigned URL and upload-window lifetimes. |
+| `MEDIA_DELETED_RETENTION_MS`, `MEDIA_UNREFERENCED_RETENTION_MS`, `MEDIA_SWEEP_INTERVAL_MS` | Retention and cleanup policy. |
 
 `.env` is git-ignored; `.env.example` contains placeholders only. Only public Supabase auth configuration uses a
 `VITE_` name; no secret is prefixed with `VITE_`, returned by the API, logged, or placed in a URL. The Supabase client
@@ -344,11 +356,97 @@ project does not have is refused with `409 PROJECT_REVISION_NOT_FOUND`; the comp
 rule in the database. Replacing scenes upserts first and prunes afterwards, so a failed save cannot lose the current
 list, and a key that already exists keeps its row id and `created_at`.
 
-`media_metadata` still has no HTTP route: media rows are only meaningful once Phase 3 adds private R2 uploads. It uses
-the same policies and grants, so it is ready for that work.
+`media_metadata` and the Phase 3 `media_references` table are exposed through the private media routes below. They use
+the same policies and grants as the other child tables.
 
 `profiles` (`20261124150000_create_profiles.sql`) is the per-user workspace record: `owner_id` is its primary key, so
 each account has exactly one, and deleting the account cascades it. It uses the same policy and grant shape.
+
+## Private media (Phase 3)
+
+Files live in a **private** R2 bucket. The Node server holds the S3 credentials and signs every request; the browser
+receives a short-lived URL for one object and never sees a credential. Ownership always comes from the verified
+Supabase session and lives in `media_metadata.owner_id`. The object key (`media/<owner-id>/<media-id>`) is only an
+address: every route first resolves the project with the verified owner id, so a guessed key or id reaches nothing.
+
+A presigned URL is a capability with an expiry, not a media id. Clients store the media id and request a fresh URL when
+they need it. Phase 9 will use the same rule for JSON2Video inputs: an input URL is requested with a TTL that covers
+queueing, retries, and rendering, and is refreshed for a retry rather than persisted as durable media metadata.
+
+### Routes
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/projects/:id/media` | List the project's media with status and reference count. |
+| `POST /api/projects/:id/media` | Reserve an upload from `{ kind, contentType, byteSize, sceneKey? }`. Returns the media row and a presigned `PUT` ticket. |
+| `POST /api/projects/:id/media/:mediaId/complete` | Verify the stored object and mark the media `ready`. |
+| `GET /api/projects/:id/media/:mediaId/url` | Presigned playback URL for ready media. |
+| `GET /api/projects/:id/media/:mediaId` | One media row plus its references. |
+| `DELETE /api/projects/:id/media/:mediaId` | Delete an unreferenced asset (`409 MEDIA_IN_USE` otherwise). |
+| `GET`/`POST /api/projects/:id/media/:mediaId/references` | List or attach a reference (`scene`, `render`, `document`, `other`). Attaching is idempotent. |
+| `DELETE /api/projects/:id/media/:mediaId/references/:referenceId` | Release one reference. |
+
+### Upload and validation
+
+The upload is direct: `POST` reserves a `pending` row and returns a presigned `PUT` (15 minutes by default). The client
+uploads bytes straight to R2, then calls `complete`. Completion does not trust the declared type or size:
+
+- `HEAD` gives the real byte size; an object larger than the declared size or the kind's bound is discarded.
+- A signed `Range` read of the first 512 bytes identifies the actual format (JPEG, PNG, GIF, WebP, MP3, WAV, OGG,
+  AAC, M4A, MP4, WebM, QuickTime). A file that is not of the declared kind is discarded with `422 MEDIA_TYPE_MISMATCH`.
+- The stored `content_type` is the detected type, not the client's claim.
+- A missing object is `409 MEDIA_OBJECT_MISSING`; an upload window that closed is `409 MEDIA_UPLOAD_EXPIRED`.
+
+Media ids are server-generated UUIDs. A per-account quota (`MEDIA_OWNER_STORAGE_BYTES`) is checked before a reservation
+is written. All media routes need the verified session and an owned project; another account's project answers exactly
+like a missing one (`404`).
+
+Browser uploads and playback are cross-origin requests to the bucket, so the bucket needs an exact-origin CORS rule.
+[`cors.json`](cors.json) holds the narrow rule applied to `story-frame` on 2026-11-24: `GET`/`PUT`/`HEAD`, the
+`Content-Type` request header, and `ETag`/`Content-Length` exposed, for `http://localhost:3000` and the current cloud
+preview origin. Apply or replace it with:
+
+```bash
+npx wrangler r2 bucket cors set <bucket> --file cors.json
+npx wrangler r2 bucket cors list <bucket>
+```
+
+The preview hostname in `cors.json` is per-chat; replace it when the preview origin changes or before a deployment.
+Probed against the real bucket: an allowed-origin preflight returned `204` with that exact origin, a disallowed origin
+returned `403` with no allow-origin header, and a presigned `GET` carried the allow-origin and exposed headers.
+
+### Deletion, references, and retention
+
+Deleting an asset first counts its references: explicit rows in `media_references` plus its `scene_key`. While any
+reference remains the object and row stay untouched (`409 MEDIA_IN_USE`); removing one reference leaves the others
+valid. Once the last reference is released, `DELETE` removes the object and marks the row `deleted`.
+
+Cleanup is opportunistic and bounded (one batch per pass, at most every `MEDIA_SWEEP_INTERVAL_MS`):
+
+- pending uploads past their window are removed (interrupted uploads);
+- deleted rows past `MEDIA_DELETED_RETENTION_MS` are removed;
+- ready assets with no `scene_key` and no explicit reference, older than `MEDIA_UNREFERENCED_RETENTION_MS`, are removed.
+
+A database row is removed only after its object removal is attempted, so a bucket hiccup leaves the row for the next
+pass instead of orphaning an object. Signed URL query strings are never logged.
+
+### Phase 3 verification (2026-11-24)
+
+| Criterion | Status | Evidence |
+| --- | --- | --- |
+| Authorized upload initiation with stable ids and private keys | **PASS** | `tests/media.test.ts` (mocked Supabase + local S3 endpoint), owner-scoped reservation |
+| Bounded sizes and per-account storage limit | **PASS** | Per-kind and quota tests; `413` before any ticket |
+| Actual type validation | **PASS** | Magic-byte detection test rejects an MP4 declared as PNG |
+| Authorized playback and another account refused | **PASS** | Playback URL returns the exact bytes; cross-owner read/complete/delete are `404` |
+| Safe deletion and shared references | **PASS** | Shared asset blocked while referenced, remains playable after one reference is released |
+| Retention and interrupted-upload cleanup | **PASS** | Clock-driven sweep tests |
+| Real R2 signing and bucket access | **PASS** | `npm run verify:r2-live`: presigned PUT/GET, signed HEAD/range/DELETE, 6/6 against the `story-frame` bucket |
+| Migration applied to the hosted Supabase project | **PASS** | Applied through the Management API; catalog checked (columns, table, RLS, policy, grants) |
+| Full upload through the app with a real signed-in session | **PASS** | `npm run verify:media-live`: two disposable hosted accounts, 25/25 checks, including a real bucket upload and playback |
+| Two-account isolation on the hosted project | **PASS** | Same check: RLS reads, refused browser write, and `404` for foreign routes |
+| Bucket CORS | **PASS** | Rule applied and probed (allowed preflight `204`, foreign origin `403`, presigned `GET` header) |
+| Upload from the UI in a browser | **UNVERIFIED** | There is still no media UI; the flow is API-only until the workspace is built |
+| JSON2Video temporary input access | **DEFERRED** | Phase 9; the presign TTL policy above is the design constraint |
 
 ## Model catalog (verified 2026-11-24)
 
@@ -389,14 +487,14 @@ record of provider/model availability; latency and output counts vary between ru
 
 Phase 2’s authenticated path was verified with a local fake Supabase (real HTTP auth + PostgREST calls) because no
 user session token was available in this environment. On 2026-11-24 the configured `story-frame` project’s obsolete
-`public` schema was exported and replaced with these five migrations (see
-[Applying the migrations](#applying-the-migrations)). The hosted catalog now matches this code: 11 tables, RLS and a
+`public` schema was exported and replaced with the migrations (six in total, the last added for Phase 3; see
+[Applying the migrations](#applying-the-migrations)). The hosted catalog now matches this code: 12 tables, RLS and a
 select-own policy on each, the revision trigger, no `auth.users` trigger, and `/api/ai/status` reporting
 `ledger.ready: true`. Live routes were then exercised with two disposable users (37/37 checks,
 including two-user isolation), and `smoke:live` exited 0 with 5/5 model families and an identical
 stored replay. The test users and rows were deleted; the project is empty again.
 
-`npm run verify:sql` applies all five migrations to a real PostgreSQL engine (PGlite, PostgreSQL compiled to
+`npm run verify:sql` applies all six migrations to a real PostgreSQL engine (PGlite, PostgreSQL compiled to
 WebAssembly) with Supabase-like `anon`, `authenticated`, and `service_role` roles plus an `auth.uid()` stub, then
 asserts what the server relies on: the revision trigger, owner-only reads on every table, refused browser writes, the
 conditional version update, constraint and foreign-key rejections, and the cascades from both `projects` and
@@ -447,6 +545,15 @@ Coverage includes:
   or proposal id is `404`; child rows cascade when their project is deleted
 - Child payload validation (duplicate scene key, unknown or client-supplied fields, non-http URL, unknown enum value,
   render revision below 1)
+- Media upload lifecycle for image, audio, and video: presigned ticket, direct upload, real-size and magic-byte
+  validation, playback through a second presigned URL, and the stored detected content type
+- Media type mismatch and empty/oversized uploads discarded; oversized declarations and the per-account quota refused
+- Media isolation: another account's playback, completion, and deletion are refused without touching the object
+- Shared media: deletion blocked while referenced, one released reference leaves the asset playable and the object in
+  place, and the last release allows deletion
+- Missing objects, pending playback, expired upload windows, interrupted-upload cleanup, deleted-row retention, and
+  unreferenced-asset cleanup
+- Media routes refused with `503 MEDIA_NOT_CONFIGURED` when the bucket is not configured
 - Missing key, unknown/disabled model, oversized prompt/body, provider auth failure, rate limiting, timeout,
   malformed/empty responses, success extraction, secret leakage, and duplicate submission
 - UI reply rendering, error display, and duplicate-submission suppression
@@ -485,6 +592,31 @@ isolation. It seeds its own rows, then deletes both users and verifies their led
 gone. It exits non-zero on failure and never prints access tokens or keys. It does not require or use
 `OLLAMA_API_KEY`, and must not be pointed at a project whose data it should not create temporary users in.
 
+### Live R2 signing check
+
+```bash
+R2_BUCKET_NAME=<bucket> npm run verify:r2-live
+```
+
+This check is **opt-in** and touches real storage: it writes one tiny, clearly named test object under `media/`, reads
+it back through a presigned URL and a signed range request, deletes it, and confirms it is gone. It never creates a
+bucket or any other resource, never prints the access key, secret, or a signed URL, and exits non-zero on failure. It
+uses `R2_ENDPOINT`/`R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY` or the `CLOUDFLARE_*` fallbacks. Run on 2026-11-24 against
+the `story-frame` bucket: 6/6 checks passed.
+
+### Live media route check
+
+```bash
+R2_BUCKET_NAME=<bucket> npm run verify:media-live
+```
+
+This check is **opt-in** and creates two disposable Supabase users in the configured project, then exercises the real
+routes against the hosted schema and the real bucket: project creation, upload initiation, direct presigned upload,
+completion, presigned playback with byte comparison, reference attach/release, blocked then allowed deletion, RLS
+reads for both accounts, a refused browser write, and cross-owner `404`s. It deletes the users, projects, rows, and
+objects afterwards and checks that they are gone. It never prints keys, tokens, or signed URLs. Run on 2026-11-24:
+**25/25 checks passed**, and cleanup verified both users and all their media rows removed.
+
 ## Security limitations
 
 - Email/password sign-in only; there is no sign-up, password-reset, MFA, OAuth, or account-management UI. The
@@ -515,5 +647,16 @@ gone. It exits non-zero on failure and never prints access tokens or keys. It do
   live routes against the configured project. The project is empty again after test cleanup.
 - A workspace is one profile per user, with no shared or multi-user workspace, which matches the isolation
   requirement. There is no workspace UI yet; the profile is reachable only through the API.
+- Media storage is private but the presigned URL itself is a bearer capability for its lifetime: anyone who obtains
+  it can read (or, for an upload ticket, write) that one object until it expires. URLs are therefore short-lived and
+  never logged, but they are not revoked early.
+- The per-account storage quota is checked from the declared size before a reservation and counts pending and ready
+  rows; it is not a durable cross-instance lock, so two simultaneous reservations can briefly exceed it. A presigned
+  PUT cannot pin the body size (browsers cannot set `Content-Length`), so an object larger than declared is rejected
+  and removed at completion; until its upload window closes, that object is not counted against the quota. Cleanup is
+  opportunistic (triggered by media routes, one bounded batch), not a scheduled job: an idle project's expired rows
+  wait until the next media call.
+- Media type detection covers the common container signatures listed above. A valid file in an unlisted format is
+  refused rather than guessed at, and an empty or truncated file is treated as unusable.
 - Child routes record what the server is told; they do not call a provider. Nothing yet writes a provider job or a
-  render automatically, and `media_metadata` has no route until Phase 3 adds private media uploads.
+  render automatically, and generated render outputs are not yet written to `media_metadata`.

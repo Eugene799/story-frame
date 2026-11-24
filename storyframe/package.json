@@ -14,6 +14,8 @@
     "test:watch": "vitest",
     "smoke:live": "tsx scripts/smoke-live.ts",
     "verify:live-routes": "tsx scripts/verify-live-routes.ts",
+    "verify:media-live": "tsx scripts/verify-media-live.ts",
+    "verify:r2-live": "tsx scripts/verify-r2-live.ts",
     "verify:sql": "tsx scripts/verify-sql.ts",
     "start:server": "tsx server/index.ts"
   },

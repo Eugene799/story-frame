@@ -10,6 +10,7 @@ import {
   type FakeSupabase,
   type FakeSupabaseOptions,
 } from "./fake-supabase";
+import { startFakeR2, type FakeR2 } from "./fake-r2";
 
 /** Fake Ollama key. Not a real credential. */
 export const FAKE_KEY = "TEST_ONLY_FAKE_OLLAMA_KEY";
@@ -31,6 +32,7 @@ export interface TestApp {
   url: string;
   server: Server;
   supabase: FakeSupabase;
+  r2: FakeR2;
   close: () => Promise<void>;
 }
 
@@ -42,6 +44,7 @@ export async function startTestServer(
 ): Promise<TestApp> {
   const { supabase: supabaseOptions, ...serverOptions } = options;
   const supabase = await startFakeSupabase(supabaseOptions);
+  const r2 = await startFakeR2();
   const server = createStoryframeServer({
     ...serverOptions,
     env: {
@@ -50,6 +53,11 @@ export async function startTestServer(
       SUPABASE_URL: supabase.url,
       SUPABASE_PUBLISHABLE_KEY: PUBLISHABLE_KEY,
       SUPABASE_SERVICE_ROLE_KEY: SERVICE_ROLE_KEY,
+      R2_ENDPOINT: r2.url,
+      R2_BUCKET_NAME: r2.bucket,
+      R2_ACCESS_KEY_ID: "test-access-key-id",
+      R2_SECRET_ACCESS_KEY: "test-secret-access-key",
+      MEDIA_SWEEP_INTERVAL_MS: "0",
       ...serverOptions.env,
     },
   });
@@ -61,12 +69,14 @@ export async function startTestServer(
     url: `http://127.0.0.1:${address.port}`,
     server,
     supabase,
+    r2,
     close: async () => {
       server.closeAllConnections();
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
       });
       await supabase.close();
+      await r2.close();
     },
   };
 }

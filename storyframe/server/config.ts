@@ -1,5 +1,7 @@
 import { resolveModels, type ResolvedModel } from "./models";
+import { loadMediaLimits, type MediaLimits } from "./media";
 import { OLLAMA_BASE_URL } from "./ollama";
+import type { R2Config } from "./r2";
 
 export interface AppConfig {
   apiKey: string | null;
@@ -15,6 +17,8 @@ export interface AppConfig {
   requestsPerMinute: number;
   abandonAfterMs: number;
   models: ResolvedModel[];
+  r2: R2Config | null;
+  media: MediaLimits;
 }
 
 function intEnv(
@@ -55,6 +59,32 @@ function supabaseUrl(env: NodeJS.ProcessEnv): string | null {
   return raw.replace(/\/+$/, "");
 }
 
+function r2Config(env: NodeJS.ProcessEnv): R2Config | null {
+  const endpoint = stringEnv(env, "R2_ENDPOINT") ?? stringEnv(env, "CLOUDFLARE_S3_ENDPOINT_URL");
+  const bucket = stringEnv(env, "R2_BUCKET_NAME") ?? stringEnv(env, "CLOUDFLARE_R2_BUCKET_NAME");
+  const accessKeyId = stringEnv(env, "R2_ACCESS_KEY_ID") ?? stringEnv(env, "CLOUDFLARE_ACCESS_ID");
+  const secretAccessKey = stringEnv(env, "R2_SECRET_ACCESS_KEY") ?? stringEnv(env, "CLOUDFLARE_SECRET_ACCESS_KEY");
+  if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(endpoint);
+  } catch {
+    throw new Error("R2_ENDPOINT must be a valid URL.");
+  }
+  const localHost = ["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname);
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && localHost)) {
+    throw new Error("R2_ENDPOINT must use https outside local development.");
+  }
+
+  return {
+    endpoint: endpoint.replace(/\/+$/, ""),
+    bucket,
+    accessKeyId,
+    secretAccessKey,
+  };
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const configuredBase = env.OLLAMA_BASE_URL?.trim();
   if (configuredBase && configuredBase.replace(/\/+$/, "") !== OLLAMA_BASE_URL) {
@@ -85,5 +115,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     requestsPerMinute: intEnv(env, "AI_MAX_REQUESTS_PER_MINUTE", 6, 1, 60),
     abandonAfterMs,
     models: resolveModels(env),
+    r2: r2Config(env),
+    media: loadMediaLimits(env),
   };
 }
