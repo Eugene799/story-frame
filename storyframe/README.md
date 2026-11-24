@@ -484,9 +484,17 @@ editable project JSON and the script as plain text; video export is not offered 
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; live media script is 25/25 |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
 | Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 130/130; `verify:sql` 69/69; `verify:live-routes` exit 0; `verify:r2-live` 6/6; `verify:media-live` 25/25 |
-| Responsive layouts visually reviewed | **UNVERIFIED** | CSS includes single-column breakpoints, but no browser viewport review was performed |
-| Real browser sign-in and upload against hosted Supabase/R2 | **UNVERIFIED** | Tests use a browser-like jsdom and a fake HTTP backend; the live media script uses the real API without a browser |
-| JSON/script download clicked in a browser | **UNVERIFIED** | Export code is present and typechecked, but the download button was not clicked in a real browser |
+| Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
+| Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
+| Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
+| Real browser sign-in and upload against hosted Supabase/R2 | **PASS** | Disposable hosted user signed in through the browser; a 7.7 KiB PNG went initiate `201` → direct presigned `PUT 200` to the `story-frame` bucket → complete `200` → scene reference `201` → saved asset id → presigned playback `GET 200`, with the image decoding at 64 px and a one-reference count |
+| JSON/script download clicked in a browser | **PASS** | Both export buttons downloaded through the browser; the JSON parsed as a schema 2 document with the saved brief, scene ids, durations, asset id, and approvals, and the script text matched the stored narration and visual direction |
+| Hosted browser test cleanup | **PASS** | Reference release then media delete returned `200`, project delete returned the dashboard to 0 projects, the disposable user and every project/media/profile row were deleted, and the R2 object answered `The specified key does not exist` |
+
+The browser run on 2026-11-24 also exposed a double-counted media reference: the Media tab sent `sceneKey` at initiate
+and then attached the same scene as an explicit reference, so the store counted two references while the list showed
+one and deletion could not be resolved from the UI. The upload now registers the scene link once, as the explicit
+reference; the row and the delete guard agree.
 
 **FAIL: none in the Phase 4 scope.** Restoring an old revision from Settings is not implemented; history is read-only
 in Phase 4.

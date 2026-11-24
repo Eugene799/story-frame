@@ -5,7 +5,7 @@
       "allowed": {
         "origins": [
           "http://localhost:3000",
-          "https://pv-2ad413f7aefe-3a226257-21b4-4376-a3ff-f26b6e10f32c.style.dev"
+          "https://pv-2ad413f7aefe-c6421d40-623e-4e0c-bbf2-2ed2064a4f85.style.dev"
         ],
         "methods": ["GET", "PUT", "HEAD"],
         "headers": ["Content-Type"]

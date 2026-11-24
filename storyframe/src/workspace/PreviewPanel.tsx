@@ -126,7 +126,10 @@ export function PreviewPanel({ title, projectDocument }: PreviewPanelProps) {
             Download script text
           </button>
         </div>
-        <p className="hint">Both exports include exactly what is open here. The JSON reopens as an editable project.</p>
+        <p className="hint">
+          Both exports include exactly what is open here. The JSON is the complete editable document; importing it
+          back through the workspace is not part of Phase 4.
+        </p>
       </div>
     </section>
   );

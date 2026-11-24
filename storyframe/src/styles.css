@@ -476,6 +476,9 @@ button:disabled {
 
 .editor {
   display: grid;
+  /* An implicit auto column cannot shrink below its widest item's min-content,
+     which overflows a narrow phone once the title row's 320px basis applies. */
+  grid-template-columns: minmax(0, 1fr);
   gap: 1rem;
 }
 
@@ -613,7 +616,7 @@ button:disabled {
 }
 
 .storyboard-grid {
-  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(290px, 100%), 1fr));
 }
 
 .scene-card,

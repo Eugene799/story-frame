@@ -208,11 +208,12 @@ export function MediaPanel({
     onBusyChange?.(true);
     try {
       const accessToken = await getAccessToken();
+      // The scene link is the explicit reference below. Sending `sceneKey` too
+      // would make the media store count the same scene twice and refuse deletion.
       const initiation = await initiateMediaUpload(accessToken, projectId, {
         kind,
         contentType: file.type,
         byteSize: file.size,
-        ...(sceneId ? { sceneKey: sceneId } : {}),
       });
       setMedia((current) => [initiation.media, ...(current ?? [])]);
 
@@ -225,16 +226,23 @@ export function MediaPanel({
       );
 
       if (sceneId) {
-        await attachMediaReference(accessToken, projectId, completed.id, {
+        const reference = await attachMediaReference(accessToken, projectId, completed.id, {
           refKind: "scene",
           refId: sceneId,
         });
+        setMedia((current) =>
+          (current ?? []).map((item) =>
+            item.id === completed.id
+              ? { ...item, referenceCount: item.referenceCount + 1 }
+              : item,
+          ),
+        );
         const saved = await onAttachAsset(sceneId, completed.id);
         const scene = scenes.find((candidate) => candidate.id === sceneId);
         setNotice(
           saved
             ? `Uploaded, completed, and attached to ${scene ? `"${scene.heading}"` : "the selected scene"}. The saved scene now lists this asset.`
-            : "Uploaded and referenced, but the project save did not complete. The draft still lists the asset; resolve the save error and retry.",
+            : `Uploaded and referenced (reference ${reference.id.slice(0, 8)}), but the project save did not complete. The draft still lists the asset; resolve the save error and retry.`,
         );
       } else {
         setNotice("Uploaded and completed. It is not attached to a scene yet.");

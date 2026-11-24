@@ -458,11 +458,12 @@ describe("workspace", () => {
     const initiate = backend.requests.find(
       (request) => request.method === "POST" && request.path === `/api/projects/${PROJECT_ID}/media`,
     );
+    // One scene link only: the explicit reference below, never `sceneKey` too.
     expect(initiate?.body).toMatchObject({
       kind: "image",
       contentType: "image/png",
-      sceneKey: "scene-1",
     });
+    expect(initiate?.body).not.toHaveProperty("sceneKey");
     expect(
       backend.requests.some(
         (request) => request.path === `/api/projects/${PROJECT_ID}/media/media-1/complete`,
