@@ -1,4 +1,21 @@
 import type { AiErrorResponse, AiStatusResponse, AiTestSuccess } from "../shared/ai-contract";
+import type {
+  MediaPlayback,
+  MediaRecord,
+  MediaReferenceRecord,
+  MediaUploadTicket,
+} from "../shared/media-contract";
+import type {
+  ProjectDeletedResponse,
+  ProjectDocumentV2,
+  ProjectListResponse,
+  ProjectRecord,
+  ProjectResponse,
+  ProjectRevisionListResponse,
+  ProjectRevisionSummary,
+  ProjectSummary,
+  ProjectType,
+} from "../shared/project-contract";
 
 export class AiRequestError extends Error {
   readonly code: string;
@@ -54,6 +71,164 @@ async function requestJson<T>(
 
 export function fetchStatus(): Promise<AiStatusResponse> {
   return requestJson<AiStatusResponse>("/api/ai/status").then(({ body }) => body);
+}
+
+async function authorizedJson<T>(
+  path: string,
+  accessToken: string,
+  options: { method?: string; body?: unknown } = {},
+): Promise<T> {
+  const init: RequestInit = {
+    method: options.method ?? "GET",
+    headers: { Authorization: `Bearer ${accessToken}` },
+  };
+  if (options.body !== undefined) init.body = JSON.stringify(options.body);
+  return (await requestJson<T>(path, init)).body;
+}
+
+export async function listProjects(accessToken: string): Promise<ProjectSummary[]> {
+  return (await authorizedJson<ProjectListResponse>("/api/projects", accessToken)).projects;
+}
+
+export async function createProject(
+  accessToken: string,
+  projectType: ProjectType,
+  title: string,
+  document: ProjectDocumentV2,
+): Promise<ProjectRecord> {
+  const body = await authorizedJson<ProjectResponse>("/api/projects", accessToken, {
+    method: "POST",
+    body: { projectType, title, document },
+  });
+  return body.project;
+}
+
+export async function getProject(accessToken: string, projectId: string): Promise<ProjectRecord> {
+  return (await authorizedJson<ProjectResponse>(`/api/projects/${projectId}`, accessToken)).project;
+}
+
+export async function updateProject(
+  accessToken: string,
+  projectId: string,
+  update: { title: string; document: ProjectDocumentV2; version: number },
+): Promise<ProjectRecord> {
+  const body = await authorizedJson<ProjectResponse>(`/api/projects/${projectId}`, accessToken, {
+    method: "PUT",
+    body: update,
+  });
+  return body.project;
+}
+
+export async function deleteProject(accessToken: string, projectId: string): Promise<string> {
+  const body = await authorizedJson<ProjectDeletedResponse>(`/api/projects/${projectId}`, accessToken, {
+    method: "DELETE",
+  });
+  return body.deletedId;
+}
+
+export async function listProjectRevisions(
+  accessToken: string,
+  projectId: string,
+): Promise<ProjectRevisionSummary[]> {
+  return (
+    await authorizedJson<ProjectRevisionListResponse>(`/api/projects/${projectId}/revisions`, accessToken)
+  ).revisions;
+}
+
+export async function listProjectMedia(accessToken: string, projectId: string): Promise<MediaRecord[]> {
+  return (await authorizedJson<{ ok: true; media: MediaRecord[] }>(`/api/projects/${projectId}/media`, accessToken))
+    .media;
+}
+
+export interface MediaInitiation {
+  media: MediaRecord;
+  upload: MediaUploadTicket;
+}
+
+export async function initiateMediaUpload(
+  accessToken: string,
+  projectId: string,
+  write: { kind: MediaRecord["kind"]; contentType: string; byteSize: number; sceneKey?: string },
+): Promise<MediaInitiation> {
+  const body = await authorizedJson<{ ok: true; media: MediaRecord; upload: MediaUploadTicket }>(
+    `/api/projects/${projectId}/media`,
+    accessToken,
+    { method: "POST", body: write },
+  );
+  return { media: body.media, upload: body.upload };
+}
+
+export async function uploadMediaObject(ticket: MediaUploadTicket, file: File): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(ticket.url, {
+      method: ticket.method,
+      headers: ticket.headers,
+      body: file,
+    });
+  } catch {
+    throw new AiRequestError("NETWORK_ERROR", "The private upload endpoint could not be reached.", 0);
+  }
+  if (!response.ok) {
+    throw new AiRequestError(
+      "UPLOAD_FAILED",
+      `The private upload failed with HTTP ${response.status}.`,
+      response.status,
+    );
+  }
+}
+
+export async function completeMediaUpload(
+  accessToken: string,
+  projectId: string,
+  mediaId: string,
+): Promise<MediaRecord> {
+  return (
+    await authorizedJson<{ ok: true; media: MediaRecord }>(
+      `/api/projects/${projectId}/media/${mediaId}/complete`,
+      accessToken,
+      { method: "POST", body: {} },
+    )
+  ).media;
+}
+
+export async function getMediaPlaybackUrl(
+  accessToken: string,
+  projectId: string,
+  mediaId: string,
+): Promise<MediaPlayback> {
+  return authorizedJson<MediaPlayback & { ok: true }>(
+    `/api/projects/${projectId}/media/${mediaId}/url`,
+    accessToken,
+  );
+}
+
+export async function attachMediaReference(
+  accessToken: string,
+  projectId: string,
+  mediaId: string,
+  reference: { refKind: "scene"; refId: string },
+): Promise<MediaReferenceRecord> {
+  return (
+    await authorizedJson<{ ok: true; reference: MediaReferenceRecord }>(
+      `/api/projects/${projectId}/media/${mediaId}/references`,
+      accessToken,
+      { method: "POST", body: reference },
+    )
+  ).reference;
+}
+
+export async function deleteMediaRecord(
+  accessToken: string,
+  projectId: string,
+  mediaId: string,
+): Promise<string> {
+  const body = await authorizedJson<{ ok: true; deletedId: string }>(
+    `/api/projects/${projectId}/media/${mediaId}`,
+    accessToken,
+    { method: "DELETE" },
+  );
+  return body.deletedId;
 }
 
 export interface AiTestOutcome {

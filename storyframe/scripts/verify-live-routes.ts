@@ -160,9 +160,33 @@ async function main(): Promise<number> {
     check("A profile survives B write", result.body?.profile?.workspaceName === "A workspace");
 
     const document = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       summary: "",
-      scenes: [{ id: "s1", heading: "Opening", body: "Hello" }],
+      brief: {
+        topic: "Live route check",
+        audience: "Internal",
+        goal: "Prove the project routes",
+        mode: "fiction",
+        targetDurationSeconds: 60,
+        tone: "Neutral",
+        preset: "Story short",
+        voicePreference: "neutral",
+        planningBudgetUsd: 0,
+      },
+      scenes: [
+        {
+          id: "s1",
+          heading: "Opening",
+          body: "Hello",
+          visualDirection: "",
+          assetIds: [],
+          onScreenText: "",
+          durationSeconds: 10,
+          approved: false,
+          approvedFingerprint: null,
+          locks: { narration: false, visualDirection: false, onScreenText: false, duration: false },
+        },
+      ],
     };
     result = await api(a.token, "POST", "/api/projects", {
       projectType: "story",

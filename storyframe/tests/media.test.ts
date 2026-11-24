@@ -1,22 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { MediaRecord, MediaReferenceRecord } from "../shared/media-contract";
 import { USER_A, USER_B } from "./fake-supabase";
+import { documentFixture } from "./project-fixture";
 import { apiRequest, startTestServer } from "./server-helpers";
 
 // MOCKED: Supabase and the S3 endpoint are local fakes served over HTTP. The
 // SigV4 signing itself is checked separately by `npm run verify:r2-live`.
 
-const DOCUMENT = {
-  schemaVersion: 1,
-  summary: "A courier finds a letter that was never meant to arrive.",
-  scenes: [
-    {
-      id: "scene-1",
-      heading: "INT. TRAIN CAR - NIGHT",
-      body: "The letter waits under a seat, addressed to nobody.",
-    },
-  ],
-};
+const DOCUMENT = documentFixture();
 
 const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(120, 1)]);
 const MP3 = Buffer.concat([Buffer.from("ID3"), Buffer.alloc(200, 0)]);

@@ -1,12 +1,12 @@
-# StoryFrame — Phase 3: private R2 media
+# StoryFrame — Phase 4: dashboard, brief, script, and storyboard
 
 This repository state keeps the Phase 2 pieces — a **server-verified Supabase session boundary**, a **durable,
-idempotent usage ledger**, and the **project data model** with owner-scoped access — and adds Phase 3: **private
-media storage in Cloudflare R2**, reached only through short-lived presigned URLs and always tied to the verified
-owner.
+idempotent usage ledger**, and the **project data model** with owner-scoped access — and the Phase 3 **private media
+storage in Cloudflare R2**. It adds Phase 4: a signed-in **workspace** with a dashboard, brief, script, storyboard,
+media panel, honest preview, and editable project/script export.
 
 The connection-test screen still uses real Supabase email/password sign-in and remains a development harness only.
-The workspace UI, scene generation, rendering, billing, discovery, and deployment are **not** started here.
+Scene generation, video rendering, billing, discovery, and deployment are **not** started here.
 
 ## Architecture
 
@@ -290,10 +290,16 @@ on the first account's row.
 
 ## Projects
 
-`projects` and `project_revisions` are the first slice of Phase 2 application persistence. Each project belongs to the
-verified Supabase user, carries one of three kinds (`story`, `product-ad`, `repurpose`), and stores a **versioned**
-`document`. Two numbers matter and they are not the same: `schema_version` is the shape of the document, while
-`version` is the optimistic concurrency token for the row.
+`projects` and `project_revisions` are the first slice of Phase 2 application persistence, extended by Phase 4. Each
+project belongs to the verified Supabase user, carries one of three kinds (`story`, `product-ad`, `repurpose`), and
+stores a **versioned** `document`. Two numbers matter and they are not the same: `schema_version` is the shape of the
+document, while `version` is the optimistic concurrency token for the row.
+
+Document **schema 2** carries the brief (`topic`, `audience`, `goal`, factual/fiction, target duration, tone, preset,
+voice preference, planning budget) and scenes with a stable id, order, narration, visual direction, asset ids,
+on-screen text, duration, approval, approval fingerprint, and per-component locks. Stored schema 1 rows are upgraded
+on read and written back as schema 2 on the next save; the migration adds empty visual/on-screen fields, zero
+durations, unlocked components, and a default brief rather than guessing content.
 
 Every accepted write appends an immutable revision in the same transaction: the `projects_record_revision` trigger
 copies the new row into `project_revisions`, numbered by `projects.version`. History cannot drift from the row, and a
@@ -306,6 +312,7 @@ rejected request cannot append a revision.
 | `GET /api/projects/:id` | One owned project, including its document. |
 | `PUT /api/projects/:id` | Replace `{ title, document }`, sending the `version` last read. |
 | `DELETE /api/projects/:id` | Delete an owned project; its revisions cascade. |
+| `GET /api/projects/:id/revisions` | The owner's 20 newest revision summaries (no document payloads). |
 
 Ownership is enforced explicitly on every query: the server filters on the id verified from the session, never on a
 client-supplied owner. Another account's project id reports `404 PROJECT_NOT_FOUND` for read, update, and delete, so it
@@ -431,6 +438,59 @@ Cleanup is opportunistic and bounded (one batch per pass, at most every `MEDIA_S
 A database row is removed only after its object removal is attempted, so a bucket hiccup leaves the row for the next
 pass instead of orphaning an object. Signed URL query strings are never logged.
 
+## Phase 4: dashboard, brief, script, and storyboard (2026-11-24)
+
+The signed-in screen is now a workspace. `src/workspace/Workspace.tsx` lists the caller's projects and creates one of
+the three kinds; `ProjectEditor.tsx` owns one open project and its tabs: **Brief, Script, Storyboard, Media, Preview,
+Settings**. Saves are explicit (one save is one revision), the header always shows unsaved/saved state, and a version
+conflict keeps the draft while offering **Load latest version**. The Phase 1–2 connection test remains mounted below
+the workspace in a developer harness.
+
+**Single-source wording and stable ids.** Narration lives only in `document.scenes[].body`. The Script, Storyboard,
+Preview, and script export all read that same field. Scene ids are stable through reordering, duplication creates a
+fresh id, and the server rejects duplicate ids.
+
+**Locks.** Each scene has independent locks for narration, visual direction, on-screen text, and duration. The server
+compares the submitted document with the stored one: a component that is locked in both cannot change (`409
+SCENE_FIELD_LOCKED`), and a scene with any lock cannot be deleted (`409 SCENE_LOCKED`). Unlocking in the same write is
+the user's explicit decision and therefore permits the edit. The UI disables locked fields and scene deletion as well.
+
+**Approvals and staleness.** Approving a scene stores a 64-bit content fingerprint over its heading, narration,
+visual direction, on-screen text, duration, and ordered asset ids. The UI derives staleness by comparing the stored
+fingerprint with the current draft, so an edit shows **Approval out of date** immediately. A save that carries an
+approval for different content clears it rather than silently approving the new wording; re-approval stores the new
+fingerprint. This is intentionally exact content, not a revision-counter heuristic.
+
+**Media from the UI.** The Media tab exercises the committed private-storage API end to end: initiate, direct
+presigned `PUT` from the browser, complete, attach a scene reference, append the media id to `scene.assetIds`, and
+save the document. Playback requests a fresh short-lived presigned URL and renders an image/audio/video element; a
+referenced asset is refused deletion by the media store. Credentials and object keys never reach the browser.
+
+**Preview and export are honest.** Preview is labelled a storyboard preview, not a rendered movie, and shows exactly
+the stored script, visual direction, on-screen text, media count, timing, and approval state. Export offers the
+editable project JSON and the script as plain text; video export is not offered and is documented as Phase 9.
+
+### Phase 4 verification (2026-11-24)
+
+| Criterion | Status | Evidence |
+| --- | --- | --- |
+| Dashboard create/open/delete and complete editable storyboard reopen | **PASS** | `tests/workspace.test.tsx`: create, edit brief, save, back, reopen, saved script returned |
+| Scene add/edit/duplicate/delete/reorder with stable ids | **PASS** | Same UI test plus server reorder test; duplicate gets a new id, remaining ids survive reorder, duplicate ids rejected |
+| Independent component locks enforced in mutations and server updates | **PASS** | `tests/projects-v2.test.ts`: locked narration edit refused, unlock+edit allowed, locked deletion refused; UI disables locked fields |
+| Exact content fingerprints for approval staleness | **PASS** | Server keeps an approval only when its fingerprint matches; UI shows **Approval out of date** after a narration edit and server clears it on save |
+| Duration totals and target comparison | **PASS** | Script/storyboard totals update through duplicate, delete, and retime; asserted `0:30` → `0:50` → `0:35` against a `1:00` target |
+| Optimistic conflicts keep the draft and allow reload | **PASS** | Server `409 PROJECT_VERSION_CONFLICT`; UI test asserts the draft survives and **Load latest version** restores the stored brief |
+| Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
+| Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; live media script is 25/25 |
+| Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 130/130; `verify:sql` 69/69; `verify:live-routes` exit 0; `verify:r2-live` 6/6; `verify:media-live` 25/25 |
+| Responsive layouts visually reviewed | **UNVERIFIED** | CSS includes single-column breakpoints, but no browser viewport review was performed |
+| Real browser sign-in and upload against hosted Supabase/R2 | **UNVERIFIED** | Tests use a browser-like jsdom and a fake HTTP backend; the live media script uses the real API without a browser |
+| JSON/script download clicked in a browser | **UNVERIFIED** | Export code is present and typechecked, but the download button was not clicked in a real browser |
+
+**FAIL: none in the Phase 4 scope.** Restoring an old revision from Settings is not implemented; history is read-only
+in Phase 4.
+
 ### Phase 3 verification (2026-11-24)
 
 | Criterion | Status | Evidence |
@@ -536,6 +596,11 @@ Coverage includes:
 - Optimistic concurrency: a stale `version` returns `409 PROJECT_VERSION_CONFLICT` without writing a revision
 - Project payload validation (kind, title, document schema, unknown fields at every level) and a stored document from
   a schema the server cannot read
+- Document v2 migration, per-component lock enforcement, approval fingerprint invalidation, duplicate scene ids,
+  stable ids through reorder, and owner-scoped revision summaries
+- Workspace UI: dashboard create/open, explicit save, reopen persisted script, disabled locked narration, scene
+  duplicate/reorder/delete/retime totals, approval staleness, media initiate/upload/complete/attach/playback, and
+  conflict reload with the draft preserved
 - The development screen reuses a key while an outcome is unknown and starts a new key after a recorded error
 - Profile read/write for the caller, an upsert that never adds a duplicate row, and `404` before a profile exists
 - Profile isolation: the second account's read is `404`, and its write creates its own row without touching the first
@@ -642,8 +707,12 @@ objects afterwards and checks that they are gone. It never prints keys, tokens, 
   across processes or instances.
 - The Vite proxy and loopback API are a development arrangement; production needs a deployed API, managed secrets,
   durable quotas, and a real auth flow.
-- Projects have a server API but no workspace UI yet, and only document schema v1 exists. There is no conflict merging:
-  a stale save is refused and the caller must reload.
+- The workspace is single-user per project and has no conflict merging: a stale save is refused, the draft is kept,
+  and the caller must load the latest version. Revision history is read-only; restoring an old version is future work.
+- Scene generation, model planning, and video rendering are not implemented. The planning budget is recorded in the
+  brief but nothing spends it, and Preview/Export are explicitly storyboard and editable-document outputs.
+- Media deletion is refused while an asset is referenced. The Media tab can upload and attach media but does not yet
+  offer detaching an asset from a scene, so an attached asset must be released through the API before deletion.
 - The migrations are verified against a real PostgreSQL engine by `npm run verify:sql`, by the test fakes, and by
   live routes against the configured project. The project is empty again after test cleanup.
 - A workspace is one profile per user, with no shared or multi-user workspace, which matches the isolation

@@ -169,7 +169,22 @@ try {
     body: JSON.stringify({
       projectType: "story",
       title: "Media live check",
-      document: { schemaVersion: 1, summary: "Live media route check.", scenes: [] },
+      document: {
+        schemaVersion: 2,
+        summary: "Live media route check.",
+        brief: {
+          topic: "Live media",
+          audience: "Internal",
+          goal: "Prove the media routes",
+          mode: "fiction",
+          targetDurationSeconds: 60,
+          tone: "Neutral",
+          preset: "Story short",
+          voicePreference: "neutral",
+          planningBudgetUsd: 0,
+        },
+        scenes: [],
+      },
     }),
   });
   check("project created for the first account", projectResponse.status === 201);

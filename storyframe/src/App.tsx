@@ -4,6 +4,7 @@ import { getAccessToken } from "./auth";
 import { ConnectionTestScreen } from "./components/ConnectionTestScreen";
 import { SignInScreen } from "./components/SignInScreen";
 import { supabase, supabaseConfigError } from "./supabase";
+import { Workspace } from "./workspace/Workspace";
 
 export interface AppProps {
   client?: SupabaseClient | null;
@@ -17,7 +18,9 @@ export default function App({ client = supabase, configError = supabaseConfigErr
   const [signingIn, setSigningIn] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
-  const [requestBusy, setRequestBusy] = useState(false);
+  const [workspaceBusy, setWorkspaceBusy] = useState(false);
+  const [testBusy, setTestBusy] = useState(false);
+  const requestBusy = workspaceBusy || testBusy;
 
   useEffect(() => {
     if (!client) {
@@ -105,16 +108,20 @@ export default function App({ client = supabase, configError = supabaseConfigErr
   }
 
   const signedIn = Boolean(session);
+  const accessToken = async (): Promise<string> => {
+    if (!client) throw new Error("Supabase is not configured in this browser.");
+    return getAccessToken(client);
+  };
 
   return (
     <div className="app-shell">
       <header className="site-header">
         <div>
-          <p className="eyebrow">StoryFrame / Phase 2</p>
-          <h1>Supabase-authenticated connection test</h1>
+          <p className="eyebrow">StoryFrame / Phase 4</p>
+          <h1>Dashboard, brief, script, and storyboard</h1>
           <p className="lede">
-            Sign in with your Supabase account. The Node server verifies the session before any AI or project request,
-            and the Supabase client refreshes it before it expires.
+            Sign in to write a brief and script, arrange the storyboard, attach private media, and preview or export
+            the editable plan. Generation and video rendering remain later phases.
           </p>
           {signedIn && session && (
             <div className="session-bar">
@@ -139,7 +146,7 @@ export default function App({ client = supabase, configError = supabaseConfigErr
             </p>
           )}
         </div>
-        <span className="badge">{signedIn ? "Live session" : "Auth required"}</span>
+        <span className="badge">{signedIn ? "Workspace" : "Auth required"}</span>
       </header>
 
       <main>
@@ -164,15 +171,22 @@ export default function App({ client = supabase, configError = supabaseConfigErr
                 {authError}
               </div>
             )}
-            <ConnectionTestScreen getAccessToken={() => getAccessToken(client)} onBusyChange={setRequestBusy} />
+            <Workspace getAccessToken={accessToken} onBusyChange={setWorkspaceBusy} />
+            <details className="dev-harness">
+              <summary>Developer connection harness</summary>
+              <p className="hint">
+                The Phase 1–2 configuration view and billable test request stay available below the workspace.
+              </p>
+              <ConnectionTestScreen getAccessToken={accessToken} onBusyChange={setTestBusy} />
+            </details>
           </>
         )}
       </main>
 
       <footer className="site-footer">
         <p>
-          Supabase Auth issues session tokens to the browser; the Node server verifies them on every request. The
-          Ollama key and Supabase service-role key never reach the browser.
+          Supabase Auth issues session tokens to the browser; the Node server verifies them on every project and media
+          request. The Ollama key, Supabase service-role key, and storage credentials never reach the browser.
         </p>
       </footer>
     </div>

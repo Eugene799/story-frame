@@ -34,6 +34,7 @@ import {
   PROJECT_LIST_LIMIT,
   PROJECT_NOT_FOUND_MESSAGE,
   createSupabaseProjectStore,
+  assertSceneLocks,
   isProjectId,
   parseProjectUpdate,
   parseProjectWrite,
@@ -80,6 +81,7 @@ const MAX_CONCURRENT_PER_USER = 1;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const LEDGER_READY_TTL_MS = 30_000;
 const CHILD_RESOURCES = new Set(["scenes", "sources", "claims", "proposals", "jobs", "renders"]);
+const PROJECT_REVISIONS_LIMIT = 20;
 const USAGE_PAGE_SIZE = 20;
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 const ABANDONED_MESSAGE =
@@ -606,6 +608,17 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       throw new HttpError(404, "PROJECT_NOT_FOUND", PROJECT_NOT_FOUND_MESSAGE);
     }
 
+    if (segments.length === 2 && segments[1] === "revisions") {
+      if (method !== "GET") {
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for this endpoint.");
+      }
+      // get() proves ownership before the revision table is queried at all.
+      await store.get(user.id, projectId);
+      const revisions = await store.listRevisions(user.id, projectId, PROJECT_REVISIONS_LIMIT);
+      sendJson(response, 200, { ok: true, revisions });
+      return;
+    }
+
     if (segments.length > 1 && segments[1] === "media") {
       await handleMedia(request, response, user, projectId, segments.slice(2));
       return;
@@ -626,7 +639,12 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     }
     if (method === "PUT") {
       const body = await readJsonBody(request, PROJECT_LIMITS.bodyBytes);
-      const project = await store.update(user.id, projectId, parseProjectUpdate(body));
+      const update = parseProjectUpdate(body);
+      // Locked components are compared against the stored document, not the
+      // client's version number, so no save path can overwrite them.
+      const current = await store.get(user.id, projectId);
+      assertSceneLocks(current.document, update.document);
+      const project = await store.update(user.id, projectId, update);
       sendJson(response, 200, { ok: true, project });
       return;
     }

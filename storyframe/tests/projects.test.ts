@@ -1,27 +1,18 @@
 import { describe, expect, it } from "vitest";
 import type {
   ProjectDeletedResponse,
-  ProjectDocumentV1,
+  ProjectDocumentV2,
   ProjectListResponse,
   ProjectRecord,
   ProjectResponse,
 } from "../shared/project-contract";
 import { USER_A, USER_B } from "./fake-supabase";
+import { documentFixture } from "./project-fixture";
 import { apiRequest, startTestServer, type TestApp } from "./server-helpers";
 
 // MOCKED: Supabase is a local fake serving Auth and PostgREST over real HTTP.
 
-const DOCUMENT: ProjectDocumentV1 = {
-  schemaVersion: 1,
-  summary: "A courier finds a letter that was never meant to arrive.",
-  scenes: [
-    {
-      id: "scene-1",
-      heading: "INT. TRAIN CAR - NIGHT",
-      body: "The letter waits under a seat, addressed to nobody.",
-    },
-  ],
-};
+const DOCUMENT: ProjectDocumentV2 = documentFixture();
 
 async function createProject(
   app: TestApp,
@@ -56,7 +47,7 @@ describe("project data model", () => {
       expect(project).toMatchObject({
         projectType: "story",
         title: "The Late Letter",
-        schemaVersion: 1,
+        schemaVersion: 2,
         version: 1,
         document: DOCUMENT,
       });
@@ -67,7 +58,7 @@ describe("project data model", () => {
         project_id: project.id,
         owner_id: USER_A.id,
         revision: 1,
-        schema_version: 1,
+        schema_version: 2,
         title: "The Late Letter",
         document: DOCUMENT,
       });
@@ -140,7 +131,7 @@ describe("project data model", () => {
 
     try {
       const project = await createProject(app);
-      const revised: ProjectDocumentV1 = { ...DOCUMENT, summary: "The letter was meant for the courier." };
+      const revised: ProjectDocumentV2 = { ...DOCUMENT, summary: "The letter was meant for the courier." };
 
       const response = await apiRequest(app.url, `/api/projects/${project.id}`, {
         method: "PUT",
@@ -232,7 +223,7 @@ describe("project data model", () => {
         { body: { projectType: "novel", title: "x", document: DOCUMENT }, code: "INVALID_PROJECT_TYPE" },
         { body: { projectType: "story", title: "   ", document: DOCUMENT }, code: "INVALID_PROJECT" },
         {
-          body: { projectType: "story", title: "x", document: { ...DOCUMENT, schemaVersion: 2 } },
+          body: { projectType: "story", title: "x", document: { ...DOCUMENT, schemaVersion: 3 } },
           code: "UNSUPPORTED_PROJECT_SCHEMA",
         },
         {
@@ -271,8 +262,8 @@ describe("project data model", () => {
         owner_id: USER_A.id,
         project_type: "story",
         title: "Written By A Newer Server",
-        schema_version: 2,
-        document: { schemaVersion: 2, summary: "", scenes: [] },
+        schema_version: 3,
+        document: { schemaVersion: 3, summary: "", scenes: [] },
         version: 1,
         created_at: now,
         updated_at: now,

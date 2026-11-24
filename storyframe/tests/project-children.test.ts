@@ -14,6 +14,7 @@ import type {
 } from "../shared/child-contract";
 import type { ProjectRecord } from "../shared/project-contract";
 import { USER_A, USER_B } from "./fake-supabase";
+import { documentFixture } from "./project-fixture";
 import { apiRequest, startTestServer, type TestApp } from "./server-helpers";
 
 // MOCKED: Supabase is a local fake serving Auth and PostgREST over real HTTP.
@@ -27,7 +28,7 @@ async function createProject(app: TestApp, token: string = USER_A.token): Promis
       body: JSON.stringify({
         projectType: "story",
         title: "The Late Letter",
-        document: { schemaVersion: 1, summary: "", scenes: [] },
+        document: { ...documentFixture(), scenes: [] },
       }),
     },
     token,

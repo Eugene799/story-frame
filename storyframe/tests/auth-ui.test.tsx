@@ -61,6 +61,7 @@ function installStatusFetch() {
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {
       if (String(input).endsWith("/api/ai/status")) return jsonResponse(STATUS);
+      if (String(input).endsWith("/api/projects")) return jsonResponse({ ok: true, projects: [] });
       throw new Error(`Unexpected request: ${String(input)}`);
     }),
   );
@@ -225,6 +226,7 @@ describe("App authentication", () => {
       vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
         if (url.endsWith("/api/ai/status")) return jsonResponse(STATUS);
+        if (url.endsWith("/api/projects")) return jsonResponse({ ok: true, projects: [] });
         if (url.endsWith("/api/ai/test")) return pending;
         throw new Error(`Unexpected request: ${url}`);
       }),
