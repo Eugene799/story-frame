@@ -127,6 +127,21 @@ export function ProjectEditor({
     return ok;
   }
 
+  async function detachAsset(sceneId: string, mediaId: string): Promise<boolean> {
+    const next: ProjectDocumentV2 = {
+      ...draft,
+      scenes: draft.scenes.map((scene) =>
+        scene.id === sceneId
+          ? { ...scene, assetIds: scene.assetIds.filter((assetId) => assetId !== mediaId) }
+          : scene,
+      ),
+    };
+    setDraft(next);
+    const ok = await saveDocument(next);
+    if (ok) setNotice(`Media ${mediaId.slice(0, 8)} detached from the scene and saved.`);
+    return ok;
+  }
+
   return (
     <div className="workspace editor">
       <section className="panel editor-header" aria-labelledby="editor-heading">
@@ -236,6 +251,7 @@ export function ProjectEditor({
             scenes={draft.scenes}
             getAccessToken={getAccessToken}
             onAttachAsset={attachAsset}
+            onDetachAsset={detachAsset}
             onBusyChange={setMediaBusy}
           />
         )}

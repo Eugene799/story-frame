@@ -218,6 +218,33 @@ export async function attachMediaReference(
   ).reference;
 }
 
+export async function listMediaReferences(
+  accessToken: string,
+  projectId: string,
+  mediaId: string,
+): Promise<MediaReferenceRecord[]> {
+  return (
+    await authorizedJson<{ ok: true; references: MediaReferenceRecord[] }>(
+      `/api/projects/${projectId}/media/${mediaId}/references`,
+      accessToken,
+    )
+  ).references;
+}
+
+export async function deleteMediaReference(
+  accessToken: string,
+  projectId: string,
+  mediaId: string,
+  referenceId: string,
+): Promise<string> {
+  const body = await authorizedJson<{ ok: true; deletedId: string }>(
+    `/api/projects/${projectId}/media/${mediaId}/references/${referenceId}`,
+    accessToken,
+    { method: "DELETE" },
+  );
+  return body.deletedId;
+}
+
 export async function deleteMediaRecord(
   accessToken: string,
   projectId: string,

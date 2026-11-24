@@ -28,6 +28,7 @@ interface FakeBackend {
   projects: Map<string, ProjectRecord>;
   revisions: Map<string, ProjectRevisionSummary[]>;
   media: Map<string, MediaRecord[]>;
+  references: Map<string, { id: string; refKind: "scene"; refId: string }[]>;
   uploads: { url: string; headers: Record<string, string> }[];
   requests: { method: string; path: string; body: unknown }[];
 }
@@ -37,6 +38,7 @@ function makeBackend(project?: ProjectRecord): FakeBackend {
     projects: new Map(project ? [[project.id, project]] : []),
     revisions: new Map(project ? [[project.id, [{ revision: 1, title: project.title, schemaVersion: 2, createdAt: NOW }]]] : []),
     media: new Map(project ? [[project.id, []]] : []),
+    references: new Map(),
     uploads: [],
     requests: [],
   };
@@ -211,18 +213,19 @@ function installBackend(backend: FakeBackend) {
           byteSize: record.byteSize,
         });
       }
+      if (action === "references" && method === "GET") {
+        return jsonResponse({ ok: true, references: backend.references.get(mediaId) ?? [] });
+      }
       if (action === "references" && method === "POST") {
         media[index] = { ...record, referenceCount: record.referenceCount + 1 };
+        const reference = {
+          id: `ref-${mediaId}-${record.referenceCount + 1}`,
+          refKind: "scene" as const,
+          refId: (body as { refId: string }).refId,
+        };
+        backend.references.set(mediaId, [...(backend.references.get(mediaId) ?? []), reference]);
         return jsonResponse(
-          {
-            ok: true,
-            reference: {
-              id: `ref-${mediaId}`,
-              refKind: "scene",
-              refId: (body as { refId: string }).refId,
-              createdAt: new Date().toISOString(),
-            },
-          },
+          { ok: true, reference: { ...reference, createdAt: new Date().toISOString() } },
           201,
         );
       }
@@ -242,6 +245,19 @@ function installBackend(backend: FakeBackend) {
         media.splice(index, 1);
         return jsonResponse({ ok: true, deletedId: mediaId });
       }
+    }
+
+    const referenceMatch = path.match(/^\/api\/projects\/([^/]+)\/media\/([^/]+)\/references\/([^/]+)$/);
+    if (referenceMatch && method === "DELETE") {
+      const [, projectId, mediaId, referenceId] = referenceMatch;
+      const media = backend.media.get(projectId) ?? [];
+      const index = media.findIndex((record) => record.id === mediaId);
+      if (index !== -1) {
+        media[index] = { ...media[index], referenceCount: Math.max(0, media[index].referenceCount - 1) };
+      }
+      const remaining = (backend.references.get(mediaId) ?? []).filter((item) => item.id !== referenceId);
+      backend.references.set(mediaId, remaining);
+      return jsonResponse({ ok: true, deletedId: referenceId });
     }
 
     throw new Error(`Unexpected request: ${method} ${raw}`);
@@ -488,6 +504,35 @@ describe("workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
     expect(await screen.findByText(/referenced and cannot be deleted/i)).toBeInTheDocument();
     await waitFor(() => expect(backend.media.get(PROJECT_ID)).toHaveLength(1));
+  });
+
+  it("detaches media from its scene so the asset can then be deleted", async () => {
+    const project = projectFixture();
+    const backend = makeBackend(project);
+    installBackend(backend);
+    renderWorkspace();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open The Late Letter" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Media" }));
+    await screen.findByText(/No media yet/i);
+
+    const file = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], "frame.png", {
+      type: "image/png",
+    });
+    fireEvent.change(screen.getByLabelText(/Media file/), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Upload media" }));
+    await screen.findByText(/attached to "INT\. TRAIN CAR - NIGHT"/i);
+
+    fireEvent.click(screen.getByRole("button", { name: "Detach media from scene 1" }));
+    expect(await screen.findByText(/Detached from scene 1 and saved/i)).toBeInTheDocument();
+    expect(backend.projects.get(PROJECT_ID)?.document.scenes[0].assetIds).toEqual([]);
+    expect(backend.media.get(PROJECT_ID)?.[0]).toMatchObject({ referenceCount: 0 });
+    expect(backend.references.get("media-1")).toEqual([]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete asset" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
+    await waitFor(() => expect(backend.media.get(PROJECT_ID)).toHaveLength(0));
+    expect(screen.queryByRole("button", { name: "Detach media from scene 1" })).not.toBeInTheDocument();
   });
 
   it("keeps the draft and offers a reload when a save conflicts", async () => {

@@ -10,8 +10,10 @@ import {
   attachMediaReference,
   completeMediaUpload,
   deleteMediaRecord,
+  deleteMediaReference,
   getMediaPlaybackUrl,
   initiateMediaUpload,
+  listMediaReferences,
   listProjectMedia,
   uploadMediaObject,
 } from "../api";
@@ -133,6 +135,7 @@ interface MediaPanelProps {
   scenes: ProjectScene[];
   getAccessToken: () => Promise<string>;
   onAttachAsset: (sceneId: string, mediaId: string) => Promise<boolean>;
+  onDetachAsset: (sceneId: string, mediaId: string) => Promise<boolean>;
   onBusyChange?: (busy: boolean) => void;
 }
 
@@ -141,6 +144,7 @@ export function MediaPanel({
   scenes,
   getAccessToken,
   onAttachAsset,
+  onDetachAsset,
   onBusyChange,
 }: MediaPanelProps) {
   const [media, setMedia] = useState<MediaRecord[] | null>(null);
@@ -339,8 +343,19 @@ export function MediaPanel({
             key={item.id}
             media={item}
             projectId={projectId}
+            scenes={scenes}
             getAccessToken={getAccessToken}
+            onDetachAsset={onDetachAsset}
             onDeleted={(id) => setMedia((current) => (current ?? []).filter((record) => record.id !== id))}
+            onReferenceReleased={(id) =>
+              setMedia((current) =>
+                (current ?? []).map((record) =>
+                  record.id === id
+                    ? { ...record, referenceCount: Math.max(0, record.referenceCount - 1) }
+                    : record,
+                ),
+              )
+            }
           />
         ))}
       </div>
@@ -351,17 +366,59 @@ export function MediaPanel({
 function MediaItem({
   media,
   projectId,
+  scenes,
   getAccessToken,
+  onDetachAsset,
   onDeleted,
+  onReferenceReleased,
 }: {
   media: MediaRecord;
   projectId: string;
+  scenes: ProjectScene[];
   getAccessToken: () => Promise<string>;
+  onDetachAsset: (sceneId: string, mediaId: string) => Promise<boolean>;
   onDeleted: (id: string) => void;
+  onReferenceReleased: (id: string) => void;
 }) {
   const [confirming, setConfirming] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [detachingId, setDetachingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const attached = scenes
+    .map((scene, index) => ({ scene, index }))
+    .filter(({ scene }) => scene.assetIds.includes(media.id));
+
+  async function detach(sceneId: string, index: number) {
+    setDetachingId(sceneId);
+    setError(null);
+    setNotice(null);
+    try {
+      const accessToken = await getAccessToken();
+      const references = await listMediaReferences(accessToken, projectId, media.id);
+      const reference = references.find((item) => item.refKind === "scene" && item.refId === sceneId);
+      if (!reference) {
+        throw new AiRequestError(
+          "MEDIA_REFERENCE_NOT_FOUND",
+          "This scene link is already gone on the server. Save the project to remove the asset id.",
+          404,
+        );
+      }
+      await deleteMediaReference(accessToken, projectId, media.id, reference.id);
+      onReferenceReleased(media.id);
+      const saved = await onDetachAsset(sceneId, media.id);
+      setNotice(
+        saved
+          ? `Detached from scene ${index + 1} and saved. Delete asset is now available.`
+          : "The reference was released, but the project save did not complete. Resolve the save error and detach again.",
+      );
+    } catch (cause) {
+      setError(toRequestError(cause).message);
+    } finally {
+      setDetachingId(null);
+    }
+  }
 
   async function remove() {
     setDeleting(true);
@@ -420,7 +477,36 @@ function MediaItem({
         </div>
       </div>
 
+      {attached.length > 0 && (
+        <div className="media-attachments">
+          <span className="field-label">Attached to</span>
+          <ul>
+            {attached.map(({ scene, index }) => (
+              <li key={scene.id}>
+                <span>
+                  Scene {index + 1}: {scene.heading}
+                </span>
+                <button
+                  type="button"
+                  className="button-secondary button-small"
+                  onClick={() => void detach(scene.id, index)}
+                  disabled={detachingId !== null || deleting}
+                  aria-label={`Detach media from scene ${index + 1}`}
+                >
+                  {detachingId === scene.id ? "Detaching..." : "Detach"}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       <MediaPlaybackView media={media} projectId={projectId} getAccessToken={getAccessToken} />
+      {notice && (
+        <p className="notice" role="status">
+          {notice}
+        </p>
+      )}
       {error && <p className="alert">{error}</p>}
     </article>
   );

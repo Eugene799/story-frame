@@ -105,8 +105,8 @@ export function SettingsPanel({ project, getAccessToken, onDeleted }: SettingsPa
       <div className="danger-block">
         <h3>Delete project</h3>
         <p className="muted">
-          Deleting removes this project, its saved versions, and its media references. Media objects already uploaded
-          to storage are not part of a project delete.
+          Deleting removes this project, its saved versions, its media references, and the media objects uploaded for
+          it. Storage cleanup is best effort, so a bucket failure can leave an object without a record.
         </p>
         {deleteError && <p className="alert">{deleteError}</p>}
         {!confirming ? (

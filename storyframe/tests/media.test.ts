@@ -374,6 +374,33 @@ describe("private media storage", () => {
     }
   });
 
+  it("removes a project's uploaded objects when the project is deleted", async () => {
+    const app = await startTestServer();
+    try {
+      const projectId = await createProject(app.url);
+      const ticket = await initiateUpload(app.url, projectId, {
+        kind: "image",
+        contentType: "image/png",
+        byteSize: PNG.length,
+      });
+      await putObject(ticket, PNG);
+      expect((await complete(app.url, projectId, ticket.media.id)).status).toBe(200);
+
+      const objectKey = `media/${USER_A.id}/${ticket.media.id}`;
+      expect(app.r2.objects.has(objectKey)).toBe(true);
+
+      const deleted = await apiRequest(app.url, `/api/projects/${projectId}`, { method: "DELETE" });
+      expect(deleted.status).toBe(200);
+      expect(app.r2.objects.has(objectKey)).toBe(false);
+      expect(app.supabase.media).toHaveLength(0);
+
+      const gone = await apiRequest(app.url, `/api/projects/${projectId}`);
+      expect(gone.status).toBe(404);
+    } finally {
+      await app.close();
+    }
+  });
+
   it("rejects media requests when the bucket is not configured", async () => {
     const app = await startTestServer({ env: { R2_ENDPOINT: "", R2_BUCKET_NAME: "" } });
     try {

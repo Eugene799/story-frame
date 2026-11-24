@@ -279,6 +279,8 @@ export interface MediaStore {
   ): Promise<MediaRecord>;
   get(ownerId: string, projectId: string, mediaId: string): Promise<StoredMedia | null>;
   list(ownerId: string, projectId: string, limit: number): Promise<MediaRecord[]>;
+  /** Object keys for a project, read before its rows cascade away. */
+  listObjectKeys(ownerId: string, projectId: string): Promise<string[]>;
   markReady(
     ownerId: string,
     projectId: string,
@@ -553,6 +555,22 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
         found.map((row) => rowText(row, "id")),
       );
       return found.map((row) => toMedia(row, counts.get(rowText(row, "id")) ?? 0));
+    },
+
+    async listObjectKeys(ownerId, projectId) {
+      const found = rows(
+        await request(
+          tableUrl("media_metadata", {
+            select: "object_key",
+            owner_id: `eq.${ownerId}`,
+            project_id: `eq.${projectId}`,
+            limit: "1000",
+          }),
+          { headers: readHeaders },
+          "the project object list",
+        ),
+      );
+      return found.map((row) => rowText(row, "object_key"));
     },
 
     async markReady(ownerId, projectId, mediaId, update) {

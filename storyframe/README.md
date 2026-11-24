@@ -429,6 +429,11 @@ reference remains the object and row stay untouched (`409 MEDIA_IN_USE`); removi
 valid. Once the last reference is released, `DELETE` marks the row `deleted` and then removes the object, so a bucket
 failure cannot leave a ready row without its file; retention retries that removal.
 
+Deleting a **project** also removes the objects uploaded for it. The object keys are read before the media rows
+cascade with the project, then each object is deleted after the project row is gone. That cleanup is best effort: a
+bucket failure at that moment leaves an object without a record and is logged, rather than refusing a project delete
+the caller asked for.
+
 Cleanup is opportunistic and bounded (one batch per pass, at most every `MEDIA_SWEEP_INTERVAL_MS`):
 
 - pending uploads past their window are removed (interrupted uploads);
@@ -464,7 +469,9 @@ fingerprint. This is intentionally exact content, not a revision-counter heurist
 **Media from the UI.** The Media tab exercises the committed private-storage API end to end: initiate, direct
 presigned `PUT` from the browser, complete, attach a scene reference, append the media id to `scene.assetIds`, and
 save the document. Playback requests a fresh short-lived presigned URL and renders an image/audio/video element; a
-referenced asset is refused deletion by the media store. Credentials and object keys never reach the browser.
+referenced asset is refused deletion by the media store. Each attached scene is listed with a **Detach** action that
+releases that reference, removes the id from the saved document, and leaves the asset deletable. Credentials and
+object keys never reach the browser.
 
 **Preview and export are honest.** Preview is labelled a storyboard preview, not a rendered movie, and shows exactly
 the stored script, visual direction, on-screen text, media count, timing, and approval state. Export offers the
@@ -483,13 +490,15 @@ editable project JSON and the script as plain text; video export is not offered 
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; live media script is 25/25 |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 130/130; `verify:sql` 69/69; `verify:live-routes` exit 0; `verify:r2-live` 6/6; `verify:media-live` 25/25 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 132/132; `verify:sql` 69/69; `verify:live-routes` exit 0; `verify:r2-live` 6/6; `verify:media-live` 25/25 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
 | Real browser sign-in and upload against hosted Supabase/R2 | **PASS** | Disposable hosted user signed in through the browser; a 7.7 KiB PNG went initiate `201` → direct presigned `PUT 200` to the `story-frame` bucket → complete `200` → scene reference `201` → saved asset id → presigned playback `GET 200`, with the image decoding at 64 px and a one-reference count |
 | JSON/script download clicked in a browser | **PASS** | Both export buttons downloaded through the browser; the JSON parsed as a schema 2 document with the saved brief, scene ids, durations, asset id, and approvals, and the script text matched the stored narration and visual direction |
 | Hosted browser test cleanup | **PASS** | Reference release then media delete returned `200`, project delete returned the dashboard to 0 projects, the disposable user and every project/media/profile row were deleted, and the R2 object answered `The specified key does not exist` |
+| Project deletion removes uploaded objects | **PASS** | `tests/media.test.ts`: a completed upload exists in the fake bucket, project `DELETE` returns `200`, the object and media rows are gone, and the project reads `404` |
+| Detach from a scene, then delete the asset | **PASS** | `tests/workspace.test.tsx`: Detach releases the reference, clears `scene.assetIds`, saves, and Delete asset then succeeds |
 
 The browser run on 2026-11-24 also exposed a double-counted media reference: the Media tab sent `sceneKey` at initiate
 and then attached the same scene as an explicit reference, so the store counted two references while the list showed
@@ -628,6 +637,10 @@ Coverage includes:
 - Missing objects, pending playback, expired upload windows, interrupted-upload cleanup, deleted-row retention, and
   unreferenced-asset cleanup
 - Media routes refused with `503 MEDIA_NOT_CONFIGURED` when the bucket is not configured
+- Project deletion reads the project's object keys before the rows cascade and removes each object from the bucket,
+  leaving no orphaned upload behind
+- Workspace detach: releases the scene reference, removes the asset id, saves the document, and then deletes the now
+  unreferenced asset
 - Missing key, unknown/disabled model, oversized prompt/body, provider auth failure, rate limiting, timeout,
   malformed/empty responses, success extraction, secret leakage, and duplicate submission
 - UI reply rendering, error display, and duplicate-submission suppression
@@ -719,8 +732,10 @@ objects afterwards and checks that they are gone. It never prints keys, tokens, 
   and the caller must load the latest version. Revision history is read-only; restoring an old version is future work.
 - Scene generation, model planning, and video rendering are not implemented. The planning budget is recorded in the
   brief but nothing spends it, and Preview/Export are explicitly storyboard and editable-document outputs.
-- Media deletion is refused while an asset is referenced. The Media tab can upload and attach media but does not yet
-  offer detaching an asset from a scene, so an attached asset must be released through the API before deletion.
+- Media deletion is refused while an asset is referenced. The Media tab can detach an attached scene, which releases
+  the reference and saves the asset id out of the document, so deletion is reachable from the UI.
+- Project deletion removes its media objects best effort after the row cascade. A failure at that point is logged and
+  cannot be retried from the deleted rows, so a later bucket audit is the safety net for that narrow window.
 - The migrations are verified against a real PostgreSQL engine by `npm run verify:sql`, by the test fakes, and by
   live routes against the configured project. The project is empty again after test cleanup.
 - A workspace is one profile per user, with no shared or multi-user workspace, which matches the isolation

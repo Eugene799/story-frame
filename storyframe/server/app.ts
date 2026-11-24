@@ -649,7 +649,23 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       return;
     }
     if (method === "DELETE") {
+      // The rows cascade with the project, so their object keys are read first.
+      // Cleanup is best effort after the delete: the alternative is a project
+      // the caller cannot remove because the bucket is briefly unavailable.
+      const objectKeys = mediaStore ? await mediaStore.listObjectKeys(user.id, projectId) : [];
       await store.remove(user.id, projectId);
+      if (objectKeys.length > 0 && !mediaObjects) {
+        log.error("[media] PROJECT_MEDIA_OBJECTS_SKIPPED");
+      }
+      if (mediaObjects) {
+        for (const objectKey of objectKeys) {
+          try {
+            await mediaObjects.delete(objectKey);
+          } catch {
+            log.error("[media] R2_DELETE_FAILED");
+          }
+        }
+      }
       sendJson(response, 200, { ok: true, deletedId: projectId });
       return;
     }
