@@ -5,6 +5,9 @@ import { chromium } from "playwright";
 import { randomBytes } from "node:crypto";
 
 const baseURL = process.env.SMOKE_BASE_URL ?? "http://127.0.0.1:3000";
+// The app asks Supabase to return to `window.location.origin`, which never has a
+// trailing slash, so that is the value the allowlist has to contain.
+const baseOrigin = new URL(baseURL).origin;
 const supabaseUrl = (process.env.SUPABASE_URL ?? "").replace(/\/+$/, "");
 const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
 const anonKey = process.env.SUPABASE_ANON_KEY ?? process.env.SUPABASE_PUBLISHABLE_KEY ?? "";
@@ -106,6 +109,34 @@ const settings = await fetch(`${supabaseUrl}/auth/v1/settings`, { headers: { api
 await createUser(accountEmail, initialPassword, true);
 await createUser(unconfirmedEmail, unconfirmedPassword, false);
 
+// Supabase rewrites `redirect_to` to the project's Site URL when the origin is
+// not allowlisted, so an emailed recovery link would never reach this app. Ask
+// first, so a hosted run says why instead of looking like a broken flow.
+async function preflightRedirect(origin) {
+  const { status, body } = await admin("/auth/v1/admin/generate_link", {
+    method: "POST",
+    body: JSON.stringify({ type: "recovery", email: accountEmail, redirect_to: origin }),
+  });
+  if (status !== 200) {
+    console.log(`PREFLIGHT WARN generate_link failed with status=${status}; redirect target unknown`);
+    return false;
+  }
+  const effective = typeof body?.redirect_to === "string" ? body.redirect_to : "(none)";
+  if (effective === origin) {
+    console.log(`PREFLIGHT redirect target ${effective} (allowlisted)`);
+    return true;
+  }
+  console.log(`PREFLIGHT WARN redirect target ${effective} -- Supabase rewrote ${origin}`);
+  console.log(
+    `PREFLIGHT WARN recovery and confirmation emails for this origin would land on ${effective}. ` +
+      `Allowlist ${origin} under Authentication -> URL Configuration -> Redirect URLs. ` +
+      "This run still exercises the app by opening the session fragment directly.",
+  );
+  return false;
+}
+
+const redirectAllowlisted = await preflightRedirect(baseOrigin);
+
 const browser = await chromium.launch({
   executablePath: process.env.CHROME_BIN,
   args: ["--no-sandbox", "--disable-dev-shm-usage"],
@@ -173,7 +204,7 @@ try {
     await signOutIfPossible();
   } else {
     const alertText = (await alert.count()) > 0 ? (await alert.innerText()).trim() : "no notice and no alert";
-    if (/rate limit/i.test(alertText)) {
+    if (/rate limit|only request this after/i.test(alertText)) {
       recordBlocked(
         "sign-up confirmation branch",
         `Supabase refused to send the confirmation email: ${alertText}`,
@@ -246,7 +277,9 @@ try {
     );
   } else {
     const text = (await resetAlert.count()) > 0 ? (await resetAlert.innerText()).trim() : "no message";
-    if (/rate limit/i.test(text)) {
+    if (/rate limit|only request this after/i.test(text)) {
+      // Supabase also applies a per-address/per-IP cooldown between sends, with
+      // this wording; it says nothing about the request itself being wrong.
       recordBlocked("password-reset request", `Supabase refused to send the recovery email: ${text}`);
     } else {
       record("reset request sends a neutral message", false, text);
@@ -377,5 +410,9 @@ try {
 const failed = results.filter((result) => !result.ok);
 const blocked = results.filter((result) => result.blocked);
 const passed = results.length - failed.length - blocked.length;
-console.log(`\nSUMMARY ${passed}/${results.length - blocked.length} passed, ${blocked.length} blocked`);
+const warnings = redirectAllowlisted ? 0 : 1;
+console.log(
+  `\nSUMMARY ${passed}/${results.length - blocked.length} passed, ${blocked.length} blocked` +
+    (warnings ? ", 1 warning (base origin is not allowlisted for redirects)" : ""),
+);
 process.exit(failed.length === 0 ? 0 : 1);

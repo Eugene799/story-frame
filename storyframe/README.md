@@ -1768,6 +1768,10 @@ not part of CI because it needs a browser. Start `npm run dev` first, then provi
 is not on `http://127.0.0.1:3000`. Install Playwright once with `npm install --no-save playwright` and either run
 `npx playwright install chromium` or point `CHROME_BIN` at an existing Chromium build.
 
+It starts with a `PREFLIGHT` line that asks Supabase which `redirect_to` it would actually use for the base origin;
+a `WARN` there means the origin is not allowlisted and emailed links would land on the project's Site URL. That is why
+the recovery step opens the session fragment directly rather than depending on the allowlist.
+
 The script creates disposable users, exercises sign-up, the reset request, a recovery link minted with the admin API
 (so no inbox is needed), the password change (the old password must stop working), an unconfirmed account, and the
 expired-session path, then deletes every user it created and verifies the deletion. It never calls the billing route:
