@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { AiUsage } from "../shared/ai-contract";
 import type { SourceRecord } from "../shared/child-contract";
 import type {
   PlanningAngle,
@@ -225,13 +226,21 @@ export class PlanningPayloadError extends Error {
 }
 
 export class PlanningInvalidError extends ApiError {
-  constructor(detail: string) {
+  /** Usage from the provider calls that were made before the refusal. */
+  readonly usage: AiUsage | null;
+  readonly returnedModel: string | null;
+  readonly latencyMs: number;
+
+  constructor(detail: string, meta: { usage: AiUsage | null; returnedModel: string | null; latencyMs: number }) {
     super(
       422,
       "PLANNING_INVALID_JSON",
       `The planning reply stayed invalid after one repair attempt: ${detail}`,
     );
     this.name = "PlanningInvalidError";
+    this.usage = meta.usage;
+    this.returnedModel = meta.returnedModel;
+    this.latencyMs = meta.latencyMs;
   }
 }
 
@@ -560,6 +569,17 @@ export interface PlanningGeneration {
   repairAttempted: boolean;
   returnedModel: string | null;
   latencyMs: number;
+  /** Token counts across the first call and any repair call, for the ledger. */
+  usage: AiUsage;
+}
+
+function addUsage(total: AiUsage | null, next: AiUsage): AiUsage {
+  const sum = (left: number | null, right: number | null): number | null =>
+    left === null && right === null ? null : (left ?? 0) + (right ?? 0);
+  return {
+    promptEvalCount: sum(total?.promptEvalCount ?? null, next.promptEvalCount),
+    evalCount: sum(total?.evalCount ?? null, next.evalCount),
+  };
 }
 
 function extractJsonObject(reply: string): unknown {
@@ -601,6 +621,7 @@ export async function generatePlanningPayload(options: PlanningGenerationOptions
       repairAttempted: false,
       returnedModel: first.returnedModel,
       latencyMs: Math.max(0, Date.now() - startedAt),
+      usage: first.usage,
     };
   } catch (error) {
     if (!(error instanceof PlanningPayloadError)) throw error;
@@ -620,6 +641,7 @@ export async function generatePlanningPayload(options: PlanningGenerationOptions
       fetchImpl: options.fetchImpl,
     });
 
+    const usage = addUsage(first.usage, second.usage);
     try {
       const payload = validatePlanningPayload(extractJsonObject(second.reply), options.context);
       return {
@@ -627,10 +649,15 @@ export async function generatePlanningPayload(options: PlanningGenerationOptions
         repairAttempted: true,
         returnedModel: second.returnedModel,
         latencyMs: Math.max(0, Date.now() - startedAt),
+        usage,
       };
     } catch (repairError) {
       if (!(repairError instanceof PlanningPayloadError)) throw repairError;
-      throw new PlanningInvalidError(`${error.detail}; after repair: ${repairError.detail}`);
+      throw new PlanningInvalidError(`${error.detail}; after repair: ${repairError.detail}`, {
+        usage,
+        returnedModel: second.returnedModel,
+        latencyMs: Math.max(0, Date.now() - startedAt),
+      });
     }
   }
 }

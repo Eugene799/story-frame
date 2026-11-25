@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { GenerationProposalRecord } from "../../shared/child-contract";
 import type {
   PlanningAngle,
@@ -47,6 +47,14 @@ function payloadOf(proposal: GenerationProposalRecord): Partial<PlanningPayload>
 
 function listOf<T>(value: T[] | undefined): T[] {
   return Array.isArray(value) ? value : [];
+}
+
+function newIdempotencyKey(): string {
+  const uuid =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+  return uuid.replace(/[^A-Za-z0-9._:-]/g, "-");
 }
 
 function statusLabel(status: GenerationProposalRecord["status"]): string {
@@ -144,6 +152,9 @@ export function PlanningPanel({
   const [acting, setActing] = useState(false);
   const [error, setError] = useState<AiRequestError | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Reused only while an attempt's outcome is unknown (a network failure), so a
+  // retry replays the recorded proposal instead of paying for another one.
+  const pendingKey = useRef<string | null>(null);
 
   const busy = generating || acting;
 
@@ -179,12 +190,16 @@ export function PlanningPanel({
     setGenerating(true);
     setError(null);
     setNotice(null);
+    const key = pendingKey.current ?? newIdempotencyKey();
+    pendingKey.current = key;
     try {
-      const created = await generatePlanningProposal(await getAccessToken(), projectId, {
-        route,
-        instruction,
-        baseVersion,
-      });
+      const created = await generatePlanningProposal(
+        await getAccessToken(),
+        projectId,
+        { route, instruction, baseVersion },
+        key,
+      );
+      pendingKey.current = null;
       setProposals((current) => [...(current ?? []), created]);
       setSelectedId(created.id);
       setNotice(
@@ -193,7 +208,10 @@ export function PlanningPanel({
           : `Proposal created with ${created.modelId}${payloadOf(created).repairAttempted ? " after one repair attempt" : ""}. Review it before accepting.`,
       );
     } catch (cause) {
-      setError(toRequestError(cause));
+      const requestError = toRequestError(cause);
+      // Status 0 means no response reached us: keep the key so Retry can replay.
+      if (requestError.status !== 0) pendingKey.current = null;
+      setError(requestError);
     } finally {
       setGenerating(false);
     }
@@ -288,7 +306,7 @@ export function PlanningPanel({
           <p className="hint">
             {dirty
               ? "Save or discard the draft first: planning is generated from the saved version."
-              : "The reply is validated against this document; a bad reply gets one disclosed repair attempt."}
+              : "Each attempt uses one Idempotency-Key; a retry after a lost response replays it instead of calling the provider again."}
           </p>
         </div>
       </div>

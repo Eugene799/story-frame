@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { AiStatusResponse } from "../shared/ai-contract";
 import type { GenerationProposalRecord } from "../shared/child-contract";
@@ -46,11 +47,17 @@ async function createProject(
   appUrl: string,
   document: ProjectDocumentV2 = documentFixture(),
   projectType: "story" | "product-ad" | "repurpose" = "story",
+  token: string = USER_A.token,
 ): Promise<string> {
-  const response = await apiRequest(appUrl, "/api/projects", {
-    method: "POST",
-    body: JSON.stringify({ projectType, title: "Planning subject", document }),
-  });
+  const response = await apiRequest(
+    appUrl,
+    "/api/projects",
+    {
+      method: "POST",
+      body: JSON.stringify({ projectType, title: "Planning subject", document }),
+    },
+    token,
+  );
   expect(response.status).toBe(201);
   return ((await response.json()) as { project: { id: string } }).project.id;
 }
@@ -60,11 +67,18 @@ function generate(
   projectId: string,
   body: { route: string; instruction?: string; baseVersion: number },
   token: string = USER_A.token,
+  idempotencyKey: string = randomUUID(),
 ) {
-  return apiRequest(appUrl, `/api/projects/${projectId}/planning`, {
-    method: "POST",
-    body: JSON.stringify(body),
-  }, token);
+  return apiRequest(
+    appUrl,
+    `/api/projects/${projectId}/planning`,
+    {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify(body),
+    },
+    token,
+  );
 }
 
 function accept(appUrl: string, projectId: string, proposalId: string, token: string = USER_A.token) {
@@ -584,6 +598,152 @@ describe("Phase 5 planning", () => {
       const response = await generate(app.url, projectId, { route: "transcript-analysis", baseVersion: 1 });
       expect(response.status).toBe(422);
       expect(app.supabase.proposals).toHaveLength(0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("requires an Idempotency-Key before contacting the provider", async () => {
+    const provider = stubProvider([scriptReply("Unused.")]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url);
+      const response = await apiRequest(app.url, `/api/projects/${projectId}/planning`, {
+        method: "POST",
+        body: JSON.stringify({ route: "script", baseVersion: 1 }),
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ ok: false, error: { code: "IDEMPOTENCY_KEY_REQUIRED" } });
+      expect(provider.calls).toHaveLength(0);
+      expect(app.supabase.usage).toHaveLength(0);
+      expect(app.supabase.proposals).toHaveLength(0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("records the attempt in the ledger and replays it for the same key", async () => {
+    const provider = stubProvider([scriptReply("Metered wording.")]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url);
+      const key = randomUUID();
+      const first = await generate(app.url, projectId, { route: "script", baseVersion: 1 }, USER_A.token, key);
+      expect(first.status).toBe(201);
+      const firstProposal = ((await first.json()) as { proposal: GenerationProposalRecord }).proposal;
+
+      const replay = await generate(app.url, projectId, { route: "script", baseVersion: 1 }, USER_A.token, key);
+      expect(replay.status).toBe(201);
+      const replayed = ((await replay.json()) as { proposal: GenerationProposalRecord }).proposal;
+
+      expect(replayed.id).toBe(firstProposal.id);
+      expect(provider.calls).toHaveLength(1);
+      expect(app.supabase.proposals).toHaveLength(1);
+      expect(app.supabase.usage).toHaveLength(1);
+      expect(app.supabase.usage[0]).toMatchObject({
+        model_id: "gemma",
+        configured_model: "gemma4:31b",
+        status: "success",
+        response_status: 201,
+        idempotency_key: key,
+      });
+      expect((app.supabase.usage[0].response_body as { proposal: { id: string } }).proposal.id).toBe(
+        firstProposal.id,
+      );
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("refuses to reuse a key for a different request", async () => {
+    const provider = stubProvider([scriptReply("First request.")]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url);
+      const key = randomUUID();
+      const first = await generate(
+        app.url,
+        projectId,
+        { route: "script", instruction: "First instruction", baseVersion: 1 },
+        USER_A.token,
+        key,
+      );
+      expect(first.status).toBe(201);
+
+      const reused = await generate(
+        app.url,
+        projectId,
+        { route: "script", instruction: "A different instruction", baseVersion: 1 },
+        USER_A.token,
+        key,
+      );
+      expect(reused.status).toBe(409);
+      expect(await reused.json()).toMatchObject({ ok: false, error: { code: "IDEMPOTENCY_KEY_REUSED" } });
+      expect(provider.calls).toHaveLength(1);
+      expect(app.supabase.proposals).toHaveLength(1);
+      expect(app.supabase.usage).toHaveLength(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("records a refused reply and replays the refusal without calling again", async () => {
+    const invalid = JSON.stringify({ summary: "Still not a planning payload." });
+    const provider = stubProvider([invalid, invalid]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url);
+      const key = randomUUID();
+      const first = await generate(app.url, projectId, { route: "script", baseVersion: 1 }, USER_A.token, key);
+      expect(first.status).toBe(422);
+      expect(provider.calls).toHaveLength(2);
+      expect(app.supabase.usage).toHaveLength(1);
+      expect(app.supabase.usage[0]).toMatchObject({
+        status: "error",
+        error_code: "PLANNING_INVALID_JSON",
+        response_status: 422,
+      });
+
+      const replay = await generate(app.url, projectId, { route: "script", baseVersion: 1 }, USER_A.token, key);
+      expect(replay.status).toBe(422);
+      expect(await replay.json()).toMatchObject({ ok: false, error: { code: "PLANNING_INVALID_JSON" } });
+      expect(provider.calls).toHaveLength(2);
+      expect(app.supabase.proposals).toHaveLength(0);
+      expect(app.supabase.usage).toHaveLength(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("scopes a key to its verified account", async () => {
+    const provider = stubProvider([scriptReply("Account-scoped.")]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const key = randomUUID();
+      const projectA = await createProject(app.url);
+      const projectB = await createProject(app.url, documentFixture(), "story", USER_B.token);
+
+      const aFirst = await generate(app.url, projectA, { route: "script", baseVersion: 1 }, USER_A.token, key);
+      expect(aFirst.status).toBe(201);
+      const proposalA = ((await aFirst.json()) as { proposal: GenerationProposalRecord }).proposal;
+
+      // The same key is a different attempt for another account.
+      const bFirst = await generate(app.url, projectB, { route: "script", baseVersion: 1 }, USER_B.token, key);
+      expect(bFirst.status).toBe(201);
+      const proposalB = ((await bFirst.json()) as { proposal: GenerationProposalRecord }).proposal;
+      expect(proposalB.id).not.toBe(proposalA.id);
+      expect(provider.calls).toHaveLength(2);
+      expect(app.supabase.usage).toHaveLength(2);
+
+      const bReplay = await generate(app.url, projectB, { route: "script", baseVersion: 1 }, USER_B.token, key);
+      expect(bReplay.status).toBe(201);
+      expect(((await bReplay.json()) as { proposal: GenerationProposalRecord }).proposal.id).toBe(proposalB.id);
+
+      const aReplay = await generate(app.url, projectA, { route: "script", baseVersion: 1 }, USER_A.token, key);
+      expect(aReplay.status).toBe(201);
+      expect(((await aReplay.json()) as { proposal: GenerationProposalRecord }).proposal.id).toBe(proposalA.id);
+      expect(provider.calls).toHaveLength(2);
+      expect(app.supabase.proposals).toHaveLength(2);
     } finally {
       await app.close();
     }

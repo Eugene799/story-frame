@@ -128,10 +128,10 @@ Afterwards, check the running server rather than assuming the schema is ready:
 3. Set `SMOKE_SUPABASE_ACCESS_TOKEN` to a session token and run `npm run smoke:live` (five
    billable calls, described under Tests).
 
-**The first six migrations are applied to the configured project (`myrohtkfsuppcabedwmn`), the sixth on 2026-11-24.
-The seventh (Phase 5) is committed and verified against PostgreSQL by `verify:sql`, but is not applied to the hosted
-project yet: this workspace has no management token, and a direct REST probe answers `42703 column sources.excerpt does
-not exist` and `PGRST205 model_health`.** Apply it before relying on Phase 5 against the hosted project. After
+**All seven migrations are applied to the configured project (`myrohtkfsuppcabedwmn`), the sixth on 2026-11-24 and the
+seventh (Phase 5) on 2026-11-25.** After applying the seventh, direct REST probes for `sources.excerpt`,
+`generation_proposals.route`/`base_version`, `claims.supporting_quote`, and `model_health.model_id` all returned
+`200`. After
 applying it, the hosted catalog was checked directly: `media_metadata` has the four added columns, `media_references`
 exists with RLS enabled, one `select` policy for `authenticated`, and only `select` granted to `authenticated`. The
 obsolete `public` schema in
@@ -361,7 +361,7 @@ of those policies, so no table can drift from the pattern. Six of them are reach
 | `PATCH /api/projects/:id/claims/:claimId` | Set `unverified`, `supported`, or `contradicted`. |
 | `GET`/`POST /api/projects/:id/proposals` | List generation proposals, or record a frozen proposal. |
 | `PATCH /api/projects/:id/proposals/:proposalId` | Accept or reject a hand-recorded proposal. |
-| `POST /api/projects/:id/planning` | Ask one configured model for a validated planning proposal (`201`); stored against the given base version and never applied. |
+| `POST /api/projects/:id/planning` | Ask one configured model for a validated planning proposal (`201`); requires `Idempotency-Key`, one ledger row per attempt, and a retry with the same key replays the stored response; stored against the given base version and never applied. |
 | `POST /api/projects/:id/proposals/:proposalId/accept` | Apply a pending planning proposal, respecting locks, and save one new project version (`200`); stale proposals are `409`. |
 | `GET`/`POST /api/projects/:id/jobs` | List provider jobs, or queue one. |
 | `PATCH /api/projects/:id/jobs/:jobId` | Move a job's status and record its result. |
@@ -525,7 +525,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 165/165; `verify:sql` 77/77; `verify:live-routes` exit 0; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 170/170; `verify:sql` 77/77; `verify:live-routes` exit 0; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -590,6 +590,18 @@ transcript analysis) with no supplied excerpt never calls a model: it stores pla
 `insufficientEvidence: true`. A storyboard must return one draft per stored scene, in order, with heading and narration
 copied word for word. Claims are written only on acceptance, and the response says whether that write succeeded.
 
+**Billable safety.** `POST /api/projects/:id/planning` requires an `Idempotency-Key` (8–128 characters, same pattern as
+`/api/ai/test`). Before the provider is contacted, the server reserves a row in the existing `ai_usage` ledger with the
+verified user id, the key, a hash of the route, configured model, and exact prompt, and the configured model id. A
+completed attempt stores its `{ ok, proposal }` body, so a retry with the same key returns the same proposal without a
+second provider call or a duplicate proposal row; a refused reply is stored and replayed too. Reusing the key for a
+different route, instruction, or document returns `409 IDEMPOTENCY_KEY_REUSED`; a still-running attempt returns `409
+IDEMPOTENCY_IN_PROGRESS`; an attempt older than `AI_ABANDON_AFTER_MS` is settled as `REQUEST_ABANDONED` without calling
+the provider. The key is scoped to the verified account, so the same key from another account is a separate attempt and
+can never read the first account's response. If the outcome cannot be recorded after the provider answered, the
+proposal is still returned with `X-Storyframe-Usage: unrecorded`. The no-evidence short-circuit makes no provider call,
+so it writes no ledger row and does not consume the key.
+
 ### Phase 5 verification (2026-11-25)
 
 | Criterion | Status | Evidence |
@@ -604,7 +616,11 @@ copied word for word. Claims are written only on acceptance, and the response sa
 | Factual evidence maps to sources and exact quotes | **PASS** | Quoted claim is `supported` with its verbatim quote; unquoted claim is `unverified`; acceptance stores both with the quote; no excerpts → planning notes and zero provider calls |
 | Transcript analysis quotes real transcript text | **PASS** | Clip becomes a scene with the quoted words and computed duration; an invented quote is refused and stores nothing |
 | Planning is owner-scoped | **PASS** | Another account gets `404` on generate and on accept, and the provider is not called |
-| Hosted planning route checks | **UNVERIFIED** | Migration 7 is not applied to the hosted project (no management token in this workspace); direct probes return `42703 sources.excerpt` and `PGRST205 model_health`. The SQL is covered by `verify:sql` 77/77 and the routes by the mocked suite |
+| Planning calls are metered and replayable | **PASS** | Generating stores one `ai_usage` row (`model_id: gemma`, `configured_model: gemma4:31b`, `response_status: 201`) and a retry with the same key returns the same proposal id after exactly one provider call and one proposal row |
+| Key reuse and account scoping | **PASS** | The same key with a different instruction is `409 IDEMPOTENCY_KEY_REUSED` with no second call; the same key from another account is a separate attempt, and each account replays only its own proposal |
+| Refused replies are recorded and replayed | **PASS** | Invalid twice stores an `ai_usage` error row (`PLANNING_INVALID_JSON`, `422`), and a retry with that key replays the `422` without another provider call |
+| Planning without a key is refused | **PASS** | A request with no `Idempotency-Key` is `400 IDEMPOTENCY_KEY_REQUIRED` before the provider or the ledger is touched |
+| Hosted schema and live routes | **PASS** | Migration 7 is applied to the hosted project (2026-11-25); probes for every new column and `model_health` return `200`; `verify:live-routes` passes against it. A live planning call is still **UNVERIFIED**: it would be billable and no provider key is spent by the test suites |
 | Plan tab behavior | **PASS (DOM)** | `tests/planning-panel.test.tsx`: list, generate, review, and accept through the panel, with nothing applied before acceptance and both actions disabled while the draft is dirty; included in the production build. Not exercised in a real browser in this environment |
 
 ### Phase 3 verification (2026-11-24)
@@ -740,6 +756,9 @@ Coverage includes:
 - Transcript clips become scene drafts with the quoted words, and planning routes are owner-scoped (`404` cross-account)
 - Plan tab: generate/review/accept through the real panel component, nothing applied before acceptance, and both actions
   disabled while the workspace draft is dirty
+- Planning idempotency: key required before any provider or ledger write; one `ai_usage` success row per attempt; replay
+  returns the same proposal after one provider call; key reuse for a different request is `409`; a refused reply is
+  stored and replayed; keys are scoped to the verified account
 - Media upload lifecycle for image, audio, and video: presigned ticket, direct upload, real-size and magic-byte
   validation, playback through a second presigned URL, and the stored detected content type
 - Media type mismatch and empty/oversized uploads discarded; oversized declarations and the per-account quota refused
@@ -833,8 +852,8 @@ the document-delete guard and project-deletion object cleanup.
 - Email/password sign-in only; there is no sign-up, password-reset, MFA, OAuth, or account-management UI. The
   Supabase client persists session tokens in browser `localStorage`; production needs an explicit session-storage and
   CSP review. Sign-out is local to this browser and does not revoke the account's other sessions.
-- The first six migrations and RLS policies are applied to the configured Supabase project; the Phase 5 migration is not
-  applied there yet (see Applying the migrations). The hosted catalog was checked (11
+- All seven migrations and RLS policies are applied to the configured Supabase project (Phase 5 on 2026-11-25). The
+  hosted catalog was checked (11
   tables, RLS, policies, grants, revision trigger), live profile/project/child routes and two-user isolation passed
   39/39 checks on the hardening commit, and the disposable users were deleted afterwards. Rerun these checks with
   `npm run verify:live-routes`. `smoke:live` exposed a live-only missing-column
@@ -858,12 +877,16 @@ the document-delete guard and project-deletion object cleanup.
 - Scene generation and video rendering are not implemented. Phase 5 plans angles, scripts, storyboards, ad concepts, and
   transcript clips as proposals; the planning budget is recorded in the brief but nothing spends or enforces it, and
   Preview/Export remain storyboard and editable-document outputs.
-- Planning has no idempotency key: a retried generate is a second billable call and a second proposal. Proposals are
-  never deleted, and accepting one does not release the project version it was based on beyond the staleness check.
+- A planning attempt is one ledger row even when the disclosed repair makes two provider calls: token counts are summed
+  and latency covers both, so per-call cost cannot be reconstructed from that row. A provider failure during the repair
+  records the attempt with unknown token counts, and the no-evidence short-circuit writes no ledger row at all.
+- Proposals are never deleted, keys never expire once completed, and accepting a proposal does not release the project
+  version beyond the staleness check.
 - The model-health counters are read-then-written in the API process, so two concurrent calls can lose one count; the
   timestamps and error codes are best-effort evidence, not an audit log. Cost rates stay `unpriced` until Phase 14.
-- Planning is verified against the local fake and `verify:sql`; it has not been run against the hosted project because
-  its migration is unapplied, and the new Plan tab has not been exercised in a browser in this environment.
+- Planning is verified against the local fake and `verify:sql`, and migration 7 is applied to the hosted project, but a
+  live planning call (which is billable) has not been made, and the Plan tab has not been exercised in a real browser in
+  this environment.
 - Media deletion is refused while an asset is referenced. The Media tab can detach an attached scene, which releases
   the reference and saves the asset id out of the document, so deletion is reachable from the UI. Saves also refuse
   scene asset ids that are not ready media in the same project, so a direct API write cannot create a dangling id.

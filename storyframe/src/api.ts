@@ -78,11 +78,11 @@ export function fetchStatus(): Promise<AiStatusResponse> {
 async function authorizedJson<T>(
   path: string,
   accessToken: string,
-  options: { method?: string; body?: unknown } = {},
+  options: { method?: string; body?: unknown; headers?: Record<string, string> } = {},
 ): Promise<T> {
   const init: RequestInit = {
     method: options.method ?? "GET",
-    headers: { Authorization: `Bearer ${accessToken}` },
+    headers: { Authorization: `Bearer ${accessToken}`, ...options.headers },
   };
   if (options.body !== undefined) init.body = JSON.stringify(options.body);
   return (await requestJson<T>(path, init)).body;
@@ -276,12 +276,13 @@ export async function generatePlanningProposal(
   accessToken: string,
   projectId: string,
   request: PlanningStartRequest,
+  idempotencyKey: string,
 ): Promise<GenerationProposalRecord> {
   return (
     await authorizedJson<{ ok: true; proposal: GenerationProposalRecord }>(
       `/api/projects/${projectId}/planning`,
       accessToken,
-      { method: "POST", body: request },
+      { method: "POST", body: request, headers: { "Idempotency-Key": idempotencyKey } },
     )
   ).proposal;
 }

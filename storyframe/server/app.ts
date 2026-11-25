@@ -66,6 +66,7 @@ import {
   findPlanningRoute,
   generatePlanningPayload,
   insufficientEvidencePayload,
+  PlanningInvalidError,
   planningRegistryWithModels,
   type ResolvedPlanningRoute,
 } from "./planning";
@@ -1110,6 +1111,8 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     projectId: string,
   ): Promise<void> {
     const project = await requireProjects().get(user.id, projectId);
+    const usageLedger = requireLedger();
+    const idempotencyKey = readIdempotencyKey(request);
     const children = requireChildren();
     const start = parsePlanningStart(await readJsonBody(request, PLANNING_BODY_BYTES), project.version);
     const route = findPlanningRoute(config.planning.routes, start.route);
@@ -1159,47 +1162,215 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       inputLimitChars: route.inputLimitChars,
     });
 
+    // Planning is billable, so one Idempotency-Key owns one attempt. The key is
+    // reserved before the provider is contacted; a retry replays the stored
+    // proposal or refusal instead of paying for a second answer.
+    const requestHash = hashRequest(`${start.route}:${route.requestId}`, prompt);
+
     beginProviderRequest(user.id);
-    let generation;
     try {
-      generation = await generatePlanningPayload({
-        route: start.route,
-        requestId: route.requestId,
-        apiKey: config.apiKey,
-        prompt,
-        timeoutMs: config.providerTimeoutMs,
-        maxOutputTokens: route.outputTokenLimit,
-        fetchImpl,
-        context: {
+      let reservation: ReservationResult;
+      try {
+        reservation = await usageLedger.reserve({
+          userId: user.id,
+          idempotencyKey,
+          requestHash,
+          modelId: route.modelId ?? "unknown",
+          configuredModel: route.requestId,
+        });
+      } catch (error) {
+        if (error instanceof UsageLedgerError) {
+          throw new HttpError(
+            503,
+            "LEDGER_UNAVAILABLE",
+            "The usage ledger is not ready. Apply the ai_usage migrations and check SUPABASE_SERVICE_ROLE_KEY.",
+          );
+        }
+        throw error;
+      }
+
+      if (reservation.state === "existing") {
+        try {
+          await replayReservation(usageLedger, user, idempotencyKey, requestHash, response, reservation.usage);
+        } catch (error) {
+          if (error instanceof UsageLedgerError) {
+            throw new HttpError(503, "LEDGER_UNAVAILABLE", "The usage ledger is temporarily unavailable.");
+          }
+          throw error;
+        }
+        return;
+      }
+
+      const startedAt = now();
+      let generation;
+      try {
+        generation = await generatePlanningPayload({
           route: start.route,
-          projectType: project.projectType,
-          document: project.document,
-          sources: supplied,
-        },
+          requestId: route.requestId,
+          apiKey: config.apiKey,
+          prompt,
+          timeoutMs: config.providerTimeoutMs,
+          maxOutputTokens: route.outputTokenLimit,
+          fetchImpl,
+          context: {
+            route: start.route,
+            projectType: project.projectType,
+            document: project.document,
+            sources: supplied,
+          },
+        });
+        await recordModelOutcome(route.modelId ?? "unknown", "success");
+      } catch (error) {
+        const providerError = error instanceof ProviderError ? error : null;
+        const planningError = error instanceof PlanningInvalidError ? error : null;
+        const code = providerError?.code ?? (error instanceof ApiError ? error.code : "INTERNAL_ERROR");
+        const message = error instanceof Error ? error.message : "Unexpected server error.";
+        const status = providerError?.status ?? (error instanceof ApiError ? error.status : 500);
+        await recordModelOutcome(route.modelId ?? "unknown", "failure", code);
+        await recordOutcome(usageLedger, user.id, reservation.id, {
+          status: "error",
+          returnedModel: planningError?.returnedModel ?? null,
+          promptEvalCount: planningError?.usage?.promptEvalCount ?? null,
+          evalCount: planningError?.usage?.evalCount ?? null,
+          latencyMs: planningError?.latencyMs ?? Math.max(0, now() - startedAt),
+          errorCode: code,
+          upstreamStatus: providerError?.upstreamStatus ?? null,
+          responseStatus: status,
+          responseBody: failure(code, message, providerError?.upstreamStatus),
+        });
+        throw error;
+      }
+
+      let proposal;
+      try {
+        proposal = await children.createProposal(user.id, projectId, {
+          modelId: route.modelId ?? "unknown",
+          prompt,
+          sceneKey: null,
+          route: start.route,
+          baseVersion: project.version,
+          proposal: generation.payload as unknown as Record<string, unknown>,
+        });
+      } catch (error) {
+        await recordOutcome(usageLedger, user.id, reservation.id, {
+          status: "error",
+          returnedModel: generation.returnedModel,
+          promptEvalCount: generation.usage.promptEvalCount,
+          evalCount: generation.usage.evalCount,
+          latencyMs: generation.latencyMs,
+          errorCode: "PROPOSAL_WRITE_FAILED",
+          responseStatus: 500,
+          responseBody: failure(
+            "PROPOSAL_WRITE_FAILED",
+            error instanceof Error ? error.message : "The proposal could not be stored.",
+          ),
+        });
+        throw error;
+      }
+
+      const successBody = { ok: true, proposal };
+      const recorded = await recordOutcome(usageLedger, user.id, reservation.id, {
+        status: "success",
+        returnedModel: generation.returnedModel,
+        promptEvalCount: generation.usage.promptEvalCount,
+        evalCount: generation.usage.evalCount,
+        latencyMs: generation.latencyMs,
+        responseStatus: 201,
+        responseBody: successBody,
       });
-      await recordModelOutcome(route.modelId ?? "unknown", "success");
-    } catch (error) {
-      const code =
-        error instanceof ProviderError
-          ? error.code
-          : error instanceof ApiError
-            ? error.code
-            : "INTERNAL_ERROR";
-      await recordModelOutcome(route.modelId ?? "unknown", "failure", code);
-      throw error;
+      sendJson(
+        response,
+        201,
+        successBody,
+        recorded ? undefined : { "X-Storyframe-Usage": "unrecorded" },
+      );
     } finally {
       endProviderRequest(user.id);
     }
+  }
 
-    const proposal = await children.createProposal(user.id, projectId, {
-      modelId: route.modelId ?? "unknown",
-      prompt,
-      sceneKey: null,
-      route: start.route,
-      baseVersion: project.version,
-      proposal: generation.payload as unknown as Record<string, unknown>,
-    });
-    sendJson(response, 201, { ok: true, proposal });
+  /**
+   * Replays a stored planning reservation with the same rules as the connection
+   * test: the same request only, a live attempt is not overridden, a stale
+   * attempt is settled without calling the provider, and a completed attempt
+   * returns its stored body and status.
+   */
+  async function replayReservation(
+    target: UsageLedger,
+    user: AuthenticatedUser,
+    idempotencyKey: string,
+    requestHash: string,
+    response: ServerResponse,
+    initial: ExistingUsage,
+  ): Promise<void> {
+    if (initial.requestHash !== requestHash) {
+      throw new HttpError(
+        409,
+        "IDEMPOTENCY_KEY_REUSED",
+        "This idempotency key was already used for a different request.",
+      );
+    }
+
+    let existing = initial;
+    if (existing.status === "pending") {
+      const startedAtMs = Date.parse(existing.createdAt);
+      const isStale = Number.isFinite(startedAtMs) && now() - startedAtMs >= config.abandonAfterMs;
+      if (!isStale) {
+        throw new HttpError(
+          409,
+          "IDEMPOTENCY_IN_PROGRESS",
+          "A request with this idempotency key is still in progress.",
+        );
+      }
+
+      const body = failure("REQUEST_ABANDONED", ABANDONED_MESSAGE);
+      const settled = await target.abandon({
+        id: existing.id,
+        userId: user.id,
+        startedBefore: new Date(now() - config.abandonAfterMs).toISOString(),
+        completion: {
+          status: "error",
+          returnedModel: null,
+          promptEvalCount: null,
+          evalCount: null,
+          latencyMs: 0,
+          errorCode: "REQUEST_ABANDONED",
+          upstreamStatus: null,
+          responseStatus: 409,
+          responseBody: body,
+        },
+      });
+      if (settled) {
+        sendJson(response, 409, body);
+        return;
+      }
+
+      const reread = await target.lookup(user.id, idempotencyKey);
+      if (!reread) {
+        throw new HttpError(503, "LEDGER_UNAVAILABLE", "The usage ledger is temporarily unavailable.");
+      }
+      existing = reread;
+      if (existing.status === "pending") {
+        throw new HttpError(
+          409,
+          "IDEMPOTENCY_IN_PROGRESS",
+          "A request with this idempotency key is still in progress.",
+        );
+      }
+    }
+
+    if (!existing.responseBody || typeof existing.responseBody !== "object") {
+      throw new HttpError(
+        503,
+        "IDEMPOTENCY_REPLAY_UNAVAILABLE",
+        "The original response for this idempotency key is unavailable.",
+      );
+    }
+    sendJson(
+      response,
+      existing.responseStatus ?? (existing.status === "success" ? 200 : 502),
+      existing.responseBody,
+    );
   }
 
   async function handleProposalAccept(
