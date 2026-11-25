@@ -114,6 +114,12 @@ NODE_ENV=production HOST=0.0.0.0 PORT=8080 npm start
   same per-piece booleans, so a misconfigured instance fails the platform health check instead of serving a broken app.
   It makes no provider call and returns no secret, and it does not check that those services are reachable, so an
   outage at one of them still answers `200`: this is a configuration check, not a dependency probe.
+- `npm run preflight:deploy -- https://<origin>` validates a live deployment in one command. From a shell holding the
+  deploy values it checks the Supabase trio, the R2 quartet, and `APP_ORIGIN` (including that it names the origin being
+  probed), warning about provider keys whose feature stays disabled; then it fetches `/` and asserts the page references
+  a built bundle and that the bundle is served, `/api/health` and asserts the instance is ready (naming any false flag),
+  and an unknown `/api` path that must be the JSON `404`. Exit `0` all passed, `1` something failed, `2` no usable
+  origin.
 - [`render.yaml`](render.yaml) declares one always-on web service: `npm ci && npm run build`, `npm start`,
   `healthCheckPath: /api/health`, `HOST=0.0.0.0`, `NODE_ENV=production`, and every credential as `sync: false` so it is
   entered in the dashboard. The instance has to stay awake on a paid plan: the media, image, video, and lip sync sweeps
