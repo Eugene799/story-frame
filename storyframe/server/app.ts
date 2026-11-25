@@ -1165,7 +1165,9 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     // Planning is billable, so one Idempotency-Key owns one attempt. The key is
     // reserved before the provider is contacted; a retry replays the stored
     // proposal or refusal instead of paying for a second answer.
-    const requestHash = hashRequest(`${start.route}:${route.requestId}`, prompt);
+    // The project is part of the key scope: two projects can hold identical
+    // documents, and a replayed proposal must never cross that boundary.
+    const requestHash = hashRequest(`${start.route}:${route.requestId}:${projectId}`, prompt);
 
     beginProviderRequest(user.id);
     try {
@@ -1576,7 +1578,22 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         sendJson(response, 200, { ok: true, proposal });
         return;
       }
-      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use PATCH for one generation proposal.");
+      if (method === "DELETE") {
+        const proposal = await children.getProposal(user.id, projectId, childId);
+        // An accepted proposal is the record behind a saved project version;
+        // deleting it would remove the provenance of applied content.
+        if (proposal.status === "accepted") {
+          throw new HttpError(
+            409,
+            "PROPOSAL_ACCEPTED",
+            "An accepted proposal cannot be deleted; reject a pending proposal instead.",
+          );
+        }
+        await children.removeProposal(user.id, projectId, childId);
+        sendJson(response, 200, { ok: true, deletedId: childId });
+        return;
+      }
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use PATCH or DELETE for one generation proposal.");
     }
 
     if (resource === "jobs") {

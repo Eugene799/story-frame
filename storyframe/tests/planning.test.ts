@@ -176,6 +176,43 @@ describe("Phase 5 planning", () => {
     }
   });
 
+  it("deletes pending proposals but never an accepted proposal", async () => {
+    const provider = stubProvider([scriptReply("First draft."), scriptReply("Second draft.")]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url);
+      const first = (await (
+        await generate(app.url, projectId, { route: "script", baseVersion: 1 })
+      ).json()) as { proposal: GenerationProposalRecord };
+
+      const deleted = await apiRequest(
+        app.url,
+        `/api/projects/${projectId}/proposals/${first.proposal.id}`,
+        { method: "DELETE" },
+      );
+      expect(deleted.status).toBe(200);
+      const afterDelete = await apiRequest(app.url, `/api/projects/${projectId}/proposals`);
+      expect(((await afterDelete.json()) as { proposals: unknown[] }).proposals).toHaveLength(0);
+
+      const second = (await (
+        await generate(app.url, projectId, { route: "script", baseVersion: 1 })
+      ).json()) as { proposal: GenerationProposalRecord };
+      expect((await accept(app.url, projectId, second.proposal.id)).status).toBe(200);
+
+      const refused = await apiRequest(
+        app.url,
+        `/api/projects/${projectId}/proposals/${second.proposal.id}`,
+        { method: "DELETE" },
+      );
+      expect(refused.status).toBe(409);
+      expect(await refused.json()).toMatchObject({ ok: false, error: { code: "PROPOSAL_ACCEPTED" } });
+      const afterRefusal = await apiRequest(app.url, `/api/projects/${projectId}/proposals`);
+      expect(((await afterRefusal.json()) as { proposals: unknown[] }).proposals).toHaveLength(1);
+    } finally {
+      await app.close();
+    }
+  });
+
   it("repairs invalid JSON once, then accepts the repaired reply", async () => {
     const provider = stubProvider(["Sure! Here is your plan.", scriptReply("Repaired wording.")]);
     const app = await startTestServer({ fetchImpl: provider.impl });
@@ -463,6 +500,15 @@ describe("Phase 5 planning", () => {
         supporting_quote: "ridership rose 12 percent",
       });
       expect(app.supabase.claims[1]).toMatchObject({ status: "unverified", supporting_quote: null });
+
+      // A claim is only evidence while its source exists: deleting the source
+      // removes the claims that cite it instead of leaving supported orphans.
+      const deleted = await apiRequest(app.url, `/api/projects/${projectId}/sources/${source.id}`, {
+        method: "DELETE",
+      });
+      expect(deleted.status).toBe(200);
+      expect(app.supabase.claims).toHaveLength(0);
+      expect(app.supabase.sources).toHaveLength(0);
     } finally {
       await app.close();
     }
@@ -598,6 +644,28 @@ describe("Phase 5 planning", () => {
       const response = await generate(app.url, projectId, { route: "transcript-analysis", baseVersion: 1 });
       expect(response.status).toBe(422);
       expect(app.supabase.proposals).toHaveLength(0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("scopes an idempotency key to its project", async () => {
+    const provider = stubProvider([scriptReply("Project-scoped.")]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      // Identical documents and requests: only the project differs.
+      const projectA = await createProject(app.url);
+      const projectB = await createProject(app.url);
+      const key = randomUUID();
+
+      const first = await generate(app.url, projectA, { route: "script", baseVersion: 1 }, USER_A.token, key);
+      expect(first.status).toBe(201);
+
+      const second = await generate(app.url, projectB, { route: "script", baseVersion: 1 }, USER_A.token, key);
+      expect(second.status).toBe(409);
+      expect(await second.json()).toMatchObject({ ok: false, error: { code: "IDEMPOTENCY_KEY_REUSED" } });
+      expect(provider.calls).toHaveLength(1);
+      expect(app.supabase.proposals).toHaveLength(1);
     } finally {
       await app.close();
     }

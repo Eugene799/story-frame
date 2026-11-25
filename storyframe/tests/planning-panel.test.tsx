@@ -66,20 +66,44 @@ function proposalFixture(status: GenerationProposalRecord["status"] = "proposed"
   };
 }
 
+function storedLease(): { tabId: string; expiresAt: number } | null {
+  const raw = window.localStorage.getItem(`storyframe.planning.lock.${PROJECT_ID}`);
+  return raw ? (JSON.parse(raw) as { tabId: string; expiresAt: number }) : null;
+}
+
+function anglesProposalFixture(): GenerationProposalRecord {
+  const base = proposalFixture();
+  return {
+    ...base,
+    route: "angles",
+    proposal: {
+      ...base.proposal,
+      route: "angles",
+      angles: [
+        { title: "The missed connection", hook: "A letter arrives too late.", rationale: "Immediate stakes." },
+      ],
+      scenes: [],
+    },
+  };
+}
+
 function installBackend() {
-  const requests: { method: string; path: string; body: unknown }[] = [];
+  const requests: { method: string; path: string; body: unknown; key: string | null }[] = [];
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), "http://localhost");
     const method = init?.method ?? "GET";
     const path = url.pathname;
     const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : null;
-    requests.push({ method, path, body });
+    requests.push({ method, path, body, key: new Headers(init?.headers).get("Idempotency-Key") });
 
     if (path === `/api/projects/${PROJECT_ID}/proposals` && method === "GET") {
       return jsonResponse({ ok: true, proposals: [] });
     }
     if (path === `/api/projects/${PROJECT_ID}/planning` && method === "POST") {
       return jsonResponse({ ok: true, proposal: proposalFixture() }, 201);
+    }
+    if (path === `/api/projects/${PROJECT_ID}/proposals/${PROPOSAL_ID}` && method === "DELETE") {
+      return jsonResponse({ ok: true, deletedId: PROPOSAL_ID });
     }
     if (path === `/api/projects/${PROJECT_ID}/proposals/${PROPOSAL_ID}/accept` && method === "POST") {
       const project = projectFixture(2);
@@ -101,6 +125,7 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   window.sessionStorage.clear();
+  window.localStorage.clear();
 });
 
 describe("PlanningPanel", () => {
@@ -186,11 +211,14 @@ describe("PlanningPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
     expect(await screen.findByText(code)).toBeTruthy();
     expect(keys[0]).toBeTruthy();
+    // The outcome is unknown, so another tab must stay locked out.
+    expect(storedLease()).not.toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
     expect(await screen.findByText("Accept and save")).toBeTruthy();
     expect(keys).toHaveLength(2);
     expect(keys[1]).toBe(keys[0]);
+    expect(storedLease()).toBeNull();
   });
 
   it("persists the pending key across a reload so Retry still replays", async () => {
@@ -244,6 +272,10 @@ describe("PlanningPanel", () => {
       />,
     );
     expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    // The leased tab checks whether a live duplicate still owns its id first.
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Generate proposal" }) as HTMLButtonElement).disabled).toBe(false),
+    );
     fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
     expect(await screen.findByText("Accept and save")).toBeTruthy();
     expect(keys).toHaveLength(2);
@@ -367,6 +399,440 @@ describe("PlanningPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
     expect(await screen.findByText("Accept and save")).toBeTruthy();
     expect(screen.getAllByText("Proposed · v1 · gemma")).toHaveLength(1);
+  });
+
+  it("records attempt history and restores it after a reload", async () => {
+    installBackend();
+    const first = render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText("Accept and save")).toBeTruthy();
+    expect(screen.getByText(/Succeeded/)).toBeTruthy();
+
+    // History is local to the browser, so it survives the panel unmounting.
+    first.unmount();
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    expect(screen.getByText(/Succeeded/)).toBeTruthy();
+  });
+
+  it("stops waiting without losing the key or treating it as a failed attempt", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input), "http://localhost").pathname;
+        if (path.endsWith("/proposals")) return jsonResponse({ ok: true, proposals: [] });
+        if (path.endsWith("/planning")) {
+          return new Promise<Response>((_resolve, reject) => {
+            const signal = init?.signal;
+            if (signal?.aborted) {
+              reject(new DOMException("Aborted", "AbortError"));
+              return;
+            }
+            signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+          });
+        }
+        return jsonResponse({ ok: false, error: { code: "NOT_FOUND", message: "not found" } }, 404);
+      }),
+    );
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Stop waiting" }));
+
+    expect(await screen.findByText(/Stopped waiting/)).toBeTruthy();
+    expect(window.sessionStorage.getItem(`storyframe.planning.pendingKey.${PROJECT_ID}`)).not.toBeNull();
+    expect(screen.getAllByText(/Stopped/).length).toBeGreaterThanOrEqual(2);
+    const lease = storedLease();
+    expect(lease).not.toBeNull();
+    expect(lease?.tabId).toBe(window.sessionStorage.getItem("storyframe.planning.tabId"));
+    expect(lease?.expiresAt).toBeGreaterThan(Date.now());
+  });
+
+  it("keeps the project lease on unmount while the outcome is unknown", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input), "http://localhost").pathname;
+        if (path.endsWith("/proposals")) return jsonResponse({ ok: true, proposals: [] });
+        if (path.endsWith("/planning")) {
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+          });
+        }
+        return jsonResponse({ ok: false, error: { code: "NOT_FOUND", message: "not found" } }, 404);
+      }),
+    );
+    const view = render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    await screen.findByRole("button", { name: "Stop waiting" });
+    view.unmount();
+
+    await waitFor(() => expect(storedLease()).not.toBeNull());
+    expect(storedLease()?.expiresAt).toBeGreaterThan(Date.now());
+
+    // A remount reads the same tab id and unsettled key, so unmounting again
+    // still must not free the lease before it expires.
+    const second = render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    second.unmount();
+    await waitFor(() => expect(storedLease()).not.toBeNull());
+  });
+
+  it("keeps the project lease after a network failure", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "http://localhost").pathname;
+        if (path.endsWith("/proposals")) return jsonResponse({ ok: true, proposals: [] });
+        if (path.endsWith("/planning")) throw new TypeError("network down");
+        return jsonResponse({ ok: false, error: { code: "NOT_FOUND", message: "not found" } }, 404);
+      }),
+    );
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText("NETWORK_ERROR")).toBeTruthy();
+    expect(storedLease()).not.toBeNull();
+    expect(window.sessionStorage.getItem(`storyframe.planning.pendingKey.${PROJECT_ID}`)).not.toBeNull();
+  });
+
+  it("disables generation while another tab holds the project lease", async () => {
+    window.localStorage.setItem(
+      `storyframe.planning.lock.${PROJECT_ID}`,
+      JSON.stringify({ tabId: "other-tab", expiresAt: Date.now() + 60_000 }),
+    );
+    installBackend();
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Generate proposal" }) as HTMLButtonElement).disabled).toBe(true),
+    );
+    expect(screen.getByText(/Another tab is generating a proposal/)).toBeTruthy();
+  });
+
+  it("does not let a duplicated tab inherit the lease", async () => {
+    const sharedTabId = "cloned-tab-id-12345678";
+    window.sessionStorage.setItem("storyframe.planning.tabId", sharedTabId);
+    window.localStorage.setItem(
+      `storyframe.planning.lock.${PROJECT_ID}`,
+      JSON.stringify({ tabId: sharedTabId, expiresAt: Date.now() + 60_000 }),
+    );
+    class DuplicateTabChannel {
+      onmessage: ((event: { data: unknown }) => void) | null = null;
+      constructor(_name: string) {}
+      postMessage(_message: unknown) {
+        queueMicrotask(() => {
+          this.onmessage?.({
+            data: { type: "planning-tab-alive", tabId: sharedTabId, instanceId: "original-page" },
+          });
+        });
+      }
+      close() {}
+    }
+    vi.stubGlobal("BroadcastChannel", DuplicateTabChannel);
+    const backend = installBackend();
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText(/inherited another tab's planning lease/)).toBeTruthy();
+    expect(window.sessionStorage.getItem("storyframe.planning.tabId")).not.toBe(sharedTabId);
+    expect((screen.getByRole("button", { name: "Generate proposal" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(backend.requests.some((request) => request.path.endsWith("/planning"))).toBe(false);
+  });
+
+  it("allows generation when the lease handshake times out with no live duplicate", async () => {
+    const sharedTabId = "reloaded-tab-id-12345678";
+    const storedKey = "timed-out-key-12345678";
+    const probes: unknown[] = [];
+    class SilentTabChannel {
+      onmessage: ((event: { data: unknown }) => void) | null = null;
+      constructor(_name: string) {}
+      postMessage(message: unknown) {
+        probes.push(message);
+      }
+      close() {}
+    }
+    vi.stubGlobal("BroadcastChannel", SilentTabChannel);
+    window.sessionStorage.setItem("storyframe.planning.tabId", sharedTabId);
+    window.localStorage.setItem(
+      `storyframe.planning.lock.${PROJECT_ID}`,
+      JSON.stringify({ tabId: sharedTabId, expiresAt: Date.now() + 60_000 }),
+    );
+    window.sessionStorage.setItem(
+      `storyframe.planning.pendingKey.${PROJECT_ID}`,
+      JSON.stringify({
+        key: storedKey,
+        route: "script",
+        instruction: "Keep it under ten seconds.",
+        baseVersion: 1,
+        startedAt: Date.now(),
+      }),
+    );
+    const backend = installBackend();
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Generate proposal" }) as HTMLButtonElement).disabled).toBe(false),
+    );
+    expect(probes).toContainEqual({
+      type: "planning-tab-probe",
+      tabId: sharedTabId,
+      instanceId: expect.any(String),
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText("Accept and save")).toBeTruthy();
+    const generate = backend.requests.find((request) => request.path.endsWith("/planning"));
+    expect(generate?.key).toBe(storedKey);
+  });
+
+  it("stops blocking generation once another tab's lease has expired", async () => {
+    window.localStorage.setItem(
+      `storyframe.planning.lock.${PROJECT_ID}`,
+      JSON.stringify({ tabId: "other-tab", expiresAt: Date.now() - 1000 }),
+    );
+    const backend = installBackend();
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Generate proposal" }) as HTMLButtonElement).disabled).toBe(false),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText("Accept and save")).toBeTruthy();
+    expect(backend.requests.filter((request) => request.path.endsWith("/planning"))).toHaveLength(1);
+    expect(storedLease()).toBeNull();
+  });
+
+  it("restores the pending route and instruction so Retry reuses the key", async () => {
+    const storedKey = "restored-key-12345678";
+    window.sessionStorage.setItem(
+      `storyframe.planning.pendingKey.${PROJECT_ID}`,
+      JSON.stringify({
+        key: storedKey,
+        route: "script",
+        instruction: "Keep it under ten seconds.",
+        baseVersion: 1,
+        startedAt: Date.now(),
+      }),
+    );
+    const backend = installBackend();
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    await waitFor(() => {
+      expect((screen.getByRole("combobox") as HTMLSelectElement).value).toBe("script");
+      expect((document.getElementById("planning-instruction") as HTMLTextAreaElement).value).toBe(
+        "Keep it under ten seconds.",
+      );
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText("Accept and save")).toBeTruthy();
+    const generate = backend.requests.find((request) => request.path.endsWith("/planning"));
+    expect(generate?.key).toBe(storedKey);
+  });
+
+  it("discards an expired pending key and mints a fresh one", async () => {
+    const backend = installBackend();
+    const staleKey = "stale-key-12345678";
+    window.sessionStorage.setItem(
+      `storyframe.planning.pendingKey.${PROJECT_ID}`,
+      JSON.stringify({
+        key: staleKey,
+        route: "angles",
+        instruction: "",
+        baseVersion: 1,
+        startedAt: Date.now() - 25 * 60 * 60 * 1000,
+      }),
+    );
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText("Accept and save")).toBeTruthy();
+
+    const generate = backend.requests.find((request) => request.path.endsWith("/planning"));
+    expect(generate?.key).toBeTruthy();
+    expect(generate?.key).not.toBe(staleKey);
+    expect(window.sessionStorage.getItem(`storyframe.planning.pendingKey.${PROJECT_ID}`)).toBeNull();
+  });
+
+  it("deletes a pending proposal after confirmation", async () => {
+    const proposal = proposalFixture();
+    const requests: { method: string; path: string }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input), "http://localhost").pathname;
+        requests.push({ method: init?.method ?? "GET", path });
+        if (path.endsWith("/proposals")) return jsonResponse({ ok: true, proposals: [proposal] });
+        if (path.endsWith(`/proposals/${PROPOSAL_ID}`) && init?.method === "DELETE") {
+          return jsonResponse({ ok: true, deletedId: PROPOSAL_ID });
+        }
+        return jsonResponse({ ok: false, error: { code: "NOT_FOUND", message: "not found" } }, 404);
+      }),
+    );
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Delete proposal" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    expect(await screen.findByText(/Proposal deleted/)).toBeTruthy();
+    expect(requests.some((request) => request.method === "DELETE")).toBe(true);
+  });
+
+  it("loads an angle into the script instruction", async () => {
+    const proposal = anglesProposalFixture();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "http://localhost").pathname;
+        if (path.endsWith("/proposals")) return jsonResponse({ ok: true, proposals: [proposal] });
+        return jsonResponse({ ok: false, error: { code: "NOT_FOUND", message: "not found" } }, 404);
+      }),
+    );
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Use this angle" }));
+    expect((screen.getByRole("combobox") as HTMLSelectElement).value).toBe("script");
+    expect((document.getElementById("planning-instruction") as HTMLTextAreaElement).value).toBe(
+      "The missed connection: A letter arrives too late.",
+    );
+    expect(screen.getByText(/Angle loaded into the script instruction/)).toBeTruthy();
   });
 
   it("blocks generation and acceptance while the draft is dirty", async () => {

@@ -17,6 +17,7 @@ import type { ProjectRecord, ProjectScene } from "../../shared/project-contract"
 import {
   AiRequestError,
   acceptPlanningProposal,
+  deletePlanningProposal,
   generatePlanningProposal,
   listProjectProposals,
   rejectPlanningProposal,
@@ -51,6 +52,15 @@ function listOf<T>(value: T[] | undefined): T[] {
 
 const PENDING_KEY_PREFIX = "storyframe.planning.pendingKey.";
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
+// A stored key is only useful while its paid attempt can still be replayed.
+const PENDING_TTL_MS = 24 * 60 * 60 * 1000;
+const LOCK_PREFIX = "storyframe.planning.lock.";
+const LOCK_TTL_MS = 150_000;
+const TAB_ID_KEY = "storyframe.planning.tabId";
+const TAB_CHANNEL = "storyframe.planning.tabPresence";
+const TAB_PROBE_MS = 80;
+const ATTEMPTS_PREFIX = "storyframe.planning.attempts.";
+const ATTEMPTS_LIMIT = 20;
 
 /** The request identity a key was minted for; the server hashes route and prompt. */
 interface PendingPlanningAttempt {
@@ -58,6 +68,33 @@ interface PendingPlanningAttempt {
   route: PlanningRoute;
   instruction: string;
   baseVersion: number;
+  startedAt: number;
+}
+
+type AttemptOutcome = "succeeded" | "replayed" | "failed" | "stopped";
+
+interface PlanningAttemptEntry {
+  at: number;
+  route: PlanningRoute;
+  outcome: AttemptOutcome;
+  code?: string;
+  proposalId?: string;
+}
+
+const ATTEMPT_LABELS: Record<AttemptOutcome, string> = {
+  succeeded: "Succeeded",
+  replayed: "Replayed",
+  failed: "Failed",
+  stopped: "Stopped",
+};
+
+function isAttemptOutcome(value: unknown): value is AttemptOutcome {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(ATTEMPT_LABELS, value);
+}
+
+interface PlanningLock {
+  tabId: string;
+  expiresAt: number;
 }
 
 function pendingKeyStorageName(projectId: string): string {
@@ -85,8 +122,14 @@ function readPendingAttempt(projectId: string): PendingPlanningAttempt | null {
       typeof record.instruction !== "string" ||
       typeof record.baseVersion !== "number" ||
       !Number.isInteger(record.baseVersion) ||
-      record.baseVersion < 1
+      record.baseVersion < 1 ||
+      typeof record.startedAt !== "number" ||
+      !Number.isFinite(record.startedAt)
     ) {
+      return null;
+    }
+    if (Date.now() - record.startedAt >= PENDING_TTL_MS) {
+      clearPendingAttempt(projectId);
       return null;
     }
     return {
@@ -94,6 +137,7 @@ function readPendingAttempt(projectId: string): PendingPlanningAttempt | null {
       route: record.route as PlanningRoute,
       instruction: record.instruction,
       baseVersion: record.baseVersion,
+      startedAt: record.startedAt,
     };
   } catch {
     return null;
@@ -115,6 +159,168 @@ function clearPendingAttempt(projectId: string): void {
     window.sessionStorage.removeItem(pendingKeyStorageName(projectId));
   } catch {
     // Nothing to clear when storage is unavailable.
+  }
+}
+
+function storeTabId(tabId: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(TAB_ID_KEY, tabId);
+  } catch {
+    // Without storage the id is still stable for this page lifetime.
+  }
+}
+
+/**
+ * Resolve true only when another live page claims the same tab id. A reload
+ * has no live predecessor, so it can reclaim its own lease; a duplicated tab
+ * inherits the stored id while the original page is still listening.
+ */
+function openTabChannel(): BroadcastChannel | null {
+  if (typeof window === "undefined" || typeof BroadcastChannel === "undefined") return null;
+  try {
+    return new BroadcastChannel(TAB_CHANNEL);
+  } catch {
+    return null;
+  }
+}
+
+function anotherInstanceIsAlive(tabId: string, instanceId: string): Promise<boolean> {
+  const channel = openTabChannel();
+  if (!channel) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer: number | null = null;
+    const finish = (alive: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) window.clearTimeout(timer);
+      channel.close();
+      resolve(alive);
+    };
+    timer = window.setTimeout(() => finish(false), TAB_PROBE_MS);
+    channel.onmessage = (event) => {
+      const message: unknown = event.data;
+      if (!message || typeof message !== "object") return;
+      const record = message as Record<string, unknown>;
+      if (
+        record.type === "planning-tab-alive" &&
+        record.tabId === tabId &&
+        typeof record.instanceId === "string" &&
+        record.instanceId !== instanceId
+      ) {
+        finish(true);
+      }
+    };
+    channel.postMessage({ type: "planning-tab-probe", tabId, instanceId });
+  });
+}
+
+function lockStorageName(projectId: string): string {
+  return `${LOCK_PREFIX}${projectId}`;
+}
+
+function readPlanningLock(projectId: string): PlanningLock | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(lockStorageName(projectId));
+    if (!raw) return null;
+    const value: unknown = JSON.parse(raw);
+    if (!value || typeof value !== "object") return null;
+    const record = value as Record<string, unknown>;
+    if (
+      typeof record.tabId !== "string" ||
+      record.tabId.length === 0 ||
+      typeof record.expiresAt !== "number" ||
+      !Number.isFinite(record.expiresAt)
+    ) {
+      return null;
+    }
+    return { tabId: record.tabId, expiresAt: record.expiresAt };
+  } catch {
+    return null;
+  }
+}
+
+/** A short lease keeps two tabs from paying for the same duplicate attempt. */
+function tryAcquirePlanningLock(projectId: string, tabId: string): boolean {
+  if (typeof window === "undefined") return true;
+  const current = readPlanningLock(projectId);
+  if (current && current.tabId !== tabId && current.expiresAt > Date.now()) return false;
+  try {
+    window.localStorage.setItem(
+      lockStorageName(projectId),
+      JSON.stringify({ tabId, expiresAt: Date.now() + LOCK_TTL_MS }),
+    );
+    return true;
+  } catch {
+    // If storage is unavailable, do not block the only tab that can be seen.
+    return true;
+  }
+}
+
+function releasePlanningLock(projectId: string, tabId: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    const current = readPlanningLock(projectId);
+    if (current?.tabId === tabId) window.localStorage.removeItem(lockStorageName(projectId));
+  } catch {
+    // Nothing to release when storage is unavailable.
+  }
+}
+
+function attemptsStorageName(projectId: string): string {
+  return `${ATTEMPTS_PREFIX}${projectId}`;
+}
+
+function readAttempts(projectId: string): PlanningAttemptEntry[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(attemptsStorageName(projectId));
+    if (!raw) return [];
+    const value: unknown = JSON.parse(raw);
+    if (!Array.isArray(value)) return [];
+    return value
+      .filter((entry): entry is PlanningAttemptEntry => {
+        if (!entry || typeof entry !== "object") return false;
+        const record = entry as Record<string, unknown>;
+        return (
+          typeof record.at === "number" &&
+          Number.isFinite(record.at) &&
+          typeof record.route === "string" &&
+          PLANNING_ROUTES.includes(record.route as PlanningRoute) &&
+          isAttemptOutcome(record.outcome)
+        );
+      })
+      .slice(-ATTEMPTS_LIMIT);
+  } catch {
+    return [];
+  }
+}
+
+function appendAttempt(projectId: string, entry: PlanningAttemptEntry): PlanningAttemptEntry[] {
+  if (typeof window === "undefined") return readAttempts(projectId);
+  try {
+    const next = [...readAttempts(projectId), entry].slice(-ATTEMPTS_LIMIT);
+    window.localStorage.setItem(attemptsStorageName(projectId), JSON.stringify(next));
+    return next;
+  } catch {
+    // History is diagnostics; a full or blocked store must not break planning.
+    return readAttempts(projectId);
+  }
+}
+
+/** Stable for the life of the tab, including a reload, so its own lease is recognizable. */
+function readOrCreateTabId(): string {
+  if (typeof window === "undefined") return newIdempotencyKey();
+  try {
+    const existing = window.sessionStorage.getItem(TAB_ID_KEY);
+    if (existing && IDEMPOTENCY_KEY_PATTERN.test(existing)) return existing;
+    const created = newIdempotencyKey();
+    storeTabId(created);
+    return created;
+  } catch {
+    return newIdempotencyKey();
   }
 }
 
@@ -161,7 +367,15 @@ function ScenarioList({ scenes }: { scenes: PlanningSceneDraft[] }) {
   );
 }
 
-function AngleList({ angles }: { angles: PlanningAngle[] }) {
+function AngleList({
+  angles,
+  disabled,
+  onUse,
+}: {
+  angles: PlanningAngle[];
+  disabled: boolean;
+  onUse: (angle: PlanningAngle) => void;
+}) {
   return (
     <ol className="planning-list">
       {angles.map((angle, index) => (
@@ -171,6 +385,14 @@ function AngleList({ angles }: { angles: PlanningAngle[] }) {
           </p>
           <p>{angle.hook}</p>
           <p className="hint">{angle.rationale}</p>
+          <button
+            type="button"
+            className="button-secondary button-small"
+            onClick={() => onUse(angle)}
+            disabled={disabled}
+          >
+            Use this angle
+          </button>
         </li>
       ))}
     </ol>
@@ -233,13 +455,124 @@ export function PlanningPanel({
   // Reused only while an attempt's outcome is unknown, so a retry replays the
   // recorded proposal instead of paying for another one.
   const pendingAttempt = useRef<PendingPlanningAttempt | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const tabId = useRef(readOrCreateTabId());
+  const instanceId = useRef(newIdempotencyKey());
+  // True while this tab holds a lease whose attempt has not settled. It is kept
+  // through unknown outcomes so another tab cannot start a duplicate paid call.
+  const leaseHeld = useRef(false);
+  const [attempts, setAttempts] = useState<PlanningAttemptEntry[]>(() => readAttempts(projectId));
+  const [otherTabGenerating, setOtherTabGenerating] = useState(false);
+  const [leaseSettling, setLeaseSettling] = useState(() => {
+    const lock = readPlanningLock(projectId);
+    return Boolean(lock && lock.tabId === tabId.current && lock.expiresAt > Date.now());
+  });
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
 
   const busy = generating || acting;
 
-  // A different project is a different attempt; never carry a key across it.
+  // A different project is a different attempt; never carry a key or history across it.
   useEffect(() => {
+    const pending = readPendingAttempt(projectId);
     pendingAttempt.current = null;
+    setAttempts(readAttempts(projectId));
+    // Retry must rebuild the exact request the stored key was minted for.
+    setRoute(pending?.route ?? "angles");
+    setInstruction(pending?.instruction ?? "");
+    // A reload keeps the tab id and the unsettled key, so it also keeps the
+    // lease: unmounting again must not free a possibly-running paid attempt.
+    const lock = readPlanningLock(projectId);
+    leaseHeld.current = Boolean(
+      lock &&
+        lock.tabId === tabId.current &&
+        lock.expiresAt > Date.now() &&
+        pending,
+    );
   }, [projectId]);
+
+  useEffect(() => {
+    const channel = openTabChannel();
+    if (!channel) return;
+    channel.onmessage = (event) => {
+      const message: unknown = event.data;
+      if (!message || typeof message !== "object") return;
+      const record = message as Record<string, unknown>;
+      if (
+        record.type === "planning-tab-probe" &&
+        record.tabId === tabId.current &&
+        typeof record.instanceId === "string" &&
+        record.instanceId !== instanceId.current
+      ) {
+        channel.postMessage({
+          type: "planning-tab-alive",
+          tabId: tabId.current,
+          instanceId: instanceId.current,
+        });
+      }
+    };
+    return () => channel.close();
+  }, []);
+
+  // A duplicated tab inherits the sessionStorage id. Ask whether a live page
+  // still owns it before treating its lease as this tab's own.
+  useEffect(() => {
+    const lock = readPlanningLock(projectId);
+    if (!lock || lock.tabId !== tabId.current || lock.expiresAt <= Date.now()) {
+      setLeaseSettling(false);
+      return;
+    }
+    let active = true;
+    setLeaseSettling(true);
+    void anotherInstanceIsAlive(tabId.current, instanceId.current).then((alive) => {
+      if (!active) return;
+      if (alive) {
+        const fresh = newIdempotencyKey();
+        tabId.current = fresh;
+        storeTabId(fresh);
+        leaseHeld.current = false;
+        setOtherTabGenerating(true);
+        setNotice(
+          "This tab inherited another tab's planning lease. Generate in the original tab, or wait for that lease to expire.",
+        );
+      }
+      setLeaseSettling(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, [projectId]);
+
+  useEffect(() => {
+    const refreshLock = () => {
+      const lock = readPlanningLock(projectId);
+      setOtherTabGenerating(Boolean(lock && lock.tabId !== tabId.current && lock.expiresAt > Date.now()));
+    };
+    refreshLock();
+    const timer = window.setInterval(refreshLock, 5000);
+    window.addEventListener("storage", refreshLock);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("storage", refreshLock);
+    };
+  }, [projectId]);
+
+  // Leaving the panel stops waiting locally. A settled attempt releases its
+  // lease; an unknown one keeps it until expiry, just like Stop waiting.
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+      if (!leaseHeld.current) releasePlanningLock(projectId, tabId.current);
+    };
+  }, [projectId]);
+
+  function recordAttempt(entry: PlanningAttemptEntry) {
+    setAttempts(appendAttempt(projectId, entry));
+  }
+
+  function settleLease() {
+    leaseHeld.current = false;
+    releasePlanningLock(projectId, tabId.current);
+  }
 
   useEffect(() => {
     onBusyChange?.(busy);
@@ -268,11 +601,25 @@ export function PlanningPanel({
   const selectedPayload = selected ? payloadOf(selected) : null;
   const canAct = Boolean(selected && selected.status === "proposed" && !dirty && !busy);
 
+  function handleUseAngle(angle: PlanningAngle) {
+    setRoute("script");
+    setInstruction(`${angle.title}: ${angle.hook}`.slice(0, 500));
+    setNotice("Angle loaded into the script instruction. Generate a script when you are ready.");
+  }
+
   async function handleGenerate() {
-    if (generating || dirty) return;
+    if (generating || dirty || otherTabGenerating || leaseSettling) return;
+    if (!tryAcquirePlanningLock(projectId, tabId.current)) {
+      setOtherTabGenerating(true);
+      setNotice("Another tab is already generating a proposal for this project. Wait for it to finish before starting one here.");
+      return;
+    }
+    leaseHeld.current = true;
     setGenerating(true);
     setError(null);
     setNotice(null);
+    const controller = new AbortController();
+    abortRef.current = controller;
     const previous = pendingAttempt.current ?? readPendingAttempt(projectId);
     const key =
       previous && isSameRequest(previous, route, instruction, baseVersion)
@@ -280,7 +627,7 @@ export function PlanningPanel({
         : newIdempotencyKey();
     // A changed request can never replay the old attempt (the server hashes the
     // exact prompt), so keeping the old key would only produce a 409 reuse.
-    pendingAttempt.current = { key, route, instruction, baseVersion };
+    pendingAttempt.current = { key, route, instruction, baseVersion, startedAt: Date.now() };
     storePendingAttempt(projectId, pendingAttempt.current);
     try {
       const created = await generatePlanningProposal(
@@ -288,9 +635,12 @@ export function PlanningPanel({
         projectId,
         { route, instruction, baseVersion },
         key,
+        controller.signal,
       );
+      const replayed = (proposals ?? []).some((proposal) => proposal.id === created.id);
       pendingAttempt.current = null;
       clearPendingAttempt(projectId);
+      settleLease();
       // A replayed attempt may already be in the list loaded after a reload.
       setProposals((current) => {
         const list = current ?? [];
@@ -299,23 +649,46 @@ export function PlanningPanel({
           : [...list, created];
       });
       setSelectedId(created.id);
+      recordAttempt({
+        at: Date.now(),
+        route,
+        outcome: replayed ? "replayed" : "succeeded",
+        proposalId: created.id,
+      });
       setNotice(
         created.modelId === "none" || payloadOf(created).insufficientEvidence
           ? "Planning notes created. No model was called because no source excerpt was supplied."
           : `Proposal created with ${created.modelId}${payloadOf(created).repairAttempted ? " after one repair attempt" : ""}. Review it before accepting.`,
       );
     } catch (cause) {
-      const requestError = toRequestError(cause);
-      // Keep the key when no response arrived, the attempt is still running, or
-      // the ledger is temporarily unavailable: retrying may replay a paid reply.
-      if (!keepsKeyOnRetry(requestError)) {
-        pendingAttempt.current = null;
-        clearPendingAttempt(projectId);
+      if (controller.signal.aborted) {
+        // The browser stopped waiting, not the server. Keep the key so Retry
+        // replays the recorded proposal instead of paying for a second attempt.
+        recordAttempt({ at: Date.now(), route, outcome: "stopped" });
+        setNotice(
+          "Stopped waiting. The attempt may still finish on the server; Retry reuses this key instead of calling the provider again.",
+        );
+      } else {
+        const requestError = toRequestError(cause);
+        // Keep the key when no response arrived, the attempt is still running, or
+        // the ledger is temporarily unavailable: retrying may replay a paid reply.
+        if (!keepsKeyOnRetry(requestError)) {
+          pendingAttempt.current = null;
+          clearPendingAttempt(projectId);
+          settleLease();
+        }
+        recordAttempt({ at: Date.now(), route, outcome: "failed", code: requestError.code });
+        setError(requestError);
       }
-      setError(requestError);
     } finally {
+      if (abortRef.current === controller) abortRef.current = null;
+      setOtherTabGenerating(false);
       setGenerating(false);
     }
+  }
+
+  function handleStop() {
+    abortRef.current?.abort();
   }
 
   async function handleAccept() {
@@ -334,6 +707,25 @@ export function PlanningPanel({
           ? `Accepted. The project is now version ${result.project.version}.`
           : `Accepted and saved as version ${result.project.version}, but the claims could not be recorded.`,
       );
+    } catch (cause) {
+      setError(toRequestError(cause));
+    } finally {
+      setActing(false);
+    }
+  }
+
+  async function handleDeleteProposal() {
+    if (!selected || selected.status === "accepted" || busy) return;
+    setActing(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await deletePlanningProposal(await getAccessToken(), projectId, selected.id);
+      const remaining = (proposals ?? []).filter((proposal) => proposal.id !== selected.id);
+      setProposals(remaining);
+      setSelectedId(remaining[remaining.length - 1]?.id ?? null);
+      setConfirmingDeleteId(null);
+      setNotice("Proposal deleted. The project was not changed.");
     } catch (cause) {
       setError(toRequestError(cause));
     } finally {
@@ -401,13 +793,26 @@ export function PlanningPanel({
         </label>
 
         <div className="editor-actions">
-          <button type="button" onClick={() => void handleGenerate()} disabled={busy || dirty}>
+          <button
+            type="button"
+            onClick={() => void handleGenerate()}
+            disabled={busy || dirty || otherTabGenerating || leaseSettling}
+          >
             {generating ? "Generating..." : "Generate proposal"}
           </button>
+          {generating && (
+            <button type="button" className="button-secondary" onClick={handleStop}>
+              Stop waiting
+            </button>
+          )}
           <p className="hint">
             {dirty
               ? "Save or discard the draft first: planning is generated from the saved version."
-              : "Each attempt uses one Idempotency-Key; a retry after a lost response replays it instead of calling the provider again."}
+              : otherTabGenerating
+                ? "Another tab is generating a proposal for this project. Wait for it to finish before starting one here."
+                : leaseSettling
+                  ? "Checking whether this tab owns the project lease before reusing it."
+                  : "Each attempt uses one Idempotency-Key; a retry after a lost response replays it instead of calling the provider again."}
           </p>
         </div>
       </div>
@@ -445,6 +850,23 @@ export function PlanningPanel({
               </li>
             ))}
           </ul>
+
+          <h3>Recent attempts</h3>
+          {attempts.length === 0 ? (
+            <p className="hint">No attempts recorded in this browser.</p>
+          ) : (
+            <ul className="planning-list">
+              {[...attempts].reverse().map((attempt, index) => (
+                <li key={`${attempt.at}-${index}`}>
+                  <span>{PLANNING_ROUTE_LABELS[attempt.route]}</span>{" "}
+                  <span className="hint">
+                    {ATTEMPT_LABELS[attempt.outcome]}
+                    {attempt.code ? ` · ${attempt.code}` : ""} · {new Date(attempt.at).toLocaleTimeString()}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
 
         <div className="planning-review">
@@ -484,7 +906,13 @@ export function PlanningPanel({
                 </ul>
               )}
 
-              {listOf(selectedPayload.angles).length > 0 && <AngleList angles={listOf(selectedPayload.angles)} />}
+              {listOf(selectedPayload.angles).length > 0 && (
+                <AngleList
+                  angles={listOf(selectedPayload.angles)}
+                  disabled={busy}
+                  onUse={handleUseAngle}
+                />
+              )}
               {listOf(selectedPayload.scenes).length > 0 && <ScenarioList scenes={listOf(selectedPayload.scenes)} />}
               {listOf(selectedPayload.clips).length > 0 && <ClipList clips={listOf(selectedPayload.clips)} />}
               {listOf(selectedPayload.claims).length > 0 && (
@@ -512,6 +940,36 @@ export function PlanningPanel({
                       ? "Save or discard the draft before accepting: accepting writes a new version from the stored one."
                       : `${scenes.length} scene${scenes.length === 1 ? "" : "s"} currently stored; locked components are kept.`}
                   </p>
+                </div>
+              )}
+
+              {selected.status !== "accepted" && (
+                <div className="editor-actions">
+                  {confirmingDeleteId === selected.id ? (
+                    <>
+                      <button type="button" className="button-danger" onClick={() => void handleDeleteProposal()} disabled={busy}>
+                        Confirm delete
+                      </button>
+                      <button
+                        type="button"
+                        className="button-secondary"
+                        onClick={() => setConfirmingDeleteId(null)}
+                        disabled={busy}
+                      >
+                        Cancel
+                      </button>
+                      <p className="hint">Deleting removes this proposal record. The project is unchanged.</p>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      className="button-secondary"
+                      onClick={() => setConfirmingDeleteId(selected.id)}
+                      disabled={busy}
+                    >
+                      Delete proposal
+                    </button>
+                  )}
                 </div>
               )}
             </article>

@@ -5,7 +5,13 @@ import type {
   MediaReferenceRecord,
   MediaUploadTicket,
 } from "../shared/media-contract";
-import type { GenerationProposalRecord } from "../shared/child-contract";
+import type {
+  GenerationProposalRecord,
+  SourceKind,
+  SourceRecord,
+  SourceResponse,
+  SourcesResponse,
+} from "../shared/child-contract";
 import type { PlanningAcceptedResponse, PlanningStartRequest } from "../shared/planning-contract";
 import type {
   ProjectDeletedResponse,
@@ -78,13 +84,19 @@ export function fetchStatus(): Promise<AiStatusResponse> {
 async function authorizedJson<T>(
   path: string,
   accessToken: string,
-  options: { method?: string; body?: unknown; headers?: Record<string, string> } = {},
+  options: {
+    method?: string;
+    body?: unknown;
+    headers?: Record<string, string>;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<T> {
   const init: RequestInit = {
     method: options.method ?? "GET",
     headers: { Authorization: `Bearer ${accessToken}`, ...options.headers },
   };
   if (options.body !== undefined) init.body = JSON.stringify(options.body);
+  if (options.signal) init.signal = options.signal;
   return (await requestJson<T>(path, init)).body;
 }
 
@@ -260,6 +272,42 @@ export async function deleteMediaRecord(
   return body.deletedId;
 }
 
+export async function listProjectSources(
+  accessToken: string,
+  projectId: string,
+): Promise<SourceRecord[]> {
+  return (
+    await authorizedJson<SourcesResponse>(`/api/projects/${projectId}/sources`, accessToken)
+  ).sources;
+}
+
+export async function createProjectSource(
+  accessToken: string,
+  projectId: string,
+  write: { kind: SourceKind; title: string; url: string | null; excerpt: string | null },
+): Promise<SourceRecord> {
+  return (
+    await authorizedJson<SourceResponse>(`/api/projects/${projectId}/sources`, accessToken, {
+      method: "POST",
+      body: write,
+    })
+  ).source;
+}
+
+export async function deleteProjectSource(
+  accessToken: string,
+  projectId: string,
+  sourceId: string,
+): Promise<string> {
+  return (
+    await authorizedJson<{ ok: true; deletedId: string }>(
+      `/api/projects/${projectId}/sources/${sourceId}`,
+      accessToken,
+      { method: "DELETE" },
+    )
+  ).deletedId;
+}
+
 export async function listProjectProposals(
   accessToken: string,
   projectId: string,
@@ -277,14 +325,29 @@ export async function generatePlanningProposal(
   projectId: string,
   request: PlanningStartRequest,
   idempotencyKey: string,
+  signal?: AbortSignal,
 ): Promise<GenerationProposalRecord> {
   return (
     await authorizedJson<{ ok: true; proposal: GenerationProposalRecord }>(
       `/api/projects/${projectId}/planning`,
       accessToken,
-      { method: "POST", body: request, headers: { "Idempotency-Key": idempotencyKey } },
+      { method: "POST", body: request, headers: { "Idempotency-Key": idempotencyKey }, signal },
     )
   ).proposal;
+}
+
+export async function deletePlanningProposal(
+  accessToken: string,
+  projectId: string,
+  proposalId: string,
+): Promise<string> {
+  return (
+    await authorizedJson<{ ok: true; deletedId: string }>(
+      `/api/projects/${projectId}/proposals/${proposalId}`,
+      accessToken,
+      { method: "DELETE" },
+    )
+  ).deletedId;
 }
 
 export async function acceptPlanningProposal(

@@ -356,11 +356,12 @@ of those policies, so no table can drift from the pattern. Six of them are reach
 | --- | --- |
 | `GET`/`PUT /api/projects/:id/scenes` | Read or replace the addressable scene list (`key`, `heading`, `body`), ordered by array position. |
 | `GET`/`POST /api/projects/:id/sources` | List sources, or add one. |
-| `DELETE /api/projects/:id/sources/:sourceId` | Remove one owned source. |
+| `DELETE /api/projects/:id/sources/:sourceId` | Remove one owned source and every claim that cites it, so no evidence-free claim survives. |
 | `GET`/`POST /api/projects/:id/claims` | List claims, or add one, optionally linked to a source of the same project. |
 | `PATCH /api/projects/:id/claims/:claimId` | Set `unverified`, `supported`, or `contradicted`. |
 | `GET`/`POST /api/projects/:id/proposals` | List generation proposals, or record a frozen proposal. |
 | `PATCH /api/projects/:id/proposals/:proposalId` | Accept or reject a hand-recorded proposal. |
+| `DELETE /api/projects/:id/proposals/:proposalId` | Delete a pending or rejected proposal (`200`); an accepted proposal is immutable (`409 PROPOSAL_ACCEPTED`). |
 | `POST /api/projects/:id/planning` | Ask one configured model for a validated planning proposal (`201`); requires `Idempotency-Key`, one ledger row per attempt, and a retry with the same key replays the stored response; stored against the given base version and never applied. |
 | `POST /api/projects/:id/proposals/:proposalId/accept` | Apply a pending planning proposal, respecting locks, and save one new project version (`200`); stale proposals are `409`. |
 | `GET`/`POST /api/projects/:id/jobs` | List provider jobs, or queue one. |
@@ -525,7 +526,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 183/183; `verify:sql` 77/77; `verify:live-routes` exit 0; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 201/201; `verify:sql` 77/77; `verify:live-routes` exit 0; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -587,6 +588,11 @@ PROPOSAL_NOT_APPLICABLE`). Accepting applies the payload, respects every lock, c
 writes one new revision, and marks the proposal accepted. Angles record the decision without changing the document;
 transcript clips become appended scene drafts with new ids and no media links.
 
+**Evidence in the editor.** The **Sources** tab writes the project's source rows: kind, title, optional URL, and the exact
+excerpt planning may quote. An excerpt is what makes factual planning possible; a source without one is stored but never
+treated as evidence. Source text is delimited as `<<<SOURCE ... SOURCE>>>` in the prompt and explicitly labelled
+untrusted data, so instructions inside a source cannot redirect the reply.
+
 **Factual mode and storyboards.** Claims carry a source id and a quote. The server marks a claim supported only when the
 quote is a verbatim excerpt of that supplied source; an empty quote is stored as `unverified`. Factual planning (and
 transcript analysis) with no supplied excerpt never calls a model: it stores planning notes with
@@ -600,9 +606,18 @@ completed attempt stores its `{ ok, proposal }` body, so a retry with the same k
 second provider call or a duplicate proposal row; a refused reply is stored and replayed too. Reusing the key for a
 different route, instruction, or document returns `409 IDEMPOTENCY_KEY_REUSED`; a still-running attempt returns `409
 IDEMPOTENCY_IN_PROGRESS`; an attempt older than `AI_ABANDON_AFTER_MS` is settled as `REQUEST_ABANDONED` without calling
-the provider. The key is scoped to the verified account, so the same key from another account is a separate attempt and
-can never read the first account's response. If the outcome cannot be recorded after the provider answered, the
-proposal is still returned with `X-Storyframe-Usage: unrecorded`. The no-evidence short-circuit makes no provider call,
+the provider. The key is scoped to the verified account and the project: the same key from another account, or in
+another project with an identical document, is a separate attempt and can never read the first attempt's response.
+The browser keeps an unsettled key in `sessionStorage` for at most 24 hours, and a per-project `localStorage` lease
+stops a second tab from starting a duplicate attempt while the first is waiting. The lease is released when an attempt
+settles (success or a recorded refusal) and retained until its 150-second expiry when the outcome is unknown: Stop
+waiting, unmount, a network failure, or `IDEMPOTENCY_IN_PROGRESS`/`LEDGER_UNAVAILABLE`. The tab id lives in
+`sessionStorage`, so a reload recognizes its own retained lease instead of locking itself out, and the pending route and
+instruction are restored so Retry rebuilds the same request and reuses the key. Because a duplicated tab copies
+`sessionStorage`, a mounted panel probes a BroadcastChannel for a live page using the same tab id; if one answers, the
+duplicate mints a fresh id and leaves the inherited lease with the original tab. An expired lease no longer blocks
+generation. If the outcome cannot be recorded after the provider answered, the proposal is still returned with
+`X-Storyframe-Usage: unrecorded`. The no-evidence short-circuit makes no provider call,
 so it writes no ledger row and does not consume the key.
 
 ### Phase 5 verification (2026-11-25)
@@ -623,10 +638,19 @@ so it writes no ledger row and does not consume the key.
 | Key reuse and account scoping | **PASS** | The same key with a different instruction is `409 IDEMPOTENCY_KEY_REUSED` with no second call; the same key from another account is a separate attempt, and each account replays only its own proposal |
 | Refused replies are recorded and replayed | **PASS** | Invalid twice stores an `ai_usage` error row (`PLANNING_INVALID_JSON`, `422`), and a retry with that key replays the `422` without another provider call |
 | Planning without a key is refused | **PASS** | A request with no `Idempotency-Key` is `400 IDEMPOTENCY_KEY_REQUIRED` before the provider or the ledger is touched |
+| Evidence can be supplied in-app | **PASS** | `tests/sources-panel.test.tsx`: add a source with kind, title, URL, and excerpt, see it listed, flag an excerpt-less source as unusable evidence, require a title, and delete; the Sources tab is wired into the editor and reads the existing owner-scoped routes |
+| Source text is treated as data | **PASS** | `tests/planning-prompt.test.ts` places an excerpt inside `<<<SOURCE ... SOURCE>>>` and asserts the prompt calls it untrusted data that must not be followed as instructions |
 | Route instructions match the validator | **PASS** | `tests/planning-prompt.test.ts` (6 tests) asserts every route names its exact root keys, counts, scene/clip fields, and duration bounds under "only these keys", keeps factual claims available to script/ad-concept/transcript-analysis, and withholds them from angles/storyboard; the tightened `angles` instruction then passed a live call with no repair |
 | Hosted schema and live routes | **PASS** | Migration 7 is applied to the hosted project (2026-11-25); probes for every new column and `model_health` return `200`; `verify:live-routes` passes against it |
 | One real hosted planning call | **PASS** | 2026-11-25, first call before tightening: `angles` → `gemma4:31b`, `201`, 3 angles, but `repairAttempted=true` (ledger tokens 715/514, latency 2311 ms). After tightening, a second call with no caller instruction: `201` in 1932 ms, `repairAttempted=false`, 3 angles; ledger `success`/`201`, tokens 301/266, latency 1144 ms, stored proposal id; same-key replay `201` in 493 ms with the same proposal and still one ledger row; proposal, project, ledger row, profile, and user deleted, cleanup read back zero rows |
-| Plan tab behavior | **PASS (DOM)** | `tests/planning-panel.test.tsx`: list, generate, review, and accept through the panel, with nothing applied before acceptance and both actions disabled while the draft is dirty. `tests/workspace.test.tsx` drives the real Workspace from the Plan tab through generate, a full remount that replays the `sessionStorage` key, and accept; the provider is stubbed, so it spends nothing. Not exercised in a real browser in this environment |
+| Plan tab behavior | **PASS (DOM)** | `tests/planning-panel.test.tsx`: list, generate, review, and accept through the panel, with nothing applied before acceptance and both actions disabled while the draft is dirty; Stop waiting aborts the browser request while keeping the key and recording a `stopped` attempt; expired keys are replaced; a second tab's lease disables generation, while an expired lease and a duplicated tab that inherits the lease are handled; a reload restores the pending route and instruction and replays the same key. `tests/workspace.test.tsx` drives the real Workspace from the Plan tab through generate, a full remount that replays the `sessionStorage` key, and accept; the provider is stubbed, so it spends nothing. Not exercised in a real browser in this environment |
+| Pending proposals have a lifecycle | **PASS** | `tests/planning.test.ts`: a pending proposal deletes `200` and disappears from the list; an accepted proposal refuses deletion with `409 PROPOSAL_ACCEPTED` and stays stored. `tests/planning-panel.test.tsx`: Delete proposal → Confirm delete removes it without changing the project |
+| Deleting a source cannot leave supported orphans | **PASS** | `tests/planning.test.ts`: after two accepted claims cite a source, deleting that source removes both claims and the source row, so no `supported` claim outlives its evidence |
+| Unknown outcomes keep the tab lease | **PASS** | `tests/planning-panel.test.tsx`: Stop waiting, unmount, a network failure, and both `IDEMPOTENCY_IN_PROGRESS` and `LEDGER_UNAVAILABLE` leave the per-project lease in `localStorage`; a successful replay clears it. A reload reuses the same `sessionStorage` tab id and can retry its own lease |
+| A cloned tab cannot inherit the lease | **PASS** | `tests/planning-panel.test.tsx` stubs a live BroadcastChannel peer for the inherited tab id: the panel mints a fresh id, keeps the original lease in place, disables generation, and never calls `/planning`. A silent peer times out instead, after the probe is observed, and the reloaded tab reuses its stored key |
+| Expired leases stop blocking | **PASS** | `tests/planning-panel.test.tsx`: a lease expired one second ago leaves Generate enabled; one call succeeds and the new lease is cleared |
+| Pending request identity survives reload | **PASS** | `tests/planning-panel.test.tsx`: a stored `script` route and instruction are restored into the form, and Retry sends the stored Idempotency-Key instead of minting a new one |
+| Attempt history is visible and local | **PASS** | `tests/planning-panel.test.tsx`: a successful attempt appears as `Succeeded`, survives an unmount/remount, and a cancelled attempt is recorded as `stopped`; history is capped and stored in `localStorage`, never in the project |
 
 ### Phase 3 verification (2026-11-24)
 
@@ -893,10 +917,19 @@ the document-delete guard and project-deletion object cleanup.
 - A planning attempt is one ledger row even when the disclosed repair makes two provider calls: token counts are summed
   and latency covers both, so per-call cost cannot be reconstructed from that row. A provider failure during the repair
   records the attempt with unknown token counts, and the no-evidence short-circuit writes no ledger row at all.
-- Proposals are never deleted, keys never expire once completed, and accepting a proposal does not release the project
-  version beyond the staleness check.
+- Pending and rejected proposals can be deleted; accepted proposals are immutable because they are the provenance of a
+  saved version. Client-side pending keys expire after 24 hours, but completed ledger rows and their stored responses
+  are retained. Cancelling stops the browser waiting; it does not abort the server's provider call, so the attempt may
+  still finish and charge, which is why Retry keeps the same key.
 - The model-health counters are read-then-written in the API process, so two concurrent calls can lose one count; the
   timestamps and error codes are best-effort evidence, not an audit log. Cost rates stay `unpriced` until Phase 14.
+- Sources can be added and deleted in the editor but not edited in place. Deleting a source now removes the claims that
+  cite it before the source row; the UI says so, and no supported claim is left pointing at missing evidence.
+- Multi-tab protection is a best-effort `localStorage` lease, not a server-side lock: a near-simultaneous read in two
+  tabs can still race, but any normal second click is refused while the lease is live. An unknown outcome keeps the
+  lease until expiry, so the original tab must wait (or retry safely with its stored key) rather than freeing it early.
+  Clone detection needs BroadcastChannel and a live original page; without either, the stored id is inherited and only
+  the lease/race guards apply. Attempt history is per-browser.
 - Planning is verified against the local fake and `verify:sql`, and migration 7 is applied to the hosted project. Real
   hosted `angles` calls and same-key replays were verified on 2026-11-25; the call after tightening needed no repair
   (see Phase 5 verification). The Plan tab has not been exercised in a real browser in this environment.

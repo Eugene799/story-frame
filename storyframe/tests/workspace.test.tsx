@@ -674,6 +674,10 @@ describe("workspace", () => {
     await openProject(backend);
     fireEvent.click(screen.getByRole("tab", { name: "Plan" }));
     expect(await screen.findByText("No proposals yet.")).toBeInTheDocument();
+    // A reload checks that no live page still owns its retained lease first.
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Generate proposal" }) as HTMLButtonElement).disabled).toBe(false),
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
     expect(await screen.findByText("Accept and save")).toBeInTheDocument();

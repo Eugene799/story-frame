@@ -459,6 +459,7 @@ export interface ChildStore {
     proposalId: string,
     update: { status: ProposalStatus },
   ): Promise<GenerationProposalRecord>;
+  removeProposal(ownerId: string, projectId: string, proposalId: string): Promise<void>;
 
   listJobs(ownerId: string, projectId: string): Promise<ProviderJobRecord[]>;
   createJob(ownerId: string, projectId: string, write: JobWrite): Promise<ProviderJobRecord>;
@@ -743,6 +744,18 @@ export function createSupabaseChildStore(options: SupabaseChildStoreOptions): Ch
     },
 
     async removeSource(ownerId, projectId, sourceId) {
+      // Delete the claims that cite this source before the row, so no
+      // "supported" claim can outlive its evidence. For an unknown source this
+      // is a scoped no-op; removeOwned then reports the 404.
+      await request(
+        tableUrl("claims", {
+          source_id: `eq.${sourceId}`,
+          project_id: `eq.${projectId}`,
+          owner_id: `eq.${ownerId}`,
+        }),
+        { method: "DELETE", headers: writeHeaders },
+        "the linked claim cleanup",
+      );
       await removeOwned("sources", ownerId, projectId, sourceId, CHILD_NOT_FOUND_MESSAGES.source);
     },
 
@@ -844,6 +857,16 @@ export function createSupabaseChildStore(options: SupabaseChildStoreOptions): Ch
         throw new ApiError(503, "CHILD_STORE_UNAVAILABLE", "The project data store did not confirm the proposal.");
       }
       return toProposal(created[0]);
+    },
+
+    async removeProposal(ownerId, projectId, proposalId) {
+      await removeOwned(
+        "generation_proposals",
+        ownerId,
+        projectId,
+        proposalId,
+        CHILD_NOT_FOUND_MESSAGES.proposal,
+      );
     },
 
     async updateProposal(ownerId, projectId, proposalId, update) {

@@ -4,15 +4,17 @@ import { AiRequestError, getProject, updateProject } from "../api";
 import { BriefPanel } from "./BriefPanel";
 import { MediaPanel } from "./MediaPanel";
 import { PlanningPanel } from "./PlanningPanel";
+import { SourcesPanel } from "./SourcesPanel";
 import { PreviewPanel } from "./PreviewPanel";
 import { ScriptPanel } from "./ScriptPanel";
 import { SettingsPanel } from "./SettingsPanel";
 import { StoryboardPanel } from "./StoryboardPanel";
 
-type EditorTab = "brief" | "plan" | "script" | "storyboard" | "media" | "preview" | "settings";
+type EditorTab = "brief" | "sources" | "plan" | "script" | "storyboard" | "media" | "preview" | "settings";
 
 const TABS: { id: EditorTab; label: string }[] = [
   { id: "brief", label: "Brief" },
+  { id: "sources", label: "Sources" },
   { id: "plan", label: "Plan" },
   { id: "script", label: "Script" },
   { id: "storyboard", label: "Storyboard" },
@@ -235,6 +237,13 @@ export function ProjectEditor({
       <div role="tabpanel" aria-label={TABS.find((item) => item.id === tab)?.label}>
         {tab === "brief" && (
           <BriefPanel brief={draft.brief} onChange={(brief) => setDraft({ ...draft, brief })} />
+        )}
+        {tab === "sources" && (
+          <SourcesPanel
+            projectId={saved.id}
+            getAccessToken={getAccessToken}
+            onBusyChange={setPlanBusy}
+          />
         )}
         {tab === "plan" && (
           <PlanningPanel
