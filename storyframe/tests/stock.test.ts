@@ -175,6 +175,7 @@ interface FakeProviders {
   delayMs: number;
   failPexels: boolean;
   remaining: number;
+  assetHits: number;
   close: () => Promise<void>;
 }
 
@@ -186,6 +187,7 @@ async function startFakeProviders(): Promise<FakeProviders> {
     delayMs: 0,
     failPexels: false,
     remaining: 199,
+    assetHits: 0,
     close: async () => undefined,
   };
 
@@ -226,6 +228,7 @@ async function startFakeProviders(): Promise<FakeProviders> {
     }
 
     if (url.pathname === "/photos/101/original.jpg") {
+      state.assetHits += 1;
       response.writeHead(200, { "Content-Type": "image/jpeg", "Content-Length": String(PHOTO_BYTES.length) });
       return response.end(PHOTO_BYTES);
     }
@@ -246,6 +249,7 @@ async function startFakeProviders(): Promise<FakeProviders> {
       return response.end();
     }
     if (url.pathname === "/photo/303_web.jpg") {
+      state.assetHits += 1;
       response.writeHead(200, { "Content-Type": "image/jpeg", "Content-Length": String(PHOTO_BYTES.length) });
       return response.end(PHOTO_BYTES);
     }
@@ -726,7 +730,8 @@ describe("stock import", () => {
       body: JSON.stringify(importBody()),
     });
     expect(response.status).toBe(201);
-    const body = (await response.json()) as { media: MediaRecord; provenance: MediaProvenance };
+    const body = (await response.json()) as { media: MediaRecord; provenance: MediaProvenance; reused: boolean };
+    expect(body.reused).toBe(false);
     expect(body.media).toMatchObject({
       kind: "image",
       status: "ready",
@@ -755,6 +760,66 @@ describe("stock import", () => {
     expect(listed.media[0].provenance?.provider).toBe("pexels");
     expect(listed.media[0].provenance?.attribution).toBe("Photo by Ada on Pexels");
     expect(app.supabase.media[0].provenance).toMatchObject({ source: "stock", providerId: "101" });
+  });
+
+  it("returns the existing media for the same asset and rendition without downloading again", async () => {
+    const { app, provider } = await startStockApp();
+    const projectId = await createProject(app.url);
+
+    const first = await apiRequest(app.url, `/api/projects/${projectId}/stock/import`, {
+      method: "POST",
+      body: JSON.stringify(importBody()),
+    });
+    expect(first.status).toBe(201);
+    const firstBody = (await first.json()) as { media: MediaRecord; reused: boolean };
+    expect(firstBody.reused).toBe(false);
+    const assetHits = provider.assetHits;
+    const puts = app.r2.puts;
+
+    const second = await apiRequest(app.url, `/api/projects/${projectId}/stock/import`, {
+      method: "POST",
+      body: JSON.stringify(importBody()),
+    });
+    expect(second.status).toBe(200);
+    const secondBody = (await second.json()) as {
+      media: MediaRecord;
+      provenance: MediaProvenance;
+      reused: boolean;
+    };
+    expect(secondBody.reused).toBe(true);
+    expect(secondBody.media.id).toBe(firstBody.media.id);
+    expect(secondBody.provenance).toMatchObject({
+      provider: "pexels",
+      providerId: "101",
+      rendition: "original",
+    });
+
+    // The reuse path must not fetch the asset or write a second object or row.
+    expect(provider.assetHits).toBe(assetHits);
+    expect(app.r2.puts).toBe(puts);
+    expect(app.supabase.media).toHaveLength(1);
+  });
+
+  it("scopes reuse to one project and one rendition", async () => {
+    const { app } = await startStockApp();
+    const firstProject = await createProject(app.url);
+    const secondProject = await createProject(app.url);
+
+    const first = await apiRequest(app.url, `/api/projects/${firstProject}/stock/import`, {
+      method: "POST",
+      body: JSON.stringify(importBody()),
+    });
+    expect(first.status).toBe(201);
+
+    // The same asset in another project is a separate asset for that project.
+    const otherProject = await apiRequest(app.url, `/api/projects/${secondProject}/stock/import`, {
+      method: "POST",
+      body: JSON.stringify(importBody()),
+    });
+    expect(otherProject.status).toBe(201);
+    expect(((await otherProject.json()) as { reused: boolean }).reused).toBe(false);
+
+    expect(app.supabase.media).toHaveLength(2);
   });
 
   it("accepts Pixabay's own site host for web-format images", async () => {

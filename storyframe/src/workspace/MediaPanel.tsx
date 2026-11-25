@@ -328,9 +328,18 @@ export function MediaPanel({
         attribution: result.attribution,
         license: result.license,
       });
-      setMedia((current) => [imported.media, ...(current ?? [])]);
+      setMedia((current) => {
+        const list = current ?? [];
+        return list.some((item) => item.id === imported.media.id)
+          ? list.map((item) => (item.id === imported.media.id ? imported.media : item))
+          : [imported.media, ...list];
+      });
 
-      if (sceneId) {
+      if (imported.reused) {
+        setStockNotice(
+          `This ${result.type} is already in the project (media ${imported.media.id.slice(0, 8)}); nothing was downloaded again. Attach it from Project media.`,
+        );
+      } else if (sceneId) {
         await attachMediaReference(accessToken, projectId, imported.media.id, {
           refKind: "scene",
           refId: sceneId,

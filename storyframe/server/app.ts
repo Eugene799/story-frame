@@ -767,6 +767,24 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     await requireProjects().get(user.id, projectId);
 
     const write = parseStockImport(await readJsonBody(request, config.media.bodyBytes));
+
+    // One provider asset and rendition is one media row per project: a repeat
+    // import returns the stored asset instead of downloading and storing it again.
+    const existing = await store.findImported(user.id, projectId, {
+      provider: write.provider,
+      providerId: write.providerId,
+      rendition: write.rendition,
+    });
+    if (existing?.media.provenance) {
+      sendJson(response, 200, {
+        ok: true,
+        media: existing.media,
+        provenance: existing.media.provenance,
+        reused: true,
+      });
+      return;
+    }
+
     const bytes = await downloadStockAsset(
       { provider: write.provider, type: write.type, url: write.url },
       { limits: config.stock, fetchImpl, hostLookup: options.hostLookup },
@@ -834,7 +852,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       if (!media) {
         throw new HttpError(409, "MEDIA_STATE_CHANGED", "The imported asset changed while it was being stored.");
       }
-      sendJson(response, 201, { ok: true, media, provenance });
+      sendJson(response, 201, { ok: true, media, provenance, reused: false });
     } catch (error) {
       await discardMedia(store, objects, user.id, projectId, mediaId, objectKey);
       throw error;

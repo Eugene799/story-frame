@@ -90,4 +90,6 @@ export interface StockImportResponse {
   ok: true;
   media: MediaRecord;
   provenance: MediaProvenance;
+  /** True when this asset and rendition was already in the project and reused. */
+  reused: boolean;
 }

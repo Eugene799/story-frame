@@ -580,6 +580,17 @@ export async function startFakeSupabase(
           const matches = (row: Record<string, unknown>) => {
             for (const [name, raw] of url.searchParams) {
               if (RESERVED.has(name)) continue;
+              // PostgREST JSON path filter, used by the imported-media lookup.
+              if (name.startsWith("provenance->>")) {
+                const field = name.slice("provenance->>".length);
+                const provenance = row.provenance;
+                const value =
+                  provenance && typeof provenance === "object"
+                    ? (provenance as Record<string, unknown>)[field]
+                    : undefined;
+                if (!raw.startsWith("eq.") || String(value ?? "") !== raw.slice(3)) return false;
+                continue;
+              }
               const value = row[name];
               if (raw.startsWith("eq.")) {
                 if (String(value ?? "") !== raw.slice(3)) return false;

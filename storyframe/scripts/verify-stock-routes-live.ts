@@ -272,7 +272,7 @@ async function main(): Promise<number> {
       if (!result || !rendition) {
         check("a selected rendition is available to import", false);
       } else {
-        const imported = await api(user.token, "POST", `/api/projects/${projectId}/stock/import`, {
+        const importRequest = {
           provider: result.provider,
           providerId: result.providerId,
           type: result.type,
@@ -282,7 +282,8 @@ async function main(): Promise<number> {
           creator: result.creator,
           attribution: result.attribution,
           license: result.license,
-        });
+        };
+        const imported = await api(user.token, "POST", `/api/projects/${projectId}/stock/import`, importRequest);
         importedMediaId = typeof imported.body?.media?.id === "string" ? imported.body.media.id : null;
         check(
           "a selected stock image imports into the project",
@@ -297,6 +298,15 @@ async function main(): Promise<number> {
         );
 
         if (importedMediaId) {
+          const repeat = await api(user.token, "POST", `/api/projects/${projectId}/stock/import`, importRequest);
+          check(
+            "a repeated import reuses the stored asset without a second copy",
+            repeat.status === 200 &&
+              repeat.body?.reused === true &&
+              repeat.body?.media?.id === importedMediaId,
+            `status=${repeat.status} code=${repeat.body?.error?.code ?? "none"}`,
+          );
+
           const listed = await api(user.token, "GET", `/api/projects/${projectId}/media`);
           const stored = Array.isArray(listed.body?.media)
             ? listed.body.media.find((entry: any) => entry.id === importedMediaId)

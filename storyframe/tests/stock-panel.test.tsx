@@ -47,7 +47,8 @@ const IMPORTED: MediaRecord = {
   provenance: PROVENANCE,
 };
 
-function installBackend() {
+function installBackend(options: { initialMedia?: MediaRecord[]; reused?: boolean } = {}) {
+  const { initialMedia = [], reused = false } = options;
   const requests: { method: string; path: string; search: string; body: unknown }[] = [];
 
   vi.stubGlobal(
@@ -59,7 +60,7 @@ function installBackend() {
       requests.push({ method, path: url.pathname, search: url.search, body });
 
       if (url.pathname === `/api/projects/${PROJECT_ID}/media` && method === "GET") {
-        return jsonResponse({ ok: true, media: [] });
+        return jsonResponse({ ok: true, media: initialMedia });
       }
       if (url.pathname === "/api/stock/search" && method === "GET") {
         return jsonResponse({
@@ -126,7 +127,7 @@ function installBackend() {
         });
       }
       if (url.pathname === `/api/projects/${PROJECT_ID}/stock/import` && method === "POST") {
-        return jsonResponse({ ok: true, media: IMPORTED, provenance: PROVENANCE }, 201);
+        return jsonResponse({ ok: true, media: IMPORTED, provenance: PROVENANCE, reused }, reused ? 200 : 201);
       }
       if (url.pathname === `/api/projects/${PROJECT_ID}/media/${MEDIA_ID}/url` && method === "GET") {
         return jsonResponse({
@@ -220,5 +221,26 @@ describe("stock search in the media panel", () => {
     expect(source.getAttribute("target")).toBe("_blank");
     expect(source.getAttribute("rel")).toContain("noreferrer");
     expect(provenance.getByText("Pexels License")).toBeTruthy();
+  });
+
+  it("reports an asset that is already in the project without adding a duplicate", async () => {
+    installBackend({ initialMedia: [IMPORTED], reused: true });
+    render(
+      <MediaPanel
+        projectId={PROJECT_ID}
+        scenes={[]}
+        getAccessToken={async () => "token"}
+        onAttachAsset={async () => true}
+        onDetachAsset={async () => true}
+      />,
+    );
+
+    expect(await screen.findByLabelText(`Media ${MEDIA_ID}`)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Stock search"), { target: { value: "rain" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search stock" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Import to project" }));
+
+    expect(await screen.findByText(/already in the project/)).toBeTruthy();
+    expect(screen.getAllByLabelText(`Media ${MEDIA_ID}`)).toHaveLength(1);
   });
 });

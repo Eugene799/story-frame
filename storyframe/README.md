@@ -548,7 +548,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 242/242; `verify:sql` 87/87; `verify:stock-live` 8/8; `verify:stock-routes-live` 21/21; `verify:live-routes` 51/51; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 245/245; `verify:sql` 87/87; `verify:stock-live` 8/8; `verify:stock-routes-live` 22/22; `verify:live-routes` 51/51; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -720,7 +720,9 @@ refusing credentials, custom ports, non-https URLs, and hosts that resolve to lo
 reserved addresses. The body is capped while streaming (image and video limits from the media settings), a playlist MIME
 type is refused, and magic bytes must match the selected type. Accepted bytes are written to private R2 through a
 server-created presigned URL, the media row becomes `ready`, and the validated provenance is stored as JSONB on the row
-and returned by the media routes. Nothing is attached to a scene unless the UI does it explicitly.
+and returned by the media routes. Importing the same provider, asset id, and rendition again into the same project
+returns that ready asset (`200`, `reused: true`) without downloading or storing a second copy; another project or
+rendition is a separate asset. Nothing is attached to a scene unless the UI does it explicitly.
 
 **UI.** The Media tab has a stock search form (query, image/video, per-provider checkboxes) and a separate preview grid.
 Each preview shows the provider, dimensions, selected rendition, creator, source link, and license link, and imports only
@@ -735,10 +737,11 @@ results.
 | Protected search with normalized fields | **PASS** | `tests/stock.test.ts`: anonymous `401`; one image search returns Pexels and Pixabay results with provider, id, title, preview, renditions, source page, creator, attribution, license, real dimensions, and duration; a video search reports the selected 1920×1080 rendition |
 | Hardened provider handling | **PASS** | Same file: duplicate/unknown/empty sources `400`; portrait crops are never selected for a 16:9 source; a `video/mp4` link ending in `.m3u8` is excluded; video previews come from provider thumbnails; a provider failure yields a sanitized code and the response never contains the provider key or URL |
 | Durable shared cache and stampedes | **PASS** | Two identical searches make one provider call each, the second reports `cached: true`, and `stock_search_cache` holds two ready rows with a Pixabay TTL of at least 24 hours; two concurrent searches still make one call per provider; a simulated cache outage leaves search working |
+| Repeated imports reuse one asset | **PASS** | `tests/stock.test.ts`: importing the same provider, asset id, and rendition twice makes one R2 write and one media row, returns the first media id with `reused: true` at `200`, and does not fetch the asset again; the same asset in another project is a separate `201` asset. `tests/stock-panel.test.tsx`: a reused import reports it and leaves one media item |
 | Controlled import with provenance | **PASS** | Imported image bytes are in R2 under `media/<owner>/<id>`, the row is `ready`, JSONB provenance is stored and returned; video import is detected as `video/mp4`; foreign hosts, internal names, a redirect to another host, `http://`, oversized bodies, `text/html`, and playlists are refused; a foreign project is `404`; a type mismatch is `422` |
 | Previews stay separate from project assets | **PASS (DOM)** | `tests/stock-panel.test.tsx`: searching writes nothing to `/media`, the credit link and license link render with their URLs, the failed provider is reported, and only **Import to project** posts the import body and adds a `ready` asset; the media item then shows the stored provider, creator, source link, and license |
 | Real provider searches | **PASS** | `npm run verify:stock-live` on 2026-11-25: image "rainy city street" merged 40 results (Pexels 20 + Pixabay 20) and video "ocean waves" merged 40, all with credit, source page, selected rendition, and no playlist renditions; 8/8 checks |
-| Import into a hosted project | **PASS** | `npm run verify:stock-routes-live` on 2026-11-25 against hosted Supabase and the real `story-frame` bucket: a selected image imported `201` with `ready` media and provenance, appeared in the media list with that provenance, returned a presigned playback URL, deleted `200` with its object, and the deleted row stopped being ready; 21/21 checks, including cache rows and cleanup |
+| Import into a hosted project | **PASS** | `npm run verify:stock-routes-live` on 2026-11-25 against hosted Supabase and the real `story-frame` bucket: a selected image imported `201` with `ready` media and provenance, a repeat import returned the same media (`200`, `reused: true`) without a second object, it appeared in the media list with that provenance, returned a presigned playback URL, deleted `200` with its object, and the deleted row stopped being ready; 22/22 checks, including cache rows and cleanup |
 | Hosted schema | **PASS** | `20261125160000_add_stock_media.sql` applied through the Supabase management API on 2026-11-25; the catalog reports `media_metadata.provenance` plus its object constraint, `stock_search_cache` with RLS on, `service_role` grants, and zero `authenticated` grants; `verify:stock-routes-live` then wrote and read both through the routes |
 
 ### Phase 3 verification (2026-11-24)
@@ -995,7 +998,7 @@ the document-delete guard and project-deletion object cleanup.
   hosted catalog was checked (12 tables, RLS, policies, grants, revision trigger), and live profile/project/child
   routes, two-user isolation, ledger readiness, and the planning-status route passed 51/51 checks; the disposable users
   were deleted afterwards. Rerun these checks with `npm run verify:live-routes`. The Phase 6 live route check
-  (`verify:stock-routes-live`, 21/21) also passed, including a real import into the bucket and full cleanup.
+  (`verify:stock-routes-live`, 22/22) also passed, including a real import and deduplicated re-import into the bucket plus full cleanup.
   `smoke:live` exposed a live-only missing-column bug; after the fix a clean five-call run exited 0 with 5/5 families
   and an identical stored replay.
 - Stock search is user-driven and bounded (20 results per provider per page), but it depends on the provider's own

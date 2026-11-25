@@ -302,6 +302,12 @@ export interface MediaStore {
     },
   ): Promise<MediaRecord>;
   get(ownerId: string, projectId: string, mediaId: string): Promise<StoredMedia | null>;
+  /** Ready media in this project imported from the same provider, asset, and rendition. */
+  findImported(
+    ownerId: string,
+    projectId: string,
+    match: Pick<MediaProvenance, "provider" | "providerId" | "rendition">,
+  ): Promise<StoredMedia | null>;
   list(ownerId: string, projectId: string, limit: number): Promise<MediaRecord[]>;
   /** Object keys for a project, read before its rows cascade away. */
   listObjectKeys(ownerId: string, projectId: string): Promise<string[]>;
@@ -510,6 +516,39 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
     return { media: toMedia(found[0], counts.get(mediaId) ?? 0), objectKey: rowText(found[0], "object_key") };
   }
 
+  /**
+   * Exact-match lookup for an already imported stock rendition. Only ready rows
+   * count: a pending interrupted import, or a deleted one, must not be reused.
+   */
+  async function findImported(
+    ownerId: string,
+    projectId: string,
+    match: Pick<MediaProvenance, "provider" | "providerId" | "rendition">,
+  ): Promise<StoredMedia | null> {
+    const found = rows(
+      await request(
+        tableUrl("media_metadata", {
+          select: MEDIA_COLUMNS,
+          owner_id: `eq.${ownerId}`,
+          project_id: `eq.${projectId}`,
+          status: "eq.ready",
+          "provenance->>provider": `eq.${match.provider}`,
+          "provenance->>providerId": `eq.${match.providerId}`,
+          "provenance->>rendition": `eq.${match.rendition}`,
+          order: "created_at.asc",
+          limit: "1",
+        }),
+        { headers: readHeaders },
+        "the imported media lookup",
+      ),
+    );
+    const row = found[0];
+    if (!row) return null;
+    const id = rowText(row, "id");
+    const counts = await referenceCounts(ownerId, [id]);
+    return { media: toMedia(row, counts.get(id) ?? 0), objectKey: rowText(row, "object_key") };
+  }
+
   async function listReferences(
     ownerId: string,
     projectId: string,
@@ -588,6 +627,7 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
     },
 
     get,
+    findImported,
     listReferences,
     referenceCounts,
 
