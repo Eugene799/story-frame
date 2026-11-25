@@ -131,6 +131,8 @@ Everything lives under the project's export namespace; `GET`/`POST /api/projects
 
 - [ ] The export routes are registered before the generic `/renders` handler and use their own `exportId` path segment,
       so a malformed id cannot fall through to the child-table routes.
+- [ ] The `kind` discriminator on both tables keeps the export-only unique indexes off the generic routes: no existing
+      `/renders` or `/jobs` handler changes.
 - [ ] `Later:` `POST /api/projects/:id/exports/video/:exportId/refresh` (poll on demand). Slice 1 poll happens in the
       sweep; `GET` never triggers a provider call.
 
@@ -152,9 +154,12 @@ pending → (provider done) → ready
       `duration_seconds`, `byte_size`, `width`, `height`, `credits_estimate`, `credits_consumed`, `idempotency_key`,
       `provider_url_expires_at`. The existing `pending/ready/failed` status check is unchanged, so `ready` still means
       "the MP4 is ours".
-- [ ] One live export per project: partial unique index on `render_snapshots (project_id) where status = 'pending'` and on
-      `provider_jobs (project_id) where status in ('queued','running')`. A second request while one is live is
-      `429 VIDEO_RENDER_IN_FLIGHT` and costs nothing.
+- [ ] One live export per project, **and only exports**: `render_snapshots` gains `kind text not null default 'snapshot'`
+      and `provider_jobs` gains `kind text not null default 'generic'`, both checked against `('…','video-export')`. The
+      partial unique indexes are `render_snapshots (project_id) where kind = 'video-export' and status = 'pending'` and
+      `provider_jobs (project_id) where kind = 'video-export' and status in ('queued','running')`, so the generic
+      `/renders` and `/jobs` routes keep creating pending snapshots and queued jobs exactly as they do today. A second
+      export while one is live is `429 VIDEO_RENDER_IN_FLIGHT` and costs nothing.
 - [ ] One paid submission per account at a time, mirroring the narration in-flight set, so two tabs cannot double-submit.
 - [ ] Submission: reserve spend → create `render_snapshots` (`pending`) → create `provider_jobs` (`queued`) → POST.
       A `2xx` stores `external_id` and moves both to `running`. A definitive `400` (validation / bad key) marks both
@@ -185,14 +190,17 @@ pending → (provider done) → ready
 
 ### 2.1 Migration: `20261126090000_add_video_render_jobs.sql`
 
-- [ ] New columns on `render_snapshots` and `provider_jobs` as above; **no status-enum change**.
-- [ ] Both partial unique indexes, plus a unique index on `(owner_id, idempotency_key) where idempotency_key is not null`.
+- [ ] New columns on `render_snapshots` and `provider_jobs` as above, plus the `kind` discriminator on both
+      (`'snapshot'` / `'generic'` defaults, `'video-export'` for this phase); **no status-enum change**.
+- [ ] Both partial unique indexes carry `kind = 'video-export'` in their predicate, and the idempotency index is
+      `(owner_id, idempotency_key) where idempotency_key is not null`. The generic tables stay unconstrained.
 - [ ] `media_id` references `media_metadata (id)` on delete set null; `job_id` references `provider_jobs (id)` on delete
       set null; owner/project columns keep the existing composite `(project_id, owner_id)` shape.
 - [ ] RLS stays select-own; writes stay `service_role` only — the same `DO` block pattern as the other child tables.
-- [ ] `verify:sql` applies the new migration and asserts: both unique indexes reject a second live row, `ready` is
-      allowed twice, the idempotency index rejects a duplicate non-null key but allows many nulls, and the auth-user /
-      project cascades still remove render rows.
+- [ ] `verify:sql` applies the new migration and asserts: both unique indexes reject a second live export, `ready` is
+      allowed twice, the idempotency index rejects a duplicate non-null key but allows many nulls, **a second pending
+      generic snapshot and a second queued generic job still insert**, and the auth-user / project cascades still remove
+      render rows.
 
 ---
 
