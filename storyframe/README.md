@@ -346,6 +346,7 @@ rejected request cannot append a revision.
 | `PUT /api/projects/:id` | Replace `{ title, document }`, sending the `version` last read. Scene asset ids must be UUID-shaped ready media in the same project (`422 MEDIA_ASSET_INVALID` otherwise). |
 | `DELETE /api/projects/:id` | Delete an owned project; its revisions cascade. |
 | `GET /api/projects/:id/revisions` | The owner's 20 newest revision summaries (no document payloads). |
+| `POST /api/projects/:id/export` | Export the `{ title, document }` the editor is showing. Returns the document, one unique stock credit per referenced asset (creator, provider, source page, license, scene ids), and a render payload with per-scene credited assets. Attribution is read from stored media rows, never the request. |
 
 Ownership is enforced explicitly on every query: the server filters on the id verified from the session, never on a
 client-supplied owner. Another account's project id reports `404 PROJECT_NOT_FOUND` for read, update, and delete, so it
@@ -536,7 +537,10 @@ object keys never reach the browser.
 
 **Preview and export are honest.** Preview is labelled a storyboard preview, not a rendered movie, and shows exactly
 the stored script, visual direction, on-screen text, media count, timing, and approval state. Export offers the
-editable project JSON and the script as plain text; video export is not offered and is documented as Phase 9.
+editable project JSON and the script as plain text; video export is not offered and is documented as Phase 9. Both
+downloads use the export route, so imported stock media carries its stored creator, provider, source page, and
+license: the JSON includes a deduplicated credit list and the per-scene render payload, and the script ends with a
+`CREDITS` block.
 
 ### Phase 4 verification (2026-11-24)
 
@@ -551,7 +555,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 246/246; `verify:sql` 89/89; `verify:stock-live` 8/8; `verify:stock-routes-live` 22/22; `verify:live-routes` 51/51; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 252/252; `verify:sql` 89/89; `verify:stock-live` 8/8; `verify:stock-routes-live` 22/22; `verify:live-routes` 51/51; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -733,8 +737,9 @@ explicitly.
 **UI.** The Media tab has a stock search form (query, image/video, per-provider checkboxes) and a separate preview grid.
 Each preview shows the provider, dimensions, selected rendition, creator, source link, and license link, and imports only
 when **Import to project** is pressed. Imported assets appear in Project media with their provenance and can use the
-existing attach/detach/delete flow. Provider failures are listed per provider; one failure does not hide the other's
-results.
+existing attach/detach/delete flow. **Export** carries that provenance: the Preview tab's JSON export includes the
+document, unique stock credits, and a render payload with per-scene credited assets, and the script text ends with a
+`CREDITS` block. Provider failures are listed per provider; one failure does not hide the other's results.
 
 ### Phase 6 verification (2026-11-25)
 
@@ -744,6 +749,7 @@ results.
 | Hardened provider handling | **PASS** | Same file: duplicate/unknown/empty sources `400`; portrait crops are never selected for a 16:9 source; a `video/mp4` link ending in `.m3u8` is excluded; video previews come from provider thumbnails; a provider failure yields a sanitized code and the response never contains the provider key or URL |
 | Durable shared cache and stampedes | **PASS** | Two identical searches make one provider call each, the second reports `cached: true`, and `stock_search_cache` holds two ready rows with a Pixabay TTL of at least 24 hours; two concurrent searches still make one call per provider; a simulated cache outage leaves search working |
 | Repeated imports reuse one asset | **PASS** | `tests/stock.test.ts`: importing the same provider, asset id, and rendition twice makes one R2 write and one ready media row, returns the first media id with `reused: true` at `200`, and does not fetch the asset again; two simultaneous imports held at the asset fetch produce one `201` and one `200`, the same media id, exactly one ready row and one settled reservation; the same asset in another project is a separate `201` asset. `verify:sql`: a second ready row for the same rendition is rejected `23505`, while a deleted duplicate is allowed. `tests/stock-panel.test.tsx`: a reused import reports it and leaves one media item |
+| Credits travel with exports and render payloads | **PASS** | `POST /api/projects/:id/export` returns the draft document, one unique credit per referenced stock asset carrying creator, provider, source page, license, and every scene id, plus a render payload with per-scene credited assets; missing, not-ready, and non-stock asset ids are ignored. `tests/preview-export.test.tsx` downloads the JSON and script from the UI and asserts the credit fields and the `CREDITS` block |
 | Controlled import with provenance | **PASS** | Imported image bytes are in R2 under `media/<owner>/<id>`, the row is `ready`, JSONB provenance is stored and returned; video import is detected as `video/mp4`; foreign hosts, internal names, a redirect to another host, `http://`, oversized bodies, `text/html`, and playlists are refused; a foreign project is `404`; a type mismatch is `422` |
 | Previews stay separate from project assets | **PASS (DOM)** | `tests/stock-panel.test.tsx`: searching writes nothing to `/media`, the credit link and license link render with their URLs, the failed provider is reported, and only **Import to project** posts the import body and adds a `ready` asset; the media item then shows the stored provider, creator, source link, and license |
 | Real provider searches | **PASS** | `npm run verify:stock-live` on 2026-11-25: image "rainy city street" merged 40 results (Pexels 20 + Pixabay 20) and video "ocean waves" merged 40, all with credit, source page, selected rendition, and no playlist renditions; 8/8 checks |

@@ -36,12 +36,14 @@ import {
   createSupabaseProjectStore,
   assertSceneLocks,
   isProjectId,
+  parseProjectExportInput,
   parseProjectUpdate,
   parseProjectWrite,
   type ProjectStore,
 } from "./projects";
 import { ApiError } from "./api-error";
 import type { MediaRecord } from "../shared/media-contract";
+import { buildProjectExport } from "../shared/project-export";
 import {
   MEDIA_NOT_FOUND_MESSAGE,
   createSupabaseMediaStore,
@@ -949,6 +951,22 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       await store.get(user.id, projectId);
       const revisions = await store.listRevisions(user.id, projectId, PROJECT_REVISIONS_LIMIT);
       sendJson(response, 200, { ok: true, revisions });
+      return;
+    }
+
+    if (segments.length === 2 && segments[1] === "export") {
+      if (method !== "POST") {
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to export the document you are editing.");
+      }
+      // Ownership first, then the draft the editor holds; attribution comes from
+      // the stored media rows, never from the request body.
+      await store.get(user.id, projectId);
+      const write = parseProjectExportInput(await readJsonBody(request, PROJECT_LIMITS.bodyBytes));
+      const media = await requireMediaStore().list(user.id, projectId, config.media.listLimit);
+      sendJson(response, 200, {
+        ok: true,
+        export: buildProjectExport(write.title, write.document, media),
+      });
       return;
     }
 

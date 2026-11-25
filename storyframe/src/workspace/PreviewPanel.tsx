@@ -1,10 +1,15 @@
+import { useState } from "react";
 import { sceneFingerprint } from "../../shared/scene-fingerprint";
 import type { ProjectDocumentV2 } from "../../shared/project-contract";
+import { buildScriptText } from "../../shared/project-export";
+import { AiRequestError, exportProject } from "../api";
 import { formatDuration, totalDurationSeconds } from "./model";
 
 interface PreviewPanelProps {
   title: string;
   projectDocument: ProjectDocumentV2;
+  projectId: string;
+  getAccessToken: () => Promise<string>;
 }
 
 function downloadFile(name: string, content: string, type: string): void {
@@ -27,39 +32,48 @@ function slugFor(title: string): string {
     .slice(0, 60) || "storyframe-project";
 }
 
-export function PreviewPanel({ title, projectDocument }: PreviewPanelProps) {
+export function PreviewPanel({ title, projectDocument, projectId, getAccessToken }: PreviewPanelProps) {
   const scenes = projectDocument.scenes;
   const total = totalDurationSeconds(scenes);
+  const [exporting, setExporting] = useState<"json" | "script" | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
 
-  function exportJson() {
-    downloadFile(
-      `${slugFor(title)}.json`,
-      JSON.stringify({ title, document: projectDocument }, null, 2),
-      "application/json",
-    );
+  // The server joins the draft's asset ids to the stored media rows, so the
+  // credit comes from provenance rather than from anything the browser sends.
+  async function loadExport() {
+    return exportProject(await getAccessToken(), projectId, title, projectDocument);
   }
 
-  function exportScript() {
-    const script = scenes
-      .map((scene, index) => {
-        const lines = [
-          `SCENE ${index + 1} — ${scene.heading}`,
-          "",
-          scene.body || "(no narration)",
-          "",
-          `VISUAL: ${scene.visualDirection || "(none)"}`,
-          `ON SCREEN: ${scene.onScreenText || "(none)"}`,
-          `DURATION: ${scene.durationSeconds}s`,
-        ];
-        return lines.join("\n");
-      })
-      .join("\n\n---\n\n");
+  async function exportJson() {
+    if (exporting) return;
+    setExporting("json");
+    setExportError(null);
+    try {
+      const payload = await loadExport();
+      downloadFile(`${slugFor(title)}.json`, JSON.stringify(payload, null, 2), "application/json");
+    } catch (cause) {
+      setExportError(
+        cause instanceof AiRequestError ? cause.message : "The export could not be completed.",
+      );
+    } finally {
+      setExporting(null);
+    }
+  }
 
-    downloadFile(
-      `${slugFor(title)}-script.txt`,
-      `${title}\n\n${script}\n`,
-      "text/plain",
-    );
+  async function exportScript() {
+    if (exporting) return;
+    setExporting("script");
+    setExportError(null);
+    try {
+      const payload = await loadExport();
+      downloadFile(`${slugFor(title)}-script.txt`, buildScriptText(payload), "text/plain");
+    } catch (cause) {
+      setExportError(
+        cause instanceof AiRequestError ? cause.message : "The export could not be completed.",
+      );
+    } finally {
+      setExporting(null);
+    }
   }
 
   return (
@@ -119,16 +133,23 @@ export function PreviewPanel({ title, projectDocument }: PreviewPanelProps) {
           rendering belongs to Phase 9.
         </p>
         <div className="button-row">
-          <button type="button" onClick={exportJson} disabled={scenes.length === 0}>
-            Download project JSON
+          <button type="button" onClick={() => void exportJson()} disabled={scenes.length === 0 || exporting !== null}>
+            {exporting === "json" ? "Preparing JSON..." : "Download project JSON"}
           </button>
-          <button type="button" className="button-secondary" onClick={exportScript} disabled={scenes.length === 0}>
-            Download script text
+          <button
+            type="button"
+            className="button-secondary"
+            onClick={() => void exportScript()}
+            disabled={scenes.length === 0 || exporting !== null}
+          >
+            {exporting === "script" ? "Preparing script..." : "Download script text"}
           </button>
         </div>
+        {exportError && <p className="alert">{exportError}</p>}
         <p className="hint">
-          Both exports include exactly what is open here. The JSON is the complete editable document; importing it
-          back through the workspace is not part of Phase 4.
+          Both exports include exactly what is open here. Imported stock media adds its creator, provider, source
+          page, and license: the JSON carries a credit list and the per-scene render payload, and the script ends with
+          a credits block.
         </p>
       </div>
     </section>

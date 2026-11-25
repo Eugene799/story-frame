@@ -464,6 +464,15 @@ export function parseProjectWrite(input: unknown): ProjectWrite {
   };
 }
 
+/** The draft the editor is showing, for an export. Ownership is checked by the route. */
+export function parseProjectExportInput(input: unknown): { title: string; document: ProjectDocumentV2 } {
+  const body = readBody(input, ["title", "document"]);
+  return {
+    title: readBoundedText(body.title, "title", PROJECT_LIMITS.titleChars),
+    document: parseDocument(body.document),
+  };
+}
+
 export function parseProjectUpdate(input: unknown): ProjectUpdate {
   const body = readBody(input, ["title", "document", "version"]);
 

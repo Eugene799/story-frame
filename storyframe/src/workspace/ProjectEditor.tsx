@@ -287,7 +287,14 @@ export function ProjectEditor({
             onBusyChange={setMediaBusy}
           />
         )}
-        {tab === "preview" && <PreviewPanel title={title} projectDocument={draft} />}
+        {tab === "preview" && (
+          <PreviewPanel
+            title={title}
+            projectDocument={draft}
+            projectId={saved.id}
+            getAccessToken={getAccessToken}
+          />
+        )}
         {tab === "settings" && (
           <SettingsPanel project={saved} getAccessToken={getAccessToken} onDeleted={onDeleted} />
         )}

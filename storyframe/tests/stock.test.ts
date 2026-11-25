@@ -849,6 +849,53 @@ describe("stock import", () => {
     expect(app.supabase.media).toHaveLength(2);
   });
 
+  it("exports the draft with stored stock credits and a render payload", async () => {
+    const { app } = await startStockApp();
+    const projectId = await createProject(app.url);
+    const imported = await apiRequest(app.url, `/api/projects/${projectId}/stock/import`, {
+      method: "POST",
+      body: JSON.stringify(importBody()),
+    });
+    expect(imported.status).toBe(201);
+    const media = ((await imported.json()) as { media: MediaRecord }).media;
+
+    const document = structuredClone(DOCUMENT);
+    document.scenes[0].assetIds = [media.id, "not-a-media-row"];
+    const response = await apiRequest(app.url, `/api/projects/${projectId}/export`, {
+      method: "POST",
+      body: JSON.stringify({ title: "Credited story", document }),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      export: {
+        title: string;
+        document: typeof DOCUMENT;
+        credits: {
+          mediaId: string;
+          sceneIds: string[];
+          creator: string;
+          provider: string;
+          sourcePage: string;
+          license: string;
+        }[];
+        renderPayload: { scenes: { assets: { mediaId: string }[] }[] };
+      };
+    };
+
+    expect(body.export.title).toBe("Credited story");
+    expect(body.export.document).toEqual(document);
+    expect(body.export.credits).toHaveLength(1);
+    expect(body.export.credits[0]).toMatchObject({
+      mediaId: media.id,
+      sceneIds: [document.scenes[0].id],
+      creator: "Ada",
+      provider: "pexels",
+      sourcePage: "https://www.pexels.com/photo/101/",
+      license: "Pexels License",
+    });
+    expect(body.export.renderPayload.scenes[0].assets.map((asset) => asset.mediaId)).toEqual([media.id]);
+  });
+
   it("reuses the winner when two identical imports complete at the same time", async () => {
     const { app, provider } = await startStockApp();
     const projectId = await createProject(app.url);

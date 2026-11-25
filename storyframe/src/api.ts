@@ -17,6 +17,7 @@ import type {
   PlanningAttemptStatusResponse,
   PlanningStartRequest,
 } from "../shared/planning-contract";
+import type { ProjectExportPayload } from "../shared/project-export";
 import type {
   StockImportRequest,
   StockImportResponse,
@@ -312,6 +313,20 @@ export async function importStockAsset(
     method: "POST",
     body: request,
   });
+}
+
+export async function exportProject(
+  accessToken: string,
+  projectId: string,
+  title: string,
+  document: ProjectDocumentV2,
+): Promise<ProjectExportPayload> {
+  const body = await authorizedJson<{ ok: true; export: ProjectExportPayload }>(
+    `/api/projects/${projectId}/export`,
+    accessToken,
+    { method: "POST", body: { title, document } },
+  );
+  return body.export;
 }
 
 export async function listProjectSources(
