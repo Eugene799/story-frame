@@ -525,7 +525,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 176/176; `verify:sql` 77/77; `verify:live-routes` exit 0; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 182/182; `verify:sql` 77/77; `verify:live-routes` exit 0; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -575,7 +575,10 @@ the six families.
 because Ollama Cloud does not enforce a schema. Exactly one repair request is made after a validation failure, and the
 stored proposal carries `repairAttempted: true`. A second failure is `422 PLANNING_INVALID_JSON` and nothing is stored.
 Unknown fields (including any attempt to supply media ids), provider-set flags, scene durations outside 1–600, rewritten
-storyboard wording, and citations that are not verbatim excerpts all fail validation.
+storyboard wording, and citations that are not verbatim excerpts all fail validation. Each route's built-in instruction
+names the exact root keys, counts, and field names that validator accepts, and forbids every other key, because an extra
+key or a wrong count costs a repair call. `claims` is invited only by `script`, `ad-concept`, and `transcript-analysis`,
+and only for a factual brief with supplied excerpts; `angles` and `storyboard` never invite it.
 
 **Proposals are not accepted content.** `POST /api/projects/:id/planning` stores a proposal against the reviewed
 project version. `POST /api/projects/:id/proposals/:proposalId/accept` re-checks that it is still pending and that its
@@ -620,7 +623,9 @@ so it writes no ledger row and does not consume the key.
 | Key reuse and account scoping | **PASS** | The same key with a different instruction is `409 IDEMPOTENCY_KEY_REUSED` with no second call; the same key from another account is a separate attempt, and each account replays only its own proposal |
 | Refused replies are recorded and replayed | **PASS** | Invalid twice stores an `ai_usage` error row (`PLANNING_INVALID_JSON`, `422`), and a retry with that key replays the `422` without another provider call |
 | Planning without a key is refused | **PASS** | A request with no `Idempotency-Key` is `400 IDEMPOTENCY_KEY_REQUIRED` before the provider or the ledger is touched |
-| Hosted schema and live routes | **PASS** | Migration 7 is applied to the hosted project (2026-11-25); probes for every new column and `model_health` return `200`; `verify:live-routes` passes against it. A live planning call is still **UNVERIFIED**: it would be billable and no provider key is spent by the test suites |
+| Route instructions match the validator | **PASS** | `tests/planning-prompt.test.ts` (6 tests) asserts every route names its exact root keys, counts, scene/clip fields, and duration bounds under "only these keys", keeps factual claims available to script/ad-concept/transcript-analysis, and withholds them from angles/storyboard; the tightened `angles` instruction then passed a live call with no repair |
+| Hosted schema and live routes | **PASS** | Migration 7 is applied to the hosted project (2026-11-25); probes for every new column and `model_health` return `200`; `verify:live-routes` passes against it |
+| One real hosted planning call | **PASS** | 2026-11-25, first call before tightening: `angles` → `gemma4:31b`, `201`, 3 angles, but `repairAttempted=true` (ledger tokens 715/514, latency 2311 ms). After tightening, a second call with no caller instruction: `201` in 1932 ms, `repairAttempted=false`, 3 angles; ledger `success`/`201`, tokens 301/266, latency 1144 ms, stored proposal id; same-key replay `201` in 493 ms with the same proposal and still one ledger row; proposal, project, ledger row, profile, and user deleted, cleanup read back zero rows |
 | Plan tab behavior | **PASS (DOM)** | `tests/planning-panel.test.tsx`: list, generate, review, and accept through the panel, with nothing applied before acceptance and both actions disabled while the draft is dirty; included in the production build. Not exercised in a real browser in this environment |
 
 ### Phase 3 verification (2026-11-24)
@@ -889,9 +894,9 @@ the document-delete guard and project-deletion object cleanup.
   version beyond the staleness check.
 - The model-health counters are read-then-written in the API process, so two concurrent calls can lose one count; the
   timestamps and error codes are best-effort evidence, not an audit log. Cost rates stay `unpriced` until Phase 14.
-- Planning is verified against the local fake and `verify:sql`, and migration 7 is applied to the hosted project, but a
-  live planning call (which is billable) has not been made, and the Plan tab has not been exercised in a real browser in
-  this environment.
+- Planning is verified against the local fake and `verify:sql`, and migration 7 is applied to the hosted project. Real
+  hosted `angles` calls and same-key replays were verified on 2026-11-25; the call after tightening needed no repair
+  (see Phase 5 verification). The Plan tab has not been exercised in a real browser in this environment.
 - Media deletion is refused while an asset is referenced. The Media tab can detach an attached scene, which releases
   the reference and saves the asset id out of the document, so deletion is reachable from the UI. Saves also refuse
   scene asset ids that are not ready media in the same project, so a direct API write cannot create a dangling id.

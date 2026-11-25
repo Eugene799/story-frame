@@ -490,17 +490,21 @@ function sceneLine(scene: ProjectScene, index: number): string {
     .join("\n");
 }
 
+// Each instruction names the exact root keys and counts the validator enforces.
+// The validator rejects any root key outside its allowlist, so "only these
+// keys" is load-bearing: an extra key or a wrong count costs a repair call.
+// Claims are only valid for a factual brief with supplied excerpts, and only
+// the routes below invite them; angles and storyboard never do.
+const ROOT_KEYS_TEXT = '"summary" (non-empty string), "notes" (array of strings, may be empty)';
+const FACTUAL_CLAIMS_KEY =
+  '"claims" (only when the brief mode is factual and source excerpts were supplied; each claim then has only "sourceId", "statement", and "quote")';
+
 const ROUTE_INSTRUCTIONS: Record<PlanningRoute, string> = {
-  angles:
-    'Return "summary", "notes", and "angles": exactly three objects with "title", "hook", and "rationale". Do not return scenes, clips, or claims.',
-  script:
-    'Return "summary", "notes", and "scenes": 1-12 objects with "heading", "narration", "visualDirection", "onScreenText", and "durationSeconds" (integer seconds). Write the script from the brief. Locked narration must be echoed unchanged.',
-  storyboard:
-    'Return "summary", "notes", and "scenes": exactly one object per existing scene, in the same order, with "heading" and "narration" copied word for word from the script. Fill "visualDirection", "onScreenText", and "durationSeconds" (integer 1-600). Never rewrite the script wording.',
-  "ad-concept":
-    'Return "summary", "notes", and "scenes" (the beats) with the same scene fields, plus any "claims". Include a call to action in the last scene\'s onScreenText.',
-  "transcript-analysis":
-    'Return "summary", "notes", and "clips": 1-12 objects with "startSeconds", "endSeconds" (integer seconds, end after start), "quote", "heading", and "rationale". Every quote must be copied word for word from a supplied transcript excerpt.',
+  angles: `Return one JSON object with only these keys: ${ROOT_KEYS_TEXT}, and "angles" (exactly 3 objects, each with only "title", "hook", and "rationale").`,
+  script: `Return one JSON object with these keys and no others: ${ROOT_KEYS_TEXT}, "scenes" (1-12 objects, each with only "heading", "narration", "visualDirection", "onScreenText", and "durationSeconds", an integer from 1 to 600), and ${FACTUAL_CLAIMS_KEY}. Write the script from the brief; locked narration must be echoed unchanged.`,
+  storyboard: `Return one JSON object with only these keys: ${ROOT_KEYS_TEXT}, and "scenes" (exactly one object per existing scene, in the same order, each with only "heading", "narration", "visualDirection", "onScreenText", and "durationSeconds", an integer from 1 to 600). Copy each existing scene's heading and narration word for word; never rewrite them.`,
+  "ad-concept": `Return one JSON object with these keys and no others: ${ROOT_KEYS_TEXT}, "scenes" (1-12 beats, each with only "heading", "narration", "visualDirection", "onScreenText", and "durationSeconds", an integer from 1 to 600), and ${FACTUAL_CLAIMS_KEY}. Put a call to action in the onScreenText of the final scene.`,
+  "transcript-analysis": `Return one JSON object with these keys and no others: ${ROOT_KEYS_TEXT}, "clips" (1-12 objects, each with only "startSeconds", "endSeconds", "quote", "heading", and "rationale"; start and end are integers, end after start), and ${FACTUAL_CLAIMS_KEY}. Every quote must be copied word for word from a supplied transcript excerpt.`,
 };
 
 export interface PromptInput {
