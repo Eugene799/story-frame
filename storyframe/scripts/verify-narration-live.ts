@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { loadEnvFile } from "node:process";
 import { fileURLToPath } from "node:url";
 import { createStoryframeServer } from "../server/app";
@@ -108,7 +109,24 @@ function wavBytes(seconds = 1): Buffer {
   return bytes;
 }
 
-const LIVE_WAV = wavBytes(1);
+const MUSIC_CASES = [
+  { label: "WAV", contentType: "audio/wav", bytes: wavBytes(1) },
+  {
+    label: "M4A",
+    contentType: "audio/mp4",
+    bytes: readFileSync(new URL("../tests/fixtures/audio/tone-1s.m4a", import.meta.url)),
+  },
+  {
+    label: "OGG",
+    contentType: "audio/ogg",
+    bytes: readFileSync(new URL("../tests/fixtures/audio/tone-1s.ogg", import.meta.url)),
+  },
+  {
+    label: "AAC",
+    contentType: "audio/aac",
+    bytes: readFileSync(new URL("../tests/fixtures/audio/tone-1s.aac", import.meta.url)),
+  },
+] as const;
 
 const scene = {
   id: "s1",
@@ -416,35 +434,39 @@ async function main(): Promise<number> {
       `bytes=${musicBytes.length}`,
     );
 
-    const wavMusic = await uploadAudio(user.token, LIVE_WAV, "audio/wav");
-    check(
-      "a WAV music file uploads and is detected from its bytes",
-      wavMusic.status === "ready" &&
-        wavMusic.contentType === "audio/wav" &&
-        wavMusic.byteSize === LIVE_WAV.length,
-      `type=${wavMusic.contentType} bytes=${wavMusic.byteSize}`,
-    );
-    const attachedWav = await api(user.token, "POST", `/api/projects/${projectId}/music`, {
-      mediaId: wavMusic.id,
-    });
-    check(
-      "uploaded WAV music is measured and replaces the prior music track",
-      attachedWav.status === 201 &&
-        attachedWav.body?.track?.source === "upload" &&
-        attachedWav.body?.track?.durationSeconds > 0,
-      `status=${attachedWav.status} duration=${attachedWav.body?.track?.durationSeconds}`,
-    );
-    const wavPlayback = await api(
-      user.token,
-      "GET",
-      `/api/projects/${projectId}/media/${wavMusic.id}/url`,
-    );
-    const wavBytesBack = Buffer.from(await (await fetch(wavPlayback.body?.url)).arrayBuffer());
-    check(
-      "uploaded WAV music plays back byte-for-byte from private R2",
-      wavPlayback.status === 200 && wavBytesBack.equals(LIVE_WAV),
-      `bytes=${wavBytesBack.length}`,
-    );
+    let activeMusicMediaId: string | null = null;
+    for (const music of MUSIC_CASES) {
+      const uploaded = await uploadAudio(user.token, music.bytes, music.contentType);
+      check(
+        `a ${music.label} music file uploads and is detected from its bytes`,
+        uploaded.status === "ready" &&
+          uploaded.contentType === music.contentType &&
+          uploaded.byteSize === music.bytes.length,
+        `type=${uploaded.contentType} bytes=${uploaded.byteSize}`,
+      );
+      const attached = await api(user.token, "POST", `/api/projects/${projectId}/music`, {
+        mediaId: uploaded.id,
+      });
+      check(
+        `uploaded ${music.label} music is measured and replaces the prior music track`,
+        attached.status === 201 &&
+          attached.body?.track?.source === "upload" &&
+          attached.body?.track?.durationSeconds > 0,
+        `status=${attached.status} duration=${attached.body?.track?.durationSeconds}`,
+      );
+      const playback = await api(
+        user.token,
+        "GET",
+        `/api/projects/${projectId}/media/${uploaded.id}/url`,
+      );
+      const bytesBack = Buffer.from(await (await fetch(playback.body?.url)).arrayBuffer());
+      check(
+        `uploaded ${music.label} music plays back byte-for-byte from private R2`,
+        playback.status === 200 && bytesBack.equals(music.bytes),
+        `bytes=${bytesBack.length}`,
+      );
+      activeMusicMediaId = uploaded.id;
+    }
 
     const activeRows = await serviceRows(
       `narration_tracks?select=kind,status,media_id,duration_seconds&project_id=eq.${projectId}&status=eq.active&order=kind`,
@@ -454,7 +476,7 @@ async function main(): Promise<number> {
       activeRows.length === 2 &&
         activeRows.every((row) => row.status === "active" && row.duration_seconds > 0) &&
         activeRows.some((row) => row.kind === "narration" && row.media_id === uploadedNarration.id) &&
-        activeRows.some((row) => row.kind === "music" && row.media_id === wavMusic.id),
+        activeRows.some((row) => row.kind === "music" && row.media_id === activeMusicMediaId),
       JSON.stringify(activeRows.map((row) => [row.kind, row.status, row.duration_seconds])),
     );
 
