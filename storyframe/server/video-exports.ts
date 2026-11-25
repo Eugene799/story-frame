@@ -52,16 +52,16 @@ import { R2Error } from "./r2";
  */
 
 /**
- * Hosts the finished MP4 may be downloaded from. The docs name
- * `assets.json2video.com`, but a live render on 2026-11-25 was delivered from
- * `json2video-cdn1.s3.amazonaws.com`, so the provider's CDN buckets are allowed
- * by shape. Nothing else is: redirects are refused and only `https` is read.
+ * Hosts a finished MP4 may be downloaded from. The docs name
+ * `assets.json2video.com`, but the first live render (2026-11-25) was delivered
+ * from `json2video-cdn1.s3.amazonaws.com`, so the provider's CDN buckets are
+ * accepted by shape. Nothing else is, and only `https` is ever read.
  */
-export const JSON2VIDEO_OUTPUT_HOSTS: readonly string[] = ["assets.json2video.com"];
-export const JSON2VIDEO_CDN_HOST = /^json2video-cdn\d+\.s3\.amazonaws\.com$/;
+const OUTPUT_HOSTS = new Set(["assets.json2video.com"]);
+const OUTPUT_CDN_HOST = /^json2video-cdn\d+\.s3\.amazonaws\.com$/;
 
-export function isJson2VideoOutputHost(hostname: string): boolean {
-  return JSON2VIDEO_OUTPUT_HOSTS.includes(hostname) || JSON2VIDEO_CDN_HOST.test(hostname);
+function isOutputHost(hostname: string): boolean {
+  return OUTPUT_HOSTS.has(hostname) || OUTPUT_CDN_HOST.test(hostname);
 }
 
 /** Provider statuses kept in `render_snapshots.provider_status`. */
@@ -1045,7 +1045,7 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
     } catch {
       throw new ApiError(422, "VIDEO_OUTPUT_INVALID", "The provider returned an unreadable output URL.");
     }
-    if (parsed.protocol !== "https:" || !isJson2VideoOutputHost(parsed.hostname)) {
+    if (parsed.protocol !== "https:" || !isOutputHost(parsed.hostname)) {
       throw new ApiError(
         422,
         "VIDEO_OUTPUT_INVALID",
@@ -1206,9 +1206,10 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
         .updateJob(cursor.ownerId, cursor.job.id, {
           status: "failed",
           result: {
+            // The last poll's snapshot stays; `details` adds what only the
+            // failing step knows, such as a finished render's provider URL.
             ...(cursor.job.result ?? {}),
             failureCode: code,
-            providerStatus: cursor.job.result?.providerStatus ?? null,
             ...details,
           },
         })
