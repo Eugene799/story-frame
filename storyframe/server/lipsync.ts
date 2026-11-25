@@ -672,6 +672,9 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
       return;
     }
 
+    // The ceiling stands until a real file says otherwise; a download that
+    // arrives but cannot be stored still bills what it measured.
+    let counted = row.secondsEstimate;
     try {
       const download = await downloadOutput(state.resultUrl ?? "");
       // Bill the seconds the file actually holds, not the ceiling reserved for it.
@@ -684,7 +687,7 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
         // longer header is broken. Never let it inflate the ledger.
         log.error("[lipsync] LIPSYNC_DURATION_OUT_OF_RANGE");
       }
-      const counted = measured === null || measured > row.secondsEstimate ? row.secondsEstimate : measured;
+      counted = measured === null || measured > row.secondsEstimate ? row.secondsEstimate : measured;
       const stored = await storeOutput(row.ownerId, row.projectId, download.bytes, download.contentType);
       await deps.store.update(row.ownerId, row.id, {
         status: "ready",
@@ -699,8 +702,8 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
       const code = error instanceof ApiError && error.code.startsWith("LIPSYNC_") ? (error.code as LipsyncFailureCode) : "LIPSYNC_OUTPUT_COPY_FAILED";
       const message = error instanceof ApiError ? error.message : "The finished lip sync could not be stored.";
       // Reached only after the provider reported SUCCESS, so it has billed the
-      // request even when we refuse or cannot keep the output.
-      await fail(row, code, message, row.secondsEstimate);
+      // request; `counted` is the measured length once the bytes arrived.
+      await fail(row, code, message, counted);
     }
   }
 

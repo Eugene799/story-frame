@@ -492,6 +492,24 @@ describe("lipsync sweep", () => {
     expect(store.settled.at(-1)).toMatchObject({ status: "failed", seconds: 0 });
   });
 
+  it("settles the measured seconds when the file downloads but cannot be stored", async () => {
+    const store = memoryStore([row()]);
+    const objects = new Map<string, Buffer>();
+    const { fetchImpl } = fakeFetch({ objects });
+    const media = fakeMedia(objects);
+    const r2 = fakeObjects(objects);
+    // The bucket refuses the presigned upload after the file has arrived.
+    r2.presignPut = () => {
+      throw new Error("bucket unavailable");
+    };
+    await service({ store: store.store, mediaStore: media.media, objects: r2, fetchImpl }).sweep();
+
+    expect(store.rows[0]).toMatchObject({ status: "failed", failureCode: "LIPSYNC_OUTPUT_COPY_FAILED" });
+    // We hold the bytes, so the ledger keeps their six seconds, not the ceiling.
+    expect(store.settled.at(-1)).toEqual({ exportId: store.rows[0]?.id, status: "succeeded", seconds: 6 });
+    expect(store.rows[0]?.secondsCounted).toBe(6);
+  });
+
   it("fails a task that reports success without an output", async () => {
     const store = memoryStore([row()]);
     const objects = new Map<string, Buffer>();

@@ -1091,8 +1091,9 @@ rather than the twenty reserved for it. A header that cannot be read keeps the r
 (`LIPSYNC_DURATION_OUT_OF_RANGE`), so a broken header can never inflate the ledger. A provider `FAILURE`/`REVOKED`, an abandoned task, or a row whose task id
 was never stored fails the export; a reported failure settles zero seconds because the provider did not bill it, while a
 lost task id keeps the reservation. Anything that fails **after** a `SUCCESS` — no usable URL, a refused output host, an
-oversized or unreadable file, a storage error — also fails the export but keeps the reserved ceiling, because the
-provider has already billed that request.
+oversized or unreadable file, a storage error — also fails the export, because the provider has already billed that
+request. The settled seconds follow the bytes: a file that never arrived keeps the reserved ceiling, while a file that
+downloaded and then could not be stored settles the length it measured.
 - The Preview tab's `LipsyncPanel` picks the source, audio and resolution, shows the seconds/USD window and an
 estimate, submits with an idempotency key, polls only while pending, plays the stored copy from a private
 presigned URL, and deletes after a confirmation. A pending task cannot be deleted.
