@@ -1,5 +1,5 @@
 /**
- * Phase 10: lip sync through Everypixel Labs.
+ * Lip sync through Everypixel Labs.
  *
  * One source clip (a talking face) or one still portrait, plus a spoken audio
  * track, becomes a new video whose mouth matches the audio. Both media inputs

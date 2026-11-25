@@ -1063,7 +1063,7 @@ unsaved changes, no scenes exist, or an export is already running. A refusal fro
 (retries and the `…/refresh` endpoint are deferred); no renders-per-day cap; the provider copy is deleted best-effort
 after our own copy exists; no cancel; no subtitle or word-timing claim; no USD estimate.
 
-### Phase 10: lip sync through Everypixel Labs (2026-11-25) — adapter only
+### Lip sync through Everypixel Labs (2026-11-25) — adapter only
 
 Started, not yet a feature: there is no route, table or UI for it yet and nothing calls the provider from the app.
 

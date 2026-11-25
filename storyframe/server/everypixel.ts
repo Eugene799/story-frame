@@ -12,7 +12,7 @@ import {
 } from "../shared/lipsync-contract";
 
 /**
- * Phase 10: Everypixel Labs lip sync adapter.
+ * Everypixel Labs lip sync adapter.
  *
  * Two calls and no state of its own:
  * - POST /v1/video_lipsync or /v1/image_lipsync with both media inputs inlined
