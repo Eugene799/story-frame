@@ -1063,6 +1063,29 @@ unsaved changes, no scenes exist, or an export is already running. A refusal fro
 (retries and the `…/refresh` endpoint are deferred); no renders-per-day cap; the provider copy is deleted best-effort
 after our own copy exists; no cancel; no subtitle or word-timing claim; no USD estimate.
 
+### Phase 10: lip sync through Everypixel Labs (2026-11-25) — adapter only
+
+Started, not yet a feature: there is no route, table or UI for it yet and nothing calls the provider from the app.
+
+- `shared/lipsync-contract.ts` holds the shapes: `360p`/`480p`/`720p`, the provider's 20-second cap on source video and
+audio at 720p, the audio/video/still formats it documents, the mapping from `PENDING`/`STARTED`/`SUCCESS`/`FAILURE`/
+`REVOKED` onto our `pending`/`ready`/`failed`, and an estimate at the published `$0.0075` per-second 720p floor. Cheap
+resolutions are not priced publicly, so the estimate deliberately does not invent a discount.
+- `server/everypixel.ts` submits `POST /v1/video_lipsync` or `/v1/image_lipsync` and polls `GET /v1/status`. Both media
+inputs travel inside the JSON body as full base64 Data URIs, which is why the adapter bounds each file in bytes rather
+than fetching provider URLs; the source's own content type picks the endpoint. Authentication is HTTP Basic with
+`EVERYPIXEL_CLIENT_ID` and `EVERYPIXEL_SECRET_ID` (the docs' client secret; `EVERYPIXEL_CLIENT_SECRET` is accepted as
+the same value). Provider bodies are never surfaced: a rejection becomes a stable code plus its HTTP status, so an
+echoed key cannot reach a client.
+- The output URL is returned whole, signature query included, because provider output links are usually signed. Its host
+is **not** yet allowlisted the way `OUTPUT_HOSTS` guards the JSON2Video copy, so a download path must not ship until a
+real render shows which host serves the file. A signed-out or unconfigured server answers `LIPSYNC_PROVIDER_DISABLED`.
+- `tests/everypixel.test.ts` covers both endpoints, basic auth, the data URIs, every refusal (source kind, audio kind,
+length, size, resolution), unreachable and rejecting providers, an unknown task status, success without a usable URL and
+`FAILURE`/`REVOKED`. No paid call was made.
+- Still missing before this is usable: the job table and spend guard, `POST/GET/DELETE /api/projects/:id/exports/lipsync`,
+copying the finished MP4 into R2 through a host-checked download, and a Preview-tab panel.
+
 ## Model catalog (verified 2026-11-24)
 
 Direct request identifiers come from `https://ollama.com/api/tags`, which the API documentation names as the source of

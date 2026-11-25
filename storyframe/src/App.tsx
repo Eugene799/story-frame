@@ -117,7 +117,7 @@ export default function App({ client = supabase, configError = supabaseConfigErr
     <div className="app-shell">
       <header className="site-header">
         <div>
-          <p className="eyebrow">StoryFrame / Phase 4</p>
+          <p className="eyebrow">StoryFrame / Phase 9</p>
           <h1>Dashboard, brief, script, and storyboard</h1>
           <p className="lede">
             Sign in to write a brief and script, arrange the storyboard, attach private media, generate images and
