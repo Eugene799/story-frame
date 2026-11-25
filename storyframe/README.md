@@ -207,6 +207,7 @@ anon) key; never the service-role key.
 | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_AI_API_TOKEN` | Cloudflare Workers AI credentials for image generation. `CF_API_TOKEN` is accepted as the same AI token. Read only in the Node process. |
 | `LEONARDO_API_KEY` | Leonardo API key. Read only in the Node process and never stored in a generation row. |
 | `IMAGE_POLL_INTERVAL_MS`, `IMAGE_GENERATION_TIMEOUT_MS`, `IMAGE_DOWNLOAD_TIMEOUT_MS` | Leonardo poll cadence, the poll deadline before a `202` is returned, and the provider image download timeout (defaults 1500, 60000, and 30000 ms). |
+| `IMAGE_DAILY_IMAGES_PER_USER`, `IMAGE_DAILY_USD_PER_USER` | Per-account spending guard over a rolling 24 hours: recorded attempts and their estimated USD (defaults 20 images and $1.00). Either value set to `0` disables that dimension. Leonardo attempts count toward images but not USD because its rate is unpublished. |
 | `STOCK_IMPORT_TIMEOUT_MS`, `STOCK_IMPORT_REDIRECTS` | Import download timeout and redirect bound (defaults 30000 ms, 3 hops). |
 
 `.env` is git-ignored; `.env.example` contains placeholders only. Only public Supabase auth configuration uses a
@@ -790,6 +791,14 @@ limit, marks a provider without credentials as disabled, and a prompt produces t
 provider; a queued job shows **Refresh job** until it settles. The ready asset is previewed through a short-lived
 private playback URL, and **Attach image to scene** writes the scene reference and saves the project in one action.
 
+Before any provider call the route applies a per-account spending guard over a rolling 24 hours. It counts every
+recorded attempt for that owner — including failed ones, which may still have been billed — and the sum of their
+estimated USD, then refuses with `429 IMAGE_SPEND_LIMIT` when the next request would exceed either limit. A second
+generation while one is still running for the same account is refused with `429 IMAGE_GENERATION_IN_FLIGHT`; the
+in-process slot closes the gap between the usage read and the new row, so a double submit cannot spend twice. The
+limits are configuration, not client input: `IMAGE_DAILY_IMAGES_PER_USER` and `IMAGE_DAILY_USD_PER_USER` (0 disables
+either check). Leonardo is capped by count only because its catalog rate is `null`.
+
 Input is limited to a known `modelKey`, a non-empty prompt within the model's limit, and optional dimensions/steps
 that the model accepts (Cloudflare fixes 1024×1024; Leonardo accepts 32–2048 px in multiples of 8). A failed provider
 call, unreadable image, refused download host, or storage failure marks the row `failed` with a sanitized code; the
@@ -814,6 +823,7 @@ row itself is the generation record.
 | Real Cloudflare generation | **PASS** | `npm run verify:image-live` on 2026-11-25, 12/12: the route estimated 172.8 neurons / $0.001901, generated one 1024×1024 flux image through Workers AI, stored it in R2, listed it, and served it from a presigned playback URL before cleanup. Credential diagnosis: `CLOUDFLARE_API_TOKEN` is a valid, active token but Workers AI rejects it with `401` code `10000` (no Workers AI permission); the project's `CF_API_TOKEN` is the Workers AI token and works. The adapter now accepts `CF_API_TOKEN` as the `CLOUDFLARE_AI_API_TOKEN` fallback |
 | Real Leonardo generation | **BLOCKED** | `LEONARDO_API_KEY` is a 36-character UUID rather than a Leonardo API key (Leonardo keys are long JWTs), and Leonardo returns `401` for both `POST /generations` and `/me`. It cannot work until a real key is issued; the route correctly records the failure and stores no media |
 | Hosted schema | **PASS** | `20261125200000_create_image_generations.sql` applied through the Supabase management API on 2026-11-25; `verify:sql` reports 92/92, including the service-role insert, `42501` for authenticated reads, and `23514` for an unknown provider |
+| Per-user spending guard | **PASS** | `tests/image-generations.test.ts`: two recorded attempts with a limit of 2 return `429 IMAGE_SPEND_LIMIT` without a row or provider write; a prior $0.001901 estimate with a $0.0035 limit refuses the next priced image; a 25-hour-old attempt and two other-account attempts do not count; a provider with no USD rate is still capped by image count; two simultaneous requests yield one `201` and one `429 IMAGE_GENERATION_IN_FLIGHT`. `verify:image-routes-live` runs with a limit of 1 and gets `429 IMAGE_SPEND_LIMIT` for a second generation with no new row or media |
 | Generation UI | **PASS (DOM)** | `tests/generate-panel.test.tsx`: the model picker marks a credential-less provider disabled; a prompt triggers the server estimate and shows $0.001901 / 172.8 neurons with its verified date and source; no generation request is made before **Generate image**; the result previews from a private playback URL and **Attach image to scene** writes the scene reference and saves the document; a `202` job shows **Refresh job** and only then completes; a provider failure shows the sanitized code without a preview |
 
 | Provider | Verified model and request | Limits | Billing |

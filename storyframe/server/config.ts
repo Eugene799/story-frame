@@ -29,8 +29,15 @@ export interface AppConfig {
   media: MediaLimits;
   /** Phase 6 provider keys, cache windows, and import bounds. */
   stock: StockLimits;
-  /** Phase 7 generation polling bounds; credentials are read separately. */
-  image: { pollIntervalMs: number; pollTimeoutMs: number; downloadTimeoutMs: number };
+  /** Phase 7 generation bounds, polling, and the per-user spending guard. */
+  image: {
+    pollIntervalMs: number;
+    pollTimeoutMs: number;
+    downloadTimeoutMs: number;
+    dailyImageLimit: number;
+    dailyUsdLimit: number;
+    spendWindowMs: number;
+  };
   /** One configured model per planning route; see Phase 5 in the README. */
   planning: { routes: ResolvedPlanningRoute[] };
 }
@@ -47,6 +54,20 @@ function intEnv(
   const value = Number(raw);
   if (!Number.isFinite(value)) return fallback;
   return Math.min(max, Math.max(min, Math.floor(value)));
+}
+
+function usdEnv(
+  env: NodeJS.ProcessEnv,
+  name: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const raw = env[name]?.trim();
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, value));
 }
 
 function stringEnv(env: NodeJS.ProcessEnv, name: string): string | null {
@@ -143,6 +164,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       pollIntervalMs: intEnv(env, "IMAGE_POLL_INTERVAL_MS", 1500, 100, 10000),
       pollTimeoutMs: intEnv(env, "IMAGE_GENERATION_TIMEOUT_MS", 60000, 1000, 300000),
       downloadTimeoutMs: intEnv(env, "IMAGE_DOWNLOAD_TIMEOUT_MS", 30000, 1000, 120000),
+      // A rolling 24-hour cap per account. Zero disables that dimension.
+      dailyImageLimit: intEnv(env, "IMAGE_DAILY_IMAGES_PER_USER", 20, 0, 1000),
+      dailyUsdLimit: usdEnv(env, "IMAGE_DAILY_USD_PER_USER", 1, 0, 1000),
+      spendWindowMs: 24 * 60 * 60 * 1000,
     },
     planning: { routes: planningRoutes(env) },
   };

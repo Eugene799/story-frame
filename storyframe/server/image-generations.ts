@@ -226,8 +226,16 @@ export interface ImageGenerationPatch {
   errorCode?: string | null;
 }
 
+export interface ImageSpendSnapshot {
+  attempts: number;
+  estimatedUsd: number;
+}
+
 export interface ImageGenerationStore {
   create(ownerId: string, generation: ImageGenerationCreate): Promise<ImageGenerationRecord>;
+  /** Every recorded attempt in the window, whatever its final status, since a
+   *  failed attempt may still have been billed by the provider. */
+  usageSince(ownerId: string, sinceIso: string): Promise<ImageSpendSnapshot>;
   update(
     ownerId: string,
     projectId: string,
@@ -315,6 +323,29 @@ export function createSupabaseImageGenerationStore(
         throw new ApiError(503, "IMAGE_STORE_UNAVAILABLE", "The image store did not confirm the generation.");
       }
       return toRecord(created[0]);
+    },
+
+    async usageSince(ownerId, sinceIso) {
+      const found = rows(
+        await request(
+          tableUrl({
+            select: "created_at,estimated_usd",
+            owner_id: `eq.${ownerId}`,
+            created_at: `gte.${sinceIso}`,
+            limit: "1000",
+          }),
+          { headers },
+          "the image usage read",
+        ),
+      );
+      let estimatedUsd = 0;
+      for (const row of found) {
+        const value = row.estimated_usd;
+        const parsed = typeof value === "number" ? value : value === null ? 0 : Number(value);
+        if (!Number.isFinite(parsed)) corrupt("estimated_usd");
+        estimatedUsd += parsed;
+      }
+      return { attempts: found.length, estimatedUsd: Number(estimatedUsd.toFixed(6)) };
     },
 
     async update(ownerId, projectId, generationId, patch) {

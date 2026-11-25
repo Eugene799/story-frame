@@ -44,7 +44,7 @@ import {
 import { ApiError } from "./api-error";
 import type { MediaRecord } from "../shared/media-contract";
 import { buildProjectExport } from "../shared/project-export";
-import type { ImageBillingView } from "../shared/image-generation-contract";
+import type { ImageBillingView, ImageEstimate } from "../shared/image-generation-contract";
 import {
   IMAGE_MODELS,
   fetchLeonardoGeneration,
@@ -59,6 +59,7 @@ import {
   parseImageGenerationInput,
   resolveImageRequest,
   type ImageGenerationStore,
+  type ResolvedImageRequest,
 } from "./image-generations";
 import {
   MEDIA_NOT_FOUND_MESSAGE,
@@ -418,6 +419,9 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
   const fetchImpl = options.fetchImpl;
   const recentRequestsByUser = new Map<string, number[]>();
   const inFlightByUser = new Map<string, number>();
+  // One image generation per account at a time, so a double submit cannot
+  // spend provider credit twice before the usage check sees the first row.
+  const imageInFlight = new Set<string>();
   let lastRateLimitSweep = 0;
   let ledgerReadiness: { value: boolean; checkedAt: number } | null = null;
 
@@ -994,6 +998,70 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       );
     }
     const estimate = estimateImageGeneration(resolved);
+    const release = acquireImageSlot(user.id);
+    try {
+      await enforceImageSpend(store, user.id, estimate);
+      await runImageGeneration(response, user, projectId, resolved, estimate);
+    } finally {
+      release();
+    }
+  }
+
+  /** The in-process slot closes the race between the usage read and the new row. */
+  function acquireImageSlot(ownerId: string): () => void {
+    if (imageInFlight.has(ownerId)) {
+      throw new HttpError(
+        429,
+        "IMAGE_GENERATION_IN_FLIGHT",
+        "An image generation is already running for this account. Wait for it to finish before starting another.",
+      );
+    }
+    imageInFlight.add(ownerId);
+    return () => {
+      imageInFlight.delete(ownerId);
+    };
+  }
+
+  /** Rolling 24-hour cap per account; either dimension can be disabled with 0. */
+  async function enforceImageSpend(
+    store: ImageGenerationStore,
+    ownerId: string,
+    estimate: ImageEstimate,
+  ): Promise<void> {
+    const since = new Date(now() - config.image.spendWindowMs).toISOString();
+    const spend = await store.usageSince(ownerId, since);
+
+    const imageLimit = config.image.dailyImageLimit;
+    if (imageLimit > 0 && spend.attempts >= imageLimit) {
+      throw new HttpError(
+        429,
+        "IMAGE_SPEND_LIMIT",
+        `This account has ${spend.attempts} image generation${spend.attempts === 1 ? "" : "s"} recorded in the last 24 hours; the limit is ${imageLimit}. Wait for the window to pass or raise the limit.`,
+      );
+    }
+
+    const usdLimit = config.image.dailyUsdLimit;
+    if (
+      usdLimit > 0 &&
+      estimate.estimatedUsd !== null &&
+      spend.estimatedUsd + estimate.estimatedUsd > usdLimit + 1e-9
+    ) {
+      throw new HttpError(
+        429,
+        "IMAGE_SPEND_LIMIT",
+        `Estimated image spend for the last 24 hours is $${spend.estimatedUsd.toFixed(4)} of $${usdLimit.toFixed(2)}; this image would exceed the limit.`,
+      );
+    }
+  }
+
+  async function runImageGeneration(
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+    resolved: ResolvedImageRequest,
+    estimate: ImageEstimate,
+  ): Promise<void> {
+    const store = requireImageStore();
     const generation = await store.create(user.id, {
       id: randomUUID(),
       projectId,

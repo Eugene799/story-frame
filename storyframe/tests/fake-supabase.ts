@@ -601,6 +601,8 @@ export async function startFakeSupabase(
                 if (value === null || value === undefined || String(value) >= raw.slice(3)) return false;
               } else if (raw.startsWith("gt.")) {
                 if (value === null || value === undefined || String(value) <= raw.slice(3)) return false;
+              } else if (raw.startsWith("gte.")) {
+                if (value === null || value === undefined || String(value) < raw.slice(4)) return false;
               } else if (raw.startsWith("neq.")) {
                 if (String(value ?? "") === raw.slice(4)) return false;
               } else if (raw.startsWith("in.(") && raw.endsWith(")")) {

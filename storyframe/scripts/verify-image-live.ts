@@ -15,6 +15,9 @@ import { createStoryframeServer } from "../server/app";
  * Supabase and R2 but answer the provider call locally. That verifies the
  * route, record, and storage path without spending provider credit.
  *
+ * The server runs with the per-user guard set to one image, so a second attempt
+ * must be refused (429 IMAGE_SPEND_LIMIT) without reaching the provider.
+ *
  * It never prints keys, tokens, signed URLs, prompts, or provider responses.
  */
 try {
@@ -148,12 +151,17 @@ const document = {
 };
 
 async function main(): Promise<number> {
-  const server = fakeProvider
-    ? createStoryframeServer({
-        env: { ...process.env, CLOUDFLARE_ACCOUNT_ID: "fake-account", CLOUDFLARE_AI_API_TOKEN: "fake-token" },
-        fetchImpl: fakeProviderFetch(),
-      })
-    : createStoryframeServer();
+  const server = createStoryframeServer({
+    env: {
+      ...process.env,
+      IMAGE_DAILY_IMAGES_PER_USER: process.env.IMAGE_VERIFY_DAILY_IMAGES ?? "1",
+      IMAGE_DAILY_USD_PER_USER: process.env.IMAGE_VERIFY_DAILY_USD ?? "1",
+      ...(fakeProvider
+        ? { CLOUDFLARE_ACCOUNT_ID: "fake-account", CLOUDFLARE_AI_API_TOKEN: "fake-token" }
+        : {}),
+    },
+    ...(fakeProvider ? { fetchImpl: fakeProviderFetch() } : {}),
+  });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", resolve);
@@ -286,6 +294,23 @@ async function main(): Promise<number> {
     check(
       "the generation record is listed for the project",
       list.status === 200 && list.body?.generations?.some((row: any) => row.id === generation.id),
+    );
+
+    const recorded = await serviceRows(`image_generations?select=id&owner_id=eq.${user.id}`);
+    const guarded = await api(user.token, "POST", `/api/projects/${projectId}/image-generations`, {
+      modelKey,
+      prompt: "a second image the spending guard should refuse",
+    });
+    check(
+      "the per-user spending guard refuses a second generation",
+      guarded.status === 429 && guarded.body?.error?.code === "IMAGE_SPEND_LIMIT",
+      `status=${guarded.status} code=${guarded.body?.error?.code ?? "none"}`,
+    );
+    const afterGuard = await serviceRows(`image_generations?select=id&owner_id=eq.${user.id}`);
+    check(
+      "the refused generation is not recorded or stored",
+      recorded.length > 0 && afterGuard.length === recorded.length && Boolean(generated.body?.media?.id),
+      `before=${recorded.length} after=${afterGuard.length}`,
     );
   } finally {
     const generationRows = user
