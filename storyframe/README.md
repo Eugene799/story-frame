@@ -204,7 +204,7 @@ anon) key; never the service-role key.
 | `STOCK_PROVIDER_TIMEOUT_MS`, `STOCK_PAGE_SIZE`, `STOCK_MAX_PAGE`, `STOCK_QUERY_MAX_CHARS` | Provider timeout and search bounds (defaults 8000 ms, 20 results per provider, page 50, 80 characters). |
 | `STOCK_PEXELS_CACHE_SECONDS`, `STOCK_PIXABAY_CACHE_SECONDS` | Durable page-cache windows (defaults 3600 and 86400). Pixabay is never below 86400, the provider's caching requirement. |
 | `STOCK_CACHE_PAYLOAD_BYTES`, `STOCK_CACHE_LEASE_MS`, `STOCK_CACHE_WAIT_MS` | Maximum cached page size, claim-lease length, and how long a concurrent request waits for the claim holder. |
-| `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_AI_API_TOKEN` | Cloudflare Workers AI credentials for image generation. Read only in the Node process. |
+| `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_AI_API_TOKEN` | Cloudflare Workers AI credentials for image generation. `CF_API_TOKEN` is accepted as the same AI token. Read only in the Node process. |
 | `LEONARDO_API_KEY` | Leonardo API key. Read only in the Node process and never stored in a generation row. |
 | `IMAGE_POLL_INTERVAL_MS`, `IMAGE_GENERATION_TIMEOUT_MS`, `IMAGE_DOWNLOAD_TIMEOUT_MS` | Leonardo poll cadence, the poll deadline before a `202` is returned, and the provider image download timeout (defaults 1500, 60000, and 30000 ms). |
 | `STOCK_IMPORT_TIMEOUT_MS`, `STOCK_IMPORT_REDIRECTS` | Import download timeout and redirect bound (defaults 30000 ms, 3 hops). |
@@ -805,8 +805,8 @@ row itself is the generation record.
 | Criterion | Status | Evidence |
 | --- | --- | --- |
 | Route, record, and R2 persistence on hosted services | **PASS** | `npm run verify:image-routes-live` against hosted Supabase and the real `story-frame` bucket, with only the provider call answered locally: the estimate reported neurons/USD, generation returned `201` with prompt/model/settings/rate version, the image was stored, listed, and served through a presigned playback URL, the record was listed, and project/user cleanup removed the row; 12/12 checks |
-| Real Cloudflare generation | **BLOCKED** | The environment has no `CLOUDFLARE_AI_API_TOKEN`. The available `CLOUDFLARE_API_TOKEN` returns `401 Authentication error` from Workers AI, so no live image was generated |
-| Real Leonardo generation | **BLOCKED** | `LEONARDO_API_KEY` is present but rejected by Leonardo (`401` on both generation and `/me`), so no live image was generated |
+| Real Cloudflare generation | **PASS** | `npm run verify:image-live` on 2026-11-25, 12/12: the route estimated 172.8 neurons / $0.001901, generated one 1024×1024 flux image through Workers AI, stored it in R2, listed it, and served it from a presigned playback URL before cleanup. Credential diagnosis: `CLOUDFLARE_API_TOKEN` is a valid, active token but Workers AI rejects it with `401` code `10000` (no Workers AI permission); the project's `CF_API_TOKEN` is the Workers AI token and works. The adapter now accepts `CF_API_TOKEN` as the `CLOUDFLARE_AI_API_TOKEN` fallback |
+| Real Leonardo generation | **BLOCKED** | `LEONARDO_API_KEY` is a 36-character UUID rather than a Leonardo API key (Leonardo keys are long JWTs), and Leonardo returns `401` for both `POST /generations` and `/me`. It cannot work until a real key is issued; the route correctly records the failure and stores no media |
 | Hosted schema | **PASS** | `20261125200000_create_image_generations.sql` applied through the Supabase management API on 2026-11-25; `verify:sql` reports 92/92, including the service-role insert, `42501` for authenticated reads, and `23514` for an unknown provider |
 | Generation UI | **UNVERIFIED** | Not part of this slice; the routes are API-only |
 

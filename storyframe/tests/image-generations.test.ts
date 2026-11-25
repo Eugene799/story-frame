@@ -230,6 +230,20 @@ describe("image generation", () => {
     expect(app.r2.puts).toBe(1);
   });
 
+  it("accepts CF_API_TOKEN as the Workers AI credential", async () => {
+    const app = await startImageApp({}, { CLOUDFLARE_ACCOUNT_ID: "account-1", CF_API_TOKEN: "cf-token" });
+    const projectId = await createProject(app);
+    const models = await api(app, USER_A.token, "GET", "/api/image-models");
+    expect(models.body.models.find((model: any) => model.provider === "cloudflare").configured).toBe(true);
+
+    const generated = await api(app, USER_A.token, "POST", `/api/projects/${projectId}/image-generations`, {
+      modelKey: "cloudflare:flux-1-schnell",
+      prompt: "rain",
+    });
+    expect(generated.status).toBe(201);
+    expect(generated.body.generation.status).toBe("succeeded");
+  });
+
   it("refuses providers without credentials while still offering estimates", async () => {
     const app = await startImageApp({}, {});
     const projectId = await createProject(app);

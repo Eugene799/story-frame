@@ -119,7 +119,8 @@ function value(env: NodeJS.ProcessEnv, name: string): string | null {
 /** Missing credentials mean the provider stays disabled, not an error. */
 export function loadImageProviderSettings(env: NodeJS.ProcessEnv): ImageProviderSettings {
   const accountId = value(env, "CLOUDFLARE_ACCOUNT_ID");
-  const apiToken = value(env, "CLOUDFLARE_AI_API_TOKEN");
+  // CF_API_TOKEN is the project-settings name for the same Workers AI token.
+  const apiToken = value(env, "CLOUDFLARE_AI_API_TOKEN") ?? value(env, "CF_API_TOKEN");
   const leonardoKey = value(env, "LEONARDO_API_KEY");
   return {
     cloudflare: accountId && apiToken ? { accountId, apiToken } : null,

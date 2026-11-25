@@ -33,8 +33,10 @@ const r2 = {
   secretAccessKey: process.env.R2_SECRET_ACCESS_KEY ?? process.env.CLOUDFLARE_SECRET_ACCESS_KEY,
 };
 const cloudflareReady = Boolean(
-  process.env.CLOUDFLARE_ACCOUNT_ID?.trim() && process.env.CLOUDFLARE_AI_API_TOKEN?.trim(),
+  process.env.CLOUDFLARE_ACCOUNT_ID?.trim() &&
+    (process.env.CLOUDFLARE_AI_API_TOKEN?.trim() || process.env.CF_API_TOKEN?.trim()),
 );
+const preferredProvider = process.env.IMAGE_VERIFY_PROVIDER?.trim().toLowerCase();
 const leonardoReady = Boolean(process.env.LEONARDO_API_KEY?.trim());
 const fakeProvider = process.argv.includes("--fake-provider");
 const PNG = Buffer.from(
@@ -191,7 +193,11 @@ async function main(): Promise<number> {
     user = await createUser();
 
     const models = await api(user.token, "GET", "/api/image-models");
-    const modelKey = !fakeProvider && leonardoReady ? "leonardo:phoenix-1.0" : "cloudflare:flux-1-schnell";
+    // Cloudflare wins by default because its request is synchronous and cheap.
+    const useLeonardo =
+      !fakeProvider &&
+      (preferredProvider === "leonardo" || (preferredProvider !== "cloudflare" && !cloudflareReady && leonardoReady));
+    const modelKey = useLeonardo ? "leonardo:phoenix-1.0" : "cloudflare:flux-1-schnell";
     const model = models.body?.models?.find((entry: any) => entry.key === modelKey);
     check(
       "the configured provider's model is listed and enabled",
