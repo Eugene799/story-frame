@@ -740,6 +740,107 @@ describe("Phase 5 planning", () => {
     }
   });
 
+  it("does not abandon a pending attempt while a repair could still be running", async () => {
+    const provider = stubProvider([scriptReply("Should not run.")]);
+    const app = await startTestServer({
+      fetchImpl: provider.impl,
+      env: {
+        AI_TIMEOUT_MS: "60000",
+        AUTH_TIMEOUT_MS: "5000",
+        AI_ABANDON_AFTER_MS: "90000",
+      },
+    });
+    try {
+      const projectId = await createProject(app.url);
+      const pendingKey = "repair-window-key-12345678";
+      app.supabase.usage.push(
+        pendingUsageRow({
+          userId: USER_A.id,
+          projectId,
+          idempotencyKey: pendingKey,
+          requestHash: "repair-window-hash",
+          // Older than one provider call plus overhead, younger than two calls.
+          createdAt: new Date(Date.now() - 100_000).toISOString(),
+        }),
+      );
+
+      const status = await planningStatus(app.url, projectId);
+      expect(await status.json()).toMatchObject({
+        ok: true,
+        inFlight: true,
+        idempotencyKey: pendingKey,
+        abandonAfterMs: 135_000,
+      });
+
+      const blocked = await generate(
+        app.url,
+        projectId,
+        { route: "script", baseVersion: 1 },
+        USER_A.token,
+        "repair-window-new-key-12345678",
+      );
+      expect(blocked.status).toBe(409);
+      expect(await blocked.json()).toMatchObject({
+        ok: false,
+        error: { code: "PLANNING_ATTEMPT_IN_FLIGHT" },
+      });
+      expect(provider.calls).toHaveLength(0);
+      expect(app.supabase.usage[0]).toMatchObject({ status: "pending", error_code: null });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("keeps a same-key retry in progress while a repair could still be running", async () => {
+    const provider = stubProvider([scriptReply("First reply.")]);
+    const app = await startTestServer({
+      fetchImpl: provider.impl,
+      env: {
+        AI_TIMEOUT_MS: "60000",
+        AUTH_TIMEOUT_MS: "5000",
+        AI_ABANDON_AFTER_MS: "90000",
+      },
+    });
+    try {
+      const projectId = await createProject(app.url);
+      const idempotencyKey = "repair-window-same-key-12345678";
+      const first = await generate(
+        app.url,
+        projectId,
+        { route: "script", baseVersion: 1 },
+        USER_A.token,
+        idempotencyKey,
+      );
+      expect(first.status).toBe(201);
+      expect(provider.calls).toHaveLength(1);
+
+      // Make the stored attempt look 100 seconds old: past the single-call
+      // window, still inside the two-call planning window.
+      const row = app.supabase.usage[0];
+      row.status = "pending";
+      row.created_at = new Date(Date.now() - 100_000).toISOString();
+      row.response_body = null;
+      row.response_status = null;
+
+      const replay = await generate(
+        app.url,
+        projectId,
+        { route: "script", baseVersion: 1 },
+        USER_A.token,
+        idempotencyKey,
+      );
+      expect(replay.status).toBe(409);
+      expect(await replay.json()).toMatchObject({
+        ok: false,
+        error: { code: "IDEMPOTENCY_IN_PROGRESS" },
+      });
+      expect(provider.calls).toHaveLength(1);
+      expect(app.supabase.usage[0]).toMatchObject({ status: "pending", error_code: null });
+    } finally {
+      await app.close();
+    }
+  });
+
   it("settles a stale project attempt before reserving a new key", async () => {
     const provider = stubProvider([scriptReply("After the stale attempt.")]);
     const app = await startTestServer({ fetchImpl: provider.impl });

@@ -1,7 +1,11 @@
 import { resolveModels, type ResolvedModel } from "./models";
 import { loadMediaLimits, type MediaLimits } from "./media";
 import { OLLAMA_BASE_URL } from "./ollama";
-import { resolvePlanningRoutes, type ResolvedPlanningRoute } from "./planning";
+import {
+  MAX_PLANNING_PROVIDER_CALLS,
+  resolvePlanningRoutes,
+  type ResolvedPlanningRoute,
+} from "./planning";
 import type { R2Config } from "./r2";
 
 export interface AppConfig {
@@ -17,6 +21,8 @@ export interface AppConfig {
   maxOutputTokens: number;
   requestsPerMinute: number;
   abandonAfterMs: number;
+  /** Covers the initial planning call plus its one repair. */
+  planningAbandonAfterMs: number;
   models: ResolvedModel[];
   r2: R2Config | null;
   media: MediaLimits;
@@ -102,6 +108,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     intEnv(env, "AI_ABANDON_AFTER_MS", 90000, 30000, 3600000),
     providerTimeoutMs + 3 * authTimeoutMs,
   );
+  const planningAbandonAfterMs = Math.max(
+    abandonAfterMs,
+    MAX_PLANNING_PROVIDER_CALLS * providerTimeoutMs + 3 * authTimeoutMs,
+  );
 
   return {
     apiKey: stringEnv(env, "OLLAMA_API_KEY"),
@@ -117,6 +127,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     maxOutputTokens: intEnv(env, "AI_MAX_OUTPUT_TOKENS", 120, 16, 512),
     requestsPerMinute: intEnv(env, "AI_MAX_REQUESTS_PER_MINUTE", 6, 1, 60),
     abandonAfterMs,
+    planningAbandonAfterMs,
     models: resolveModels(env),
     r2: r2Config(env),
     media: loadMediaLimits(env),

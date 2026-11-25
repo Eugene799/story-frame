@@ -26,4 +26,15 @@ describe("abandon threshold", () => {
   it("honors a longer explicit threshold", () => {
     expect(loadConfig({ AI_ABANDON_AFTER_MS: "600000" }).abandonAfterMs).toBe(600_000);
   });
+
+  it("sizes the planning window for the disclosed repair call", () => {
+    const config = loadConfig({
+      AI_ABANDON_AFTER_MS: "30000",
+      AI_TIMEOUT_MS: "60000",
+      AUTH_TIMEOUT_MS: "5000",
+    });
+
+    expect(config.abandonAfterMs).toBe(60_000 + 3 * 5_000);
+    expect(config.planningAbandonAfterMs).toBe(2 * 60_000 + 3 * 5_000);
+  });
 });

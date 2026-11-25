@@ -28,6 +28,10 @@ import { requestChat } from "./ollama";
  * and is never applied to the project until the caller accepts it.
  */
 
+// One initial reply plus at most one disclosed repair. The server's pending
+// attempt window must cover both bounded requests.
+export const MAX_PLANNING_PROVIDER_CALLS = 2;
+
 export const PLANNING_LIMITS = {
   instructionChars: 500,
   summaryChars: 2000,

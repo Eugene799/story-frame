@@ -176,7 +176,7 @@ anon) key; never the service-role key.
 | `OLLAMA_MODEL_*` | Optional exact-request-id overrides for the six families. |
 | `AI_ROUTE_ANGLES`, `AI_ROUTE_SCRIPT`, `AI_ROUTE_STORYBOARD`, `AI_ROUTE_AD_CONCEPT`, `AI_ROUTE_TRANSCRIPT_ANALYSIS` | Planning route override, naming a family key from the allowlist (`gemma`, `deepseek`, `glm`, `gpt-oss`, `minimax`). The default for every route is `gemma`; a value that is unknown, disabled, or lacks the capability disables that route instead of falling back. |
 | `AI_TIMEOUT_MS`, `AI_MAX_PROMPT_CHARS`, `AI_MAX_OUTPUT_TOKENS`, `AI_MAX_REQUESTS_PER_MINUTE` | Optional bounds. |
-| `AI_ABANDON_AFTER_MS` | Age at which a pending reservation may be settled as abandoned instead of retried (default 90000, floored at the provider timeout plus three auth timeouts). |
+| `AI_ABANDON_AFTER_MS` | Age at which a pending reservation may be settled as abandoned instead of retried (default 90000, floored at the provider timeout plus three auth timeouts). Planning uses a wider floor of two provider timeouts plus three auth timeouts, covering its initial call and one repair. |
 | `APP_ORIGIN` | Optional additional origin restriction for API calls. |
 | `SMOKE_SUPABASE_ACCESS_TOKEN` | Only for `npm run smoke:live`; a valid session token. Never commit it. |
 | `R2_ENDPOINT` | R2 S3 endpoint (`https://<account-id>.r2.cloudflarestorage.com`). `CLOUDFLARE_S3_ENDPOINT_URL` is accepted as a fallback. |
@@ -533,7 +533,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 210/210; `verify:sql` 81/81; `verify:live-routes` 51/51; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 213/213; `verify:sql` 81/81; `verify:live-routes` 51/51; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -612,8 +612,9 @@ verified user id, the key, a hash of the route, configured model, and exact prom
 completed attempt stores its `{ ok, proposal }` body, so a retry with the same key returns the same proposal without a
 second provider call or a duplicate proposal row; a refused reply is stored and replayed too. Reusing the key for a
 different route, instruction, or document returns `409 IDEMPOTENCY_KEY_REUSED`; a still-running attempt returns `409
-IDEMPOTENCY_IN_PROGRESS`; an attempt older than `AI_ABANDON_AFTER_MS` is settled as `REQUEST_ABANDONED` without calling
-the provider. The key is scoped to the verified account and the project: the same key from another account, or in
+IDEMPOTENCY_IN_PROGRESS`; an attempt older than the planning window is settled as `REQUEST_ABANDONED` without calling
+the provider. The planning window is the larger of `AI_ABANDON_AFTER_MS` and two provider timeouts plus three auth
+timeouts, so the initial call and its one repair both fit. The key is scoped to the verified account and the project: the same key from another account, or in
 another project with an identical document, is a separate attempt and can never read the first attempt's response.
 The ledger row records `project_id`, and a partial unique index allows only one `pending` attempt per project, so two
 near-simultaneous reservations cannot both start a paid call.
@@ -621,7 +622,7 @@ near-simultaneous reservations cannot both start a paid call.
 **One attempt per project, across devices.** Before a new paid call, `GET /api/projects/:id/planning/status` reports the
 project's live pending attempt for the verified owner. A live attempt with a different key blocks generation with `409
 PLANNING_ATTEMPT_IN_FLIGHT`; the same key is allowed so Retry can replay its own attempt. An attempt older than the
-configured abandon window is settled as `REQUEST_ABANDONED` first, exactly like same-key recovery. The browser also
+planning abandon window is settled as `REQUEST_ABANDONED` first, exactly like same-key recovery. The browser also
 calls this preflight before acquiring its local lease, so a stale tab on another device, or a browser without
 BroadcastChannel, is blocked by the server instead of only by `localStorage`. The response's `abandonAfterMs` sizes
 the new local lease, matching the server window (90 seconds by default).
@@ -654,7 +655,7 @@ so it writes no ledger row and does not consume the key.
 | Planning is owner-scoped | **PASS** | Another account gets `404` on generate and on accept, and the provider is not called |
 | Planning calls are metered and replayable | **PASS** | Generating stores one `ai_usage` row (`model_id: gemma`, `configured_model: gemma4:31b`, `response_status: 201`) and a retry with the same key returns the same proposal id after exactly one provider call and one proposal row |
 | Key reuse and account scoping | **PASS** | The same key with a different instruction is `409 IDEMPOTENCY_KEY_REUSED` with no second call; the same key from another account is a separate attempt, and each account replays only its own proposal |
-| One live attempt per project, across devices | **PASS** | `tests/planning.test.ts`: the status preflight reports another device's pending key and start time, another account gets `404`, a new key is `409 PLANNING_ATTEMPT_IN_FLIGHT` with zero provider calls, and a stale pending row is settled before the new key is reserved. A race test hides the preflight's pending read so the unique index rejects the second reservation, then asserts the route still returns the in-flight `409`. `tests/usage.test.ts` reserves two keys for one project directly against the ledger and gets `project_busy` for the second. `verify:sql` proves the partial unique index rejects a second pending row for the project while another project can reserve one |
+| One live attempt per project, across devices | **PASS** | `tests/planning.test.ts`: the status preflight reports another device's pending key and start time, another account gets `404`, a new key is `409 PLANNING_ATTEMPT_IN_FLIGHT` with zero provider calls, and a stale pending row is settled before the new key is reserved. Repair-window tests age a pending attempt past the old single-call window: the status route still reports it live, a second key is refused without a provider call or abandonment, and a same-key retry returns `IDEMPOTENCY_IN_PROGRESS` instead of settling the row. A race test hides the preflight's pending read so the unique index rejects the second reservation, then asserts the route still returns the in-flight `409`. `tests/usage.test.ts` reserves two keys for one project directly against the ledger and gets `project_busy` for the second. `verify:sql` proves the partial unique index rejects a second pending row for the project while another project can reserve one |
 | Browser lease matches the server abandon window | **PASS** | `tests/planning-panel.test.tsx`: a server `abandonAfterMs` of 120 seconds produces a lease about 120 seconds out, a remote pending attempt disables Generate and makes no `/planning` call, and the same key reported by preflight is allowed so Retry can replay |
 | Refused replies are recorded and replayed | **PASS** | Invalid twice stores an `ai_usage` error row (`PLANNING_INVALID_JSON`, `422`), and a retry with that key replays the `422` without another provider call |
 | Planning without a key is refused | **PASS** | A request with no `Idempotency-Key` is `400 IDEMPOTENCY_KEY_REQUIRED` before the provider or the ledger is touched |
@@ -916,8 +917,8 @@ the document-delete guard and project-deletion object cleanup.
   51/51 checks after the preflight migration; the disposable users were deleted afterwards. Rerun these checks with
   `npm run verify:live-routes`. `smoke:live` exposed a live-only missing-column
   bug; after the fix a clean five-call run exited 0 with 5/5 families and an identical stored replay.
-- Pending reservations are recovered lazily, when a retry with the same key arrives after `AI_ABANDON_AFTER_MS` or a
-  preflight for the project sees a stale row. There is no background sweeper, so a project nobody retries stays
+- Pending reservations are recovered lazily, when a retry with the same key arrives after the applicable abandon window
+  or a preflight for the project sees a stale row. There is no background sweeper, so a project nobody retries stays
   `pending` until its next attempt or status check, and the original attempt's outcome is never learned: the row
   becomes a terminal `error` with `REQUEST_ABANDONED`, no token counts, and zero latency. Recovery never calls the
   provider, so it cannot bill twice, but it cannot tell you whether the original attempt was charged.

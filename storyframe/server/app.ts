@@ -1115,7 +1115,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
 
   function planningAttemptIsStale(createdAt: string): boolean {
     const startedAtMs = Date.parse(createdAt);
-    return !Number.isFinite(startedAtMs) || now() - startedAtMs >= config.abandonAfterMs;
+    return !Number.isFinite(startedAtMs) || now() - startedAtMs >= config.planningAbandonAfterMs;
   }
 
   /** Preflight result for this project; the project lookup proves ownership first. */
@@ -1140,7 +1140,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       inFlight: live !== null,
       idempotencyKey: live?.idempotencyKey ?? null,
       startedAt: live?.createdAt ?? null,
-      abandonAfterMs: config.abandonAfterMs,
+      abandonAfterMs: config.planningAbandonAfterMs,
     };
     sendJson(response, 200, body);
   }
@@ -1179,7 +1179,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       await ledger.abandon({
         id: pending.id,
         userId,
-        startedBefore: new Date(now() - config.abandonAfterMs).toISOString(),
+        startedBefore: new Date(now() - config.planningAbandonAfterMs).toISOString(),
         completion: {
           status: "error",
           returnedModel: null,
@@ -1438,9 +1438,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
 
     let existing = initial;
     if (existing.status === "pending") {
-      const startedAtMs = Date.parse(existing.createdAt);
-      const isStale = Number.isFinite(startedAtMs) && now() - startedAtMs >= config.abandonAfterMs;
-      if (!isStale) {
+      if (!planningAttemptIsStale(existing.createdAt)) {
         throw new HttpError(
           409,
           "IDEMPOTENCY_IN_PROGRESS",
@@ -1452,7 +1450,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       const settled = await target.abandon({
         id: existing.id,
         userId: user.id,
-        startedBefore: new Date(now() - config.abandonAfterMs).toISOString(),
+        startedBefore: new Date(now() - config.planningAbandonAfterMs).toISOString(),
         completion: {
           status: "error",
           returnedModel: null,
