@@ -29,6 +29,8 @@ export interface AppConfig {
   media: MediaLimits;
   /** Phase 6 provider keys, cache windows, and import bounds. */
   stock: StockLimits;
+  /** Phase 7 generation polling bounds; credentials are read separately. */
+  image: { pollIntervalMs: number; pollTimeoutMs: number; downloadTimeoutMs: number };
   /** One configured model per planning route; see Phase 5 in the README. */
   planning: { routes: ResolvedPlanningRoute[] };
 }
@@ -137,6 +139,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     r2: r2Config(env),
     media,
     stock: loadStockLimits(env, media),
+    image: {
+      pollIntervalMs: intEnv(env, "IMAGE_POLL_INTERVAL_MS", 1500, 100, 10000),
+      pollTimeoutMs: intEnv(env, "IMAGE_GENERATION_TIMEOUT_MS", 60000, 1000, 300000),
+      downloadTimeoutMs: intEnv(env, "IMAGE_DOWNLOAD_TIMEOUT_MS", 30000, 1000, 120000),
+    },
     planning: { routes: planningRoutes(env) },
   };
 }

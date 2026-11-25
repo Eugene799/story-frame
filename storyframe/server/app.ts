@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   createServer as createHttpServer,
   type IncomingMessage,
@@ -44,6 +44,22 @@ import {
 import { ApiError } from "./api-error";
 import type { MediaRecord } from "../shared/media-contract";
 import { buildProjectExport } from "../shared/project-export";
+import type { ImageBillingView } from "../shared/image-generation-contract";
+import {
+  IMAGE_MODELS,
+  fetchLeonardoGeneration,
+  generateWithCloudflare,
+  isImageProviderConfigured,
+  loadImageProviderSettings,
+  startLeonardoGeneration,
+} from "./image-providers";
+import {
+  createSupabaseImageGenerationStore,
+  estimateImageGeneration,
+  parseImageGenerationInput,
+  resolveImageRequest,
+  type ImageGenerationStore,
+} from "./image-generations";
 import {
   MEDIA_NOT_FOUND_MESSAGE,
   createSupabaseMediaStore,
@@ -470,6 +486,17 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
 
   const mediaObjects: R2Client | null = config.r2 ? createR2Client(config.r2, { fetchImpl, now }) : null;
 
+  const imageStore: ImageGenerationStore | null =
+    config.supabaseUrl && config.supabaseServiceRoleKey
+      ? createSupabaseImageGenerationStore({
+          url: config.supabaseUrl,
+          serviceRoleKey: config.supabaseServiceRoleKey,
+          timeoutMs: config.authTimeoutMs,
+        })
+      : null;
+  // Credentials stay in this process; the store records only the model and job.
+  const imageSettings = loadImageProviderSettings(options.env ?? process.env);
+
   const stockCache: StockCacheStore | null =
     config.supabaseUrl && config.supabaseServiceRoleKey
       ? createSupabaseStockCache({
@@ -570,6 +597,12 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     if (path === "/api/stock/search" || path === "/stock/search") {
       if (method !== "GET") throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for stock search.");
       await handleStockSearch(request, response, requestUrl);
+      return;
+    }
+
+    if (path === "/api/image-models") {
+      if (method !== "GET") throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for the image models.");
+      await handleImageModels(request, response);
       return;
     }
 
@@ -699,6 +732,17 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     return mediaStore;
   }
 
+  function requireImageStore(): ImageGenerationStore {
+    if (!imageStore) {
+      throw new HttpError(
+        503,
+        "IMAGE_STORE_UNAVAILABLE",
+        "The image generation store is not configured on the server. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.",
+      );
+    }
+    return imageStore;
+  }
+
   function requireMediaObjects(): R2Client {
     if (!mediaObjects) {
       throw new HttpError(
@@ -756,6 +800,324 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     const input = parseStockSearchInput(requestUrl.searchParams, config.stock);
     if (!stockCache) log.error("[stock] STOCK_CACHE_NOT_CONFIGURED");
     sendJson(response, 200, await searchStock(input));
+  }
+
+  function imageBillingView(model: (typeof IMAGE_MODELS)[number]): ImageBillingView {
+    const billing = model.billing;
+    if (billing.kind === "neurons") {
+      return {
+        kind: "neurons",
+        usdPerThousandNeurons: billing.usdPerThousandNeurons,
+        neuralRates: { perTile: billing.neuronsPerTile, perStep: billing.neuronsPerStep },
+        note: `${billing.freeDailyNeurons.toLocaleString("en-US")} free neurons per day at the account level.`,
+        sourceUrl: billing.sourceUrl,
+        verifiedOn: billing.verifiedOn,
+      };
+    }
+    return {
+      kind: "api-credit",
+      note: billing.note,
+      sourceUrl: billing.sourceUrl,
+      verifiedOn: billing.verifiedOn,
+    };
+  }
+
+  async function handleImageModels(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    checkOrigin(request);
+    await authenticate(request);
+    sendJson(response, 200, {
+      ok: true,
+      models: IMAGE_MODELS.map((model) => ({
+        key: model.key,
+        provider: model.provider,
+        label: model.label,
+        width: model.width,
+        height: model.height,
+        steps: model.steps,
+        maxPromptChars: model.maxPromptChars,
+        // Always listed; a missing credential disables generation, not discovery.
+        configured: isImageProviderConfigured(imageSettings, model.provider),
+        billing: imageBillingView(model),
+      })),
+    });
+  }
+
+  async function handleImageEstimate(
+    request: IncomingMessage,
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+  ): Promise<void> {
+    await requireProjects().get(user.id, projectId);
+    const input = parseImageGenerationInput(await readJsonBody(request, PROJECT_LIMITS.bodyBytes));
+    const estimate = estimateImageGeneration(resolveImageRequest(input));
+    sendJson(response, 200, { ok: true, estimate });
+  }
+
+  /**
+   * Polls Leonardo until its job leaves PENDING or the configured deadline
+   * passes. A still-pending job is returned so the caller can refresh later;
+   * no provider call is retried and the record keeps its job id.
+   */
+  async function waitForLeonardo(jobId: string): Promise<{ status: "pending" | "succeeded" | "failed"; imageUrls: string[] }> {
+    const deadline = now() + config.image.pollTimeoutMs;
+    for (;;) {
+      const status = await fetchLeonardoGeneration(imageSettings, jobId, {
+        fetchImpl,
+        timeoutMs: Math.min(30_000, config.image.pollTimeoutMs),
+      });
+      if (status.status !== "pending" || now() >= deadline) return status;
+      await new Promise((resolve) => setTimeout(resolve, config.image.pollIntervalMs));
+    }
+  }
+
+  /** Only the documented Leonardo asset host; redirects are not followed. */
+  async function downloadGeneratedImage(target: string): Promise<{ bytes: Buffer; contentType: string }> {
+    let url: URL;
+    try {
+      url = new URL(target);
+    } catch {
+      throw new HttpError(502, "IMAGE_ASSET_INVALID", "The provider returned an unreadable image URL.");
+    }
+    if (url.protocol !== "https:" || url.hostname !== "cdn.leonardo.ai") {
+      throw new HttpError(502, "IMAGE_ASSET_HOST_REFUSED", "The generated image is not on the allowed asset host.");
+    }
+    let downloaded: Response;
+    try {
+      downloaded = await (fetchImpl ?? fetch)(url, {
+        redirect: "error",
+        signal: AbortSignal.timeout(config.image.downloadTimeoutMs),
+      });
+    } catch {
+      throw new HttpError(502, "IMAGE_ASSET_UNAVAILABLE", "The generated image could not be downloaded.");
+    }
+    if (!downloaded.ok) {
+      throw new HttpError(502, "IMAGE_ASSET_UNAVAILABLE", `The generated image returned HTTP ${downloaded.status}.`);
+    }
+    const declared = Number(downloaded.headers.get("content-length") ?? "0");
+    if (Number.isFinite(declared) && declared > config.media.imageBytes) {
+      throw new HttpError(413, "MEDIA_TOO_LARGE", "The generated image exceeds the image size limit.");
+    }
+    const bytes = Buffer.from(await downloaded.arrayBuffer());
+    if (bytes.length > config.media.imageBytes) {
+      throw new HttpError(413, "MEDIA_TOO_LARGE", "The generated image exceeds the image size limit.");
+    }
+    const detected = detectMediaType(bytes);
+    if (!detected || detected.kind !== "image") {
+      throw new HttpError(502, "IMAGE_ASSET_INVALID", "The generated file is not an image.");
+    }
+    return { bytes, contentType: detected.contentType };
+  }
+
+  /**
+   * Writes generated bytes through the same private-media path as an upload:
+   * pending row, presigned PUT, HEAD check, then markReady. A failure discards
+   * both the object and the row.
+   */
+  async function persistGeneratedImage(
+    ownerId: string,
+    projectId: string,
+    bytes: Buffer,
+    contentType: string,
+  ): Promise<MediaRecord> {
+    const store = requireMediaStore();
+    const objects = requireMediaObjects();
+    if (bytes.length > config.media.imageBytes) {
+      throw new HttpError(413, "MEDIA_TOO_LARGE", "The generated image exceeds the image size limit.");
+    }
+    const mediaId = newMediaId();
+    const objectKey = mediaObjectKey(ownerId, mediaId);
+    const upload = objects.presignPut(objectKey, config.media.uploadUrlSeconds);
+    const uploadExpiresAt = new Date(
+      now() + Math.min(config.media.uploadTtlMs, config.media.uploadUrlSeconds * 1000),
+    ).toISOString();
+    await store.createPending(ownerId, projectId, {
+      id: mediaId,
+      kind: "image",
+      contentType,
+      byteSize: bytes.length,
+      sceneKey: null,
+      objectKey,
+      uploadExpiresAt,
+      provenance: null,
+    });
+    try {
+      const put = await (fetchImpl ?? fetch)(upload.url, {
+        method: "PUT",
+        headers: { "Content-Type": contentType },
+        body: new Uint8Array(bytes),
+        signal: AbortSignal.timeout(config.image.downloadTimeoutMs),
+      });
+      if (!put.ok) {
+        throw new HttpError(502, "MEDIA_STORAGE_UNAVAILABLE", "Private storage rejected the generated image.");
+      }
+      const head = await requireMediaBucket(() => objects.head(objectKey));
+      if (head === null) {
+        throw new HttpError(502, "MEDIA_STORAGE_UNAVAILABLE", "The generated image was not stored.");
+      }
+      const media = await store.markReady(ownerId, projectId, mediaId, { contentType, byteSize: head.byteSize });
+      if (!media) {
+        throw new HttpError(409, "IMAGE_MEDIA_STATE_CHANGED", "The generated asset changed while it was stored.");
+      }
+      return media;
+    } catch (error) {
+      await discardMedia(store, objects, ownerId, projectId, mediaId, objectKey);
+      throw error;
+    }
+  }
+
+  async function handleImageGenerationList(
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+  ): Promise<void> {
+    await requireProjects().get(user.id, projectId);
+    const generations = await requireImageStore().list(user.id, projectId, 50);
+    sendJson(response, 200, { ok: true, generations });
+  }
+
+  async function handleImageGenerate(
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+    request: IncomingMessage,
+  ): Promise<void> {
+    const store = requireImageStore();
+    await requireProjects().get(user.id, projectId);
+    const input = parseImageGenerationInput(await readJsonBody(request, PROJECT_LIMITS.bodyBytes));
+    const resolved = resolveImageRequest(input);
+    if (!isImageProviderConfigured(imageSettings, resolved.model.provider)) {
+      throw new HttpError(
+        503,
+        "IMAGE_PROVIDER_DISABLED",
+        `${resolved.model.label} is disabled because its provider credentials are not configured.`,
+      );
+    }
+    const estimate = estimateImageGeneration(resolved);
+    const generation = await store.create(user.id, {
+      id: randomUUID(),
+      projectId,
+      provider: resolved.model.provider,
+      modelKey: resolved.model.key,
+      prompt: resolved.prompt,
+      settings: { width: resolved.width, height: resolved.height, steps: resolved.steps },
+      estimatedUsd: estimate.estimatedUsd,
+      estimatedNeurons: estimate.estimatedNeurons,
+      rateVersion: estimate.rateVersion,
+    });
+
+    const fail = async (error: unknown): Promise<never> => {
+      const code =
+        error instanceof HttpError || error instanceof ApiError ? error.code : "IMAGE_GENERATION_FAILED";
+      await store
+        .update(user.id, projectId, generation.id, { status: "failed", errorCode: code })
+        .catch(() => undefined);
+      throw error;
+    };
+
+    try {
+      let bytes: Buffer;
+      let contentType: string;
+      let jobId: string | null = null;
+
+      if (resolved.model.provider === "cloudflare") {
+        const result = await generateWithCloudflare(
+          imageSettings,
+          {
+            modelKey: resolved.model.key,
+            prompt: resolved.prompt,
+            ...(resolved.steps === null ? {} : { steps: resolved.steps }),
+          },
+          { fetchImpl, timeoutMs: config.image.pollTimeoutMs },
+        );
+        bytes = result.bytes;
+        contentType = result.contentType;
+      } else {
+        const started = await startLeonardoGeneration(
+          imageSettings,
+          {
+            modelKey: resolved.model.key,
+            prompt: resolved.prompt,
+            width: resolved.width,
+            height: resolved.height,
+          },
+          { fetchImpl, timeoutMs: Math.min(30_000, config.image.pollTimeoutMs) },
+        );
+        jobId = started.jobId;
+        await store.update(user.id, projectId, generation.id, { jobId });
+        const polled = await waitForLeonardo(jobId);
+        if (polled.status === "pending") {
+          const pending = await store.get(user.id, projectId, generation.id);
+          sendJson(response, 202, { ok: true, generation: pending ?? generation, media: null });
+          return;
+        }
+        if (polled.status !== "succeeded" || polled.imageUrls.length === 0) {
+          throw new HttpError(502, "IMAGE_PROVIDER_FAILED", "The provider reported no completed image.");
+        }
+        const download = await downloadGeneratedImage(polled.imageUrls[0]);
+        bytes = download.bytes;
+        contentType = download.contentType;
+      }
+
+      const media = await persistGeneratedImage(user.id, projectId, bytes, contentType);
+      const updated = await store.update(user.id, projectId, generation.id, {
+        status: "succeeded",
+        mediaId: media.id,
+        jobId,
+      });
+      if (!updated) {
+        throw new HttpError(503, "IMAGE_STORE_UNAVAILABLE", "The image store did not confirm the generation.");
+      }
+      sendJson(response, 201, { ok: true, generation: updated, media });
+    } catch (error) {
+      return fail(error);
+    }
+  }
+
+  async function handleImageRefresh(
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+    generationId: string,
+  ): Promise<void> {
+    const store = requireImageStore();
+    await requireProjects().get(user.id, projectId);
+    const generation = await store.get(user.id, projectId, generationId);
+    if (!generation) {
+      throw new HttpError(404, "IMAGE_GENERATION_NOT_FOUND", "No generation with that id is in this project.");
+    }
+    if (generation.status !== "pending" || !generation.jobId) {
+      throw new HttpError(409, "IMAGE_GENERATION_NOT_PENDING", "Only a pending generation can be refreshed.");
+    }
+    const polled = await waitForLeonardo(generation.jobId);
+    if (polled.status === "pending") {
+      sendJson(response, 202, { ok: true, generation, media: null });
+      return;
+    }
+    if (polled.status !== "succeeded" || polled.imageUrls.length === 0) {
+      const failed = await store.update(user.id, projectId, generation.id, {
+        status: "failed",
+        errorCode: "IMAGE_PROVIDER_FAILED",
+      });
+      sendJson(response, 200, { ok: true, generation: failed ?? generation, media: null });
+      return;
+    }
+    try {
+      const download = await downloadGeneratedImage(polled.imageUrls[0]);
+      const media = await persistGeneratedImage(user.id, projectId, download.bytes, download.contentType);
+      const updated = await store.update(user.id, projectId, generation.id, {
+        status: "succeeded",
+        mediaId: media.id,
+      });
+      sendJson(response, 200, { ok: true, generation: updated ?? generation, media });
+    } catch (error) {
+      const code =
+        error instanceof HttpError || error instanceof ApiError ? error.code : "IMAGE_GENERATION_FAILED";
+      await store
+        .update(user.id, projectId, generation.id, { status: "failed", errorCode: code })
+        .catch(() => undefined);
+      throw error;
+    }
   }
 
   async function handleStockImport(
@@ -999,6 +1361,34 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to accept a planning proposal.");
       }
       await handleProposalAccept(response, user, projectId, segments[2]);
+      return;
+    }
+
+    if (segments.length === 2 && segments[1] === "image-generations") {
+      if (method === "GET") {
+        await handleImageGenerationList(response, user, projectId);
+        return;
+      }
+      if (method === "POST") {
+        await handleImageGenerate(response, user, projectId, request);
+        return;
+      }
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET or POST for image generations.");
+    }
+
+    if (segments.length === 3 && segments[1] === "image-generations" && segments[2] === "estimate") {
+      if (method !== "POST") {
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to estimate an image generation.");
+      }
+      await handleImageEstimate(request, response, user, projectId);
+      return;
+    }
+
+    if (segments.length === 4 && segments[1] === "image-generations" && segments[3] === "refresh") {
+      if (method !== "POST") {
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to refresh a pending generation.");
+      }
+      await handleImageRefresh(response, user, projectId, segments[2]);
       return;
     }
 

@@ -204,6 +204,9 @@ anon) key; never the service-role key.
 | `STOCK_PROVIDER_TIMEOUT_MS`, `STOCK_PAGE_SIZE`, `STOCK_MAX_PAGE`, `STOCK_QUERY_MAX_CHARS` | Provider timeout and search bounds (defaults 8000 ms, 20 results per provider, page 50, 80 characters). |
 | `STOCK_PEXELS_CACHE_SECONDS`, `STOCK_PIXABAY_CACHE_SECONDS` | Durable page-cache windows (defaults 3600 and 86400). Pixabay is never below 86400, the provider's caching requirement. |
 | `STOCK_CACHE_PAYLOAD_BYTES`, `STOCK_CACHE_LEASE_MS`, `STOCK_CACHE_WAIT_MS` | Maximum cached page size, claim-lease length, and how long a concurrent request waits for the claim holder. |
+| `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_AI_API_TOKEN` | Cloudflare Workers AI credentials for image generation. Read only in the Node process. |
+| `LEONARDO_API_KEY` | Leonardo API key. Read only in the Node process and never stored in a generation row. |
+| `IMAGE_POLL_INTERVAL_MS`, `IMAGE_GENERATION_TIMEOUT_MS`, `IMAGE_DOWNLOAD_TIMEOUT_MS` | Leonardo poll cadence, the poll deadline before a `202` is returned, and the provider image download timeout (defaults 1500, 60000, and 30000 ms). |
 | `STOCK_IMPORT_TIMEOUT_MS`, `STOCK_IMPORT_REDIRECTS` | Import download timeout and redirect bound (defaults 30000 ms, 3 hops). |
 
 `.env` is git-ignored; `.env.example` contains placeholders only. Only public Supabase auth configuration uses a
@@ -746,8 +749,8 @@ document, unique stock credits, and a render payload with per-scene credited ass
 **Status.** Every Phase 6 contract item is implemented and exercised: one protected search endpoint with normalized
 results, per-provider pagination surfaced in the UI, the durable shared cache with Pixabay's 24-hour window, a
 controlled import with provenance, credited exports, and live acceptance runs for real image/video search and import.
-Phase 7 (Cloudflare Workers AI and Leonardo image generation) is the next milestone; it is a separate provider task with
-its own credentials and is not started in this change.
+Phase 7 (Cloudflare Workers AI and Leonardo image generation) has begun: the protected estimate/generate/refresh routes,
+the `image_generations` record, and R2 persistence are in place; a generation UI is not.
 
 ### Phase 6 verification (2026-11-25)
 
@@ -765,13 +768,47 @@ its own credentials and is not started in this change.
 | Import into a hosted project | **PASS** | `npm run verify:stock-routes-live` on 2026-11-25 against hosted Supabase and the real `story-frame` bucket: a selected image imported `201` with `ready` media and provenance, a repeat import returned the same media (`200`, `reused: true`) without a second object, it appeared in the media list with that provenance, a draft referencing it exported with the stored creator, provider, source page, and license in `credits` and the per-scene render payload, it returned a presigned playback URL, deleted `200` with its object, and the deleted row stopped being ready; 23/23 checks, including cache rows and cleanup |
 | Hosted schema | **PASS** | `20261125160000_add_stock_media.sql` applied through the Supabase management API on 2026-11-25; the catalog reports `media_metadata.provenance` plus its object constraint, `stock_search_cache` with RLS on, `service_role` grants, and zero `authenticated` grants; `media_metadata_ready_stock_import_key` was applied on 2026-11-25 after confirming the hosted data had no duplicate ready groups; `verify:stock-routes-live` then wrote and read both through the routes |
 
-### Phase 7: image generation scaffold (2026-11-25)
+### Phase 7: image generation route (2026-11-25)
 
 `server/image-providers.ts` contains separate Cloudflare Workers AI and Leonardo adapters with a small verified model
-catalog. They are **not routed and not enabled**: there is no generation route, prompt UI, cost estimate, or R2
-persistence yet, and no live generation was attempted. An adapter refuses with `503 IMAGE_PROVIDER_DISABLED` unless its
-own credentials are set (`CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_AI_API_TOKEN`, or `LEONARDO_API_KEY`), so an absent
-provider stays clearly disabled rather than silently switching to the other.
+catalog. Generation is never automatic: a caller reads the models, asks for an estimate, then explicitly posts a
+generation. The server resolves and validates the prompt and settings before creating one `image_generations` row, calls
+exactly the selected provider, and stores the returned bytes in R2 through the same private-media path as an upload. If
+the provider is not configured the route refuses with `503 IMAGE_PROVIDER_DISABLED`; there is no fallback provider.
+
+| Route | Method | Behavior |
+| --- | --- | --- |
+| `/api/image-models` | GET | Signed-in catalog with prompt/step/size limits, per-provider `configured`, and the verified billing view. Listing works while a provider is disabled. |
+| `/api/projects/:id/image-generations/estimate` | POST | Validates the input, returns dimensions, steps, estimated neurons, estimated USD (or `null` for Leonardo), the rate version, and the billing note. No provider call, no row. |
+| `/api/projects/:id/image-generations` | POST | Re-checks credentials, creates a `pending` row (prompt, provider, model, settings, estimate, rate version), generates, persists the image as `image`, and returns `201` with the settled record and media. A Leonardo job still pending at the poll deadline returns `202` with its job id. |
+| `/api/projects/:id/image-generations/:generationId/refresh` | POST | Polls the stored Leonardo job id; `202` while pending, then stores the image and settles the row. |
+| `/api/projects/:id/image-generations` | GET | Most recent 50 generations for the project. |
+
+Input is limited to a known `modelKey`, a non-empty prompt within the model's limit, and optional dimensions/steps
+that the model accepts (Cloudflare fixes 1024×1024; Leonardo accepts 32–2048 px in multiples of 8). A failed provider
+call, unreadable image, refused download host, or storage failure marks the row `failed` with a sanitized code; the
+provider key is never returned. Leonardo downloads are restricted to `https://cdn.leonardo.ai` without redirects, and
+the bytes are re-detected as an image before upload. Generated media has no stock provenance: the `image_generations`
+row itself is the generation record.
+
+| Route check | Evidence |
+| --- | --- |
+| Estimate is deterministic and free | `tests/image-generations.test.ts`: Flux at 1024²/4 steps reports 172.8 neurons and $0.001901 from the verified rate; no generation row and no provider/R2 write |
+| Explicit generation stores everything | Cloudflare generation returns `201` with prompt, model, settings, job marker, rate version, estimate, and a `ready` image; exactly one R2 put, one `image_generations` row, and one listed media row |
+| Leonardo job lifecycle | A polled job stores its job id, downloads from the CDN, and settles ready; a job still pending at the deadline returns `202` and a later refresh completes it |
+| Disabled providers stay disabled | With no credentials both models report `configured: false`, estimates still work, and generation is `503 IMAGE_PROVIDER_DISABLED` with no row or write |
+| Failures are sanitized and recorded | A provider `500` returns `502 IMAGE_PROVIDER_FAILED`, the record is `failed`, no media row exists, and the message does not contain the key |
+| Another account's project is refused | User B gets `404` for User A's project and no row is created |
+
+### Phase 7 verification (2026-11-25)
+
+| Criterion | Status | Evidence |
+| --- | --- | --- |
+| Route, record, and R2 persistence on hosted services | **PASS** | `npm run verify:image-routes-live` against hosted Supabase and the real `story-frame` bucket, with only the provider call answered locally: the estimate reported neurons/USD, generation returned `201` with prompt/model/settings/rate version, the image was stored, listed, and served through a presigned playback URL, the record was listed, and project/user cleanup removed the row; 12/12 checks |
+| Real Cloudflare generation | **BLOCKED** | The environment has no `CLOUDFLARE_AI_API_TOKEN`. The available `CLOUDFLARE_API_TOKEN` returns `401 Authentication error` from Workers AI, so no live image was generated |
+| Real Leonardo generation | **BLOCKED** | `LEONARDO_API_KEY` is present but rejected by Leonardo (`401` on both generation and `/me`), so no live image was generated |
+| Hosted schema | **PASS** | `20261125200000_create_image_generations.sql` applied through the Supabase management API on 2026-11-25; `verify:sql` reports 92/92, including the service-role insert, `42501` for authenticated reads, and `23514` for an unknown provider |
+| Generation UI | **UNVERIFIED** | Not part of this slice; the routes are API-only |
 
 | Provider | Verified model and request | Limits | Billing |
 | --- | --- | --- | --- |

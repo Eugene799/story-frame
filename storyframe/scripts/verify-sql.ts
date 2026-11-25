@@ -23,6 +23,7 @@ const MIGRATIONS = [
   "20261125140000_add_planning_attempt_preflight.sql",
   "20261125160000_add_stock_media.sql",
   "20261125180000_enforce_stock_import_uniqueness.sql",
+  "20261125200000_create_image_generations.sql",
 ];
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "supabase", "migrations");
 
@@ -409,6 +410,23 @@ check("stock_search_cache: an unknown provider is rejected (23514)",
     `insert into public.stock_search_cache
        (cache_key, provider, query_text, media_type, page, expires_at)
      values ('cache-2', 'getty', 'rain', 'image', 1, now() + interval '1 hour')`))) === "23514");
+
+await as("service_role", null,
+  `insert into public.image_generations
+     (id, owner_id, project_id, provider, model_key, prompt, settings, status, rate_version)
+   values (gen_random_uuid(), $1, $2, 'cloudflare', 'cloudflare:flux-1-schnell', 'rain',
+           '{"width":1024,"height":1024,"steps":4}'::jsonb, 'pending', 'rate-v1')`,
+  [USER_A, PROJECT_A]);
+check("image_generations: the service role stores a generation",
+  (await count("image_generations", "model_key = 'cloudflare:flux-1-schnell'", [])) === 1);
+check("image_generations: authenticated reads are refused (42501)",
+  (await errorCode(() => as("authenticated", USER_A, "select count(*) from public.image_generations"))) === "42501");
+check("image_generations: an unknown provider is rejected (23514)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.image_generations
+       (id, owner_id, project_id, provider, model_key, prompt, settings, rate_version)
+     values (gen_random_uuid(), $1, $2, 'getty', 'x', 'rain', '{}'::jsonb, 'rate-v1')`,
+    [USER_A, PROJECT_A]))) === "23514");
 
 check("render_snapshots rejects a revision that does not exist (23503)",
   (await errorCode(() => as("service_role", null,
