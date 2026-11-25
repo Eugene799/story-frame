@@ -9,14 +9,14 @@ accepted content. Phase 6 adds protected Pexels and Pixabay stock search with no
 cache, credited attribution, and server-mediated imports into project media.
 
 The connection-test screen still uses real Supabase email/password sign-in and remains a development harness only.
-Video rendering, billing, discovery, and deployment are **not** started here.
+No host is configured in this repository state; [Production](#production) covers the deployable slice.
 
 ## Architecture
 
 ```
 Browser (Vite + React) → Supabase Auth      (email/password, refresh, sign-out)
       └─ /api/ai/test       (current Supabase access token)
-      ↓ Vite dev proxy (development only)
+      ↓ Vite dev proxy (dev; production serves both from one process)
 Node server (127.0.0.1:8787)
       ├─ Supabase Auth  GET /auth/v1/user  → verified user id
       ├─ Supabase REST  POST /rest/v1/ai_usage → pending reservation
@@ -41,9 +41,9 @@ Row-level security is enabled on the ledger: authenticated users may only `selec
 with the server-only service role. Server-side isolation is also enforced explicitly by filtering reads on the
 verified user id.
 
-**This is still a development arrangement, not a production hosting solution.** The Node process is loopback-only and
-reached through the Vite dev proxy. Production hosting, durable cross-instance quotas, and broader account flows (sign-up, password reset, MFA, OAuth)
-remain future work.
+**The development loop is loopback-only.** `npm run dev` binds the API to `127.0.0.1` and reaches it through the Vite
+proxy. In production the same process serves the built client and `/api` from one origin (see [Production](#production)).
+Durable cross-instance quotas and broader account flows (sign-up, password reset, MFA, OAuth) remain future work.
 
 ## Run locally
 
@@ -79,6 +79,7 @@ npm run verify:r2-live    # opt-in: real R2 presign/upload/read/delete check (no
 npm run verify:sql        # apply every migration to in-memory PostgreSQL and assert RLS, triggers, cascades
 npm run audit:media       # read-only bucket-vs-database orphan audit (needs hosted Supabase + R2 values)
 npm run start:server      # server without watch
+npm start                 # production start, after npm run build
 ```
 
 `verify:stock-routes-live` also needs `R2_BUCKET_NAME` alongside the Supabase and provider values; the configured
@@ -90,6 +91,37 @@ For an external preview hostname, allow it explicitly instead of using a blanket
 ```bash
 __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=<preview-hostname> npm run dev
 ```
+
+## Production
+
+Production is one Node process serving the built client and `/api` on the same origin. The browser calls relative
+`/api` paths and the API sends no CORS headers, so splitting the frontend and the API across origins would break every
+request; one origin is the intended shape.
+
+```bash
+npm ci
+npm run build                                  # type-check + dist/
+NODE_ENV=production HOST=0.0.0.0 PORT=8080 npm start
+```
+
+- `npm start` runs `node --import tsx server/index.ts`. `tsx` is a runtime dependency, so the start works on a host that
+  installs production dependencies only, and `engines` requires Node `>=22 <27`.
+- [`server/static.ts`](server/static.ts) serves `dist`: hashed `/assets/*` are cached as immutable, `index.html` is
+  `no-store`, an extension-less path falls back to `index.html`, a missing asset is a `404`, and a path that escapes
+  `dist` is never served.
+- `GET /api/health` answers `200 { ok: true, ready: { auth, ledger, storage } }` only when Supabase auth, the
+  service-role ledger, and the R2 bucket are all configured. Any missing piece answers `503` with `ok: false` and the
+  same per-piece booleans, so a misconfigured instance fails the platform health check instead of serving a broken app.
+  It makes no provider call and returns no secret, and it does not check that those services are reachable, so an
+  outage at one of them still answers `200`: this is a configuration check, not a dependency probe.
+- [`render.yaml`](render.yaml) declares one always-on web service: `npm ci && npm run build`, `npm start`,
+  `healthCheckPath: /api/health`, `HOST=0.0.0.0`, `NODE_ENV=production`, and every credential as `sync: false` so it is
+  entered in the dashboard. The instance has to stay awake on a paid plan: the media, image, video, and lip sync sweeps
+  are in-process timers, so a sleeping or multi-instance deployment loses them.
+
+A real deployment still needs its own Supabase project with every migration applied, its own R2 bucket with a CORS rule
+for the production origin (`npm run cors:preview -- https://<origin>`), `APP_ORIGIN` set to that origin, and accounts
+created through the admin API: there is no sign-up or password-reset flow.
 
 ## Applying the migrations
 
@@ -116,6 +148,7 @@ these tables. Apply them in filename order:
 17. `20261125260000_preserve_narration_usage_on_project_delete.sql` (Phase 8: keep the Deepgram ledger when a project is deleted)
 18. `20261126090000_add_video_render_jobs.sql` (Phase 9: export-scoped render/job kinds and their unique indexes)
 19. `20261126100000_create_video_usage.sql` (Phase 9: credits ledger and atomic per-account reservation)
+20. `20261126110000_create_lipsync_exports.sql` (Phase 9: lip sync exports and the provider-seconds ledger)
 
 Run the compatibility check first. It must return no rows:
 
@@ -1403,8 +1436,9 @@ ticket's CORS preflight from the `cors.json` preview origin, the document-delete
   response.
 - Rate limiting is in-memory and per-process; it is scoped to the verified account but is not a durable quota shared
   across processes or instances.
-- The Vite proxy and loopback API are a development arrangement; production needs a deployed API, managed secrets,
-  durable quotas, and a real auth flow.
+- The Vite proxy and loopback API are the development loop; production serves the build and `/api` from one process,
+  but durable quotas shared across instances, managed secret rotation, and a sign-up/password-reset flow are still
+  missing.
 - The workspace is single-user per project and has no conflict merging: a stale save is refused, the draft is kept,
   and the caller must load the latest version. Revision history is read-only; restoring an old version is future work.
 - Scene generation and video rendering are not implemented. Phase 5 plans angles, scripts, storyboards, ad concepts, and

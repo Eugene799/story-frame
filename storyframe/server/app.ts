@@ -759,19 +759,20 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     const path = requestUrl.pathname;
 
     // The platform health check polls this, so it stays cheap: configuration
-    // readiness only, with no provider call and no secret in the reply.
+    // readiness only, with no provider call and no secret in the reply. A
+    // missing piece answers 503, so a misconfigured instance is taken out of
+    // rotation instead of serving requests it cannot complete.
     if (path === "/api/health") {
       if (method !== "GET" && method !== "HEAD") {
-        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for the health check.");
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET or HEAD for the health check.");
       }
-      sendJson(response, 200, {
-        ok: true,
-        ready: {
-          auth: Boolean(config.supabaseUrl && config.supabasePublishableKey),
-          ledger: Boolean(config.supabaseServiceRoleKey),
-          storage: Boolean(config.r2),
-        },
-      });
+      const ready = {
+        auth: Boolean(config.supabaseUrl && config.supabasePublishableKey),
+        ledger: Boolean(config.supabaseUrl && config.supabaseServiceRoleKey),
+        storage: Boolean(config.r2),
+      };
+      const healthy = ready.auth && ready.ledger && ready.storage;
+      sendJson(response, healthy ? 200 : 503, { ok: healthy, ready });
       return;
     }
 

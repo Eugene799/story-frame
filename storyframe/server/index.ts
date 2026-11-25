@@ -35,7 +35,7 @@ server.listen(port, host, () => {
     }`,
   );
   if (!production) {
-    console.log("[storyframe] Development arrangement only - not a production hosting solution.");
+    console.log("[storyframe] Development mode: Vite proxies /api from port 3000; production serves the build and /api from one process.");
   }
 });
 

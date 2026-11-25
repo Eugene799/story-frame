@@ -142,6 +142,28 @@ describe("health route and API fallthrough", () => {
     });
   });
 
+  it("fails the health check when the ledger or storage is not configured", async () => {
+    const unconfigured = await startTestServer({
+      env: {
+        SUPABASE_SERVICE_ROLE_KEY: "",
+        R2_ENDPOINT: "",
+        R2_BUCKET_NAME: "",
+        R2_ACCESS_KEY_ID: "",
+        R2_SECRET_ACCESS_KEY: "",
+      },
+    });
+    try {
+      const response = await fetch(`${unconfigured.url}/api/health`);
+      expect(response.status).toBe(503);
+      expect(await response.json()).toEqual({
+        ok: false,
+        ready: { auth: true, ledger: false, storage: false },
+      });
+    } finally {
+      await unconfigured.close();
+    }
+  });
+
   it("answers the bare /api prefix with the JSON 404, not the client", async () => {
     const response = await fetch(`${server.url}/api`);
     expect(response.status).toBe(404);
