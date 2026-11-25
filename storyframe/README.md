@@ -555,7 +555,7 @@ license: the JSON includes a deduplicated credit list and the per-scene render p
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 252/252; `verify:sql` 89/89; `verify:stock-live` 8/8; `verify:stock-routes-live` 23/23; `verify:live-routes` 51/51; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 253/253; `verify:sql` 89/89; `verify:stock-live` 8/8; `verify:stock-routes-live` 23/23; `verify:live-routes` 51/51; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -696,7 +696,7 @@ so it writes no ledger row and does not consume the key.
 | Pending request identity survives reload | **PASS** | `tests/planning-panel.test.tsx`: a stored `script` route and instruction are restored into the form, and Retry sends the stored Idempotency-Key instead of minting a new one |
 | Attempt history is visible and local | **PASS** | `tests/planning-panel.test.tsx`: a successful attempt appears as `Succeeded`, survives an unmount/remount, and a cancelled attempt is recorded as `stopped`; history is capped and stored in `localStorage`, never in the project |
 
-### Phase 6: stock search (2026-11-25)
+### Phase 6: stock search (2026-11-25) — complete
 
 `GET /api/stock/search?q=...&type=image|video&sources=pexels,pixabay` requires a verified Supabase session. The
 unprefixed `/stock/search` from the phase contract is accepted as an alias; `/api/stock/search` is canonical because it
@@ -710,7 +710,9 @@ Video renditions are chosen by both dimensions and aspect ratio: a portrait or s
 selected, a file labelled `video/mp4` but pointing at an `.m3u8`/`.mpd`/`.ts` playlist is excluded, and video previews
 use the thumbnail the provider supplied. Pexels photo results report the original's actual dimensions; Pixabay reports
 preview, web-format, and original dimensions. Pagination is **per provider**: `page=N` is sent to each selected
-provider, then the normalized pages are merged, so `hasMore` is reported per provider.
+provider, then the normalized pages are merged, so `hasMore` is reported per provider. The Media tab's **Load more**
+requests page N+1 from the search that produced the current results, merges the new pages, skips assets already shown,
+and disappears once no provider reports `hasMore`.
 
 **Durable shared cache.** Normalized pages are stored in `public.stock_search_cache` (service-role only, keyed by a hash
 of provider, type, page, and normalized query). A search reads the row, and a miss inserts a short lease claim with
@@ -741,10 +743,17 @@ existing attach/detach/delete flow. **Export** carries that provenance: the Prev
 document, unique stock credits, and a render payload with per-scene credited assets, and the script text ends with a
 `CREDITS` block. Provider failures are listed per provider; one failure does not hide the other's results.
 
+**Status.** Every Phase 6 contract item is implemented and exercised: one protected search endpoint with normalized
+results, per-provider pagination surfaced in the UI, the durable shared cache with Pixabay's 24-hour window, a
+controlled import with provenance, credited exports, and live acceptance runs for real image/video search and import.
+Phase 7 (Cloudflare Workers AI and Leonardo image generation) is the next milestone; it is a separate provider task with
+its own credentials and is not started in this change.
+
 ### Phase 6 verification (2026-11-25)
 
 | Criterion | Status | Evidence |
 | --- | --- | --- |
+| Per-provider pages merge through Load more | **PASS** | `tests/stock-panel.test.tsx`: the first page renders one Pexels preview with a failed Pixabay provider; **Load more (page 2)** sends `page=2` with the original query, appends the second page's preview, keeps the first, and removes the control when no provider has more |
 | Protected search with normalized fields | **PASS** | `tests/stock.test.ts`: anonymous `401`; one image search returns Pexels and Pixabay results with provider, id, title, preview, renditions, source page, creator, attribution, license, real dimensions, and duration; a video search reports the selected 1920×1080 rendition |
 | Hardened provider handling | **PASS** | Same file: duplicate/unknown/empty sources `400`; portrait crops are never selected for a 16:9 source; a `video/mp4` link ending in `.m3u8` is excluded; video previews come from provider thumbnails; a provider failure yields a sanitized code and the response never contains the provider key or URL |
 | Durable shared cache and stampedes | **PASS** | Two identical searches make one provider call each, the second reports `cached: true`, and `stock_search_cache` holds two ready rows with a Pixabay TTL of at least 24 hours; two concurrent searches still make one call per provider; a simulated cache outage leaves search working |

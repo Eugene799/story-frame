@@ -174,6 +174,7 @@ export function MediaPanel({
   const [stockError, setStockError] = useState<string | null>(null);
   const [stockNotice, setStockNotice] = useState<string | null>(null);
   const [stockSearching, setStockSearching] = useState(false);
+  const [stockLoadingMore, setStockLoadingMore] = useState(false);
   const [importingId, setImportingId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -301,6 +302,39 @@ export function MediaPanel({
       setStockError(toRequestError(cause).message);
     } finally {
       setStockSearching(false);
+      onBusyChange?.(false);
+    }
+  }
+
+  async function loadMoreStock() {
+    if (!stock || stockSearching || stockLoadingMore) return;
+    // Page forward on the search that produced these results, not on whatever
+    // the form now holds: the query may have been edited after searching.
+    const requested = {
+      query: stock.query,
+      type: stock.type,
+      sources: stock.sources,
+      page: stock.page + 1,
+    };
+    setStockLoadingMore(true);
+    setStockError(null);
+    onBusyChange?.(true);
+    try {
+      const next = await searchStock(await getAccessToken(), requested);
+      setStock((current) => {
+        if (!current || current.query !== requested.query || current.type !== requested.type) {
+          return current;
+        }
+        const seen = new Set(current.results.map((result) => `${result.provider}:${result.providerId}`));
+        const added = next.results.filter(
+          (result) => !seen.has(`${result.provider}:${result.providerId}`),
+        );
+        return { ...next, results: [...current.results, ...added] };
+      });
+    } catch (cause) {
+      setStockError(toRequestError(cause).message);
+    } finally {
+      setStockLoadingMore(false);
       onBusyChange?.(false);
     }
   }
@@ -508,6 +542,22 @@ export function MediaPanel({
               );
             })}
           </ul>
+          {stock.providers.some((provider) => provider.hasMore) && (
+            <div className="editor-actions">
+              <button
+                type="button"
+                className="button-secondary"
+                onClick={() => void loadMoreStock()}
+                disabled={stockSearching || stockLoadingMore}
+              >
+                {stockLoadingMore ? "Loading more..." : `Load more (page ${stock.page + 1})`}
+              </button>
+              <p className="hint">
+                Requests page {stock.page + 1} from each provider that still has results, then merges the new pages
+                and skips assets already shown.
+              </p>
+            </div>
+          )}
         </div>
       )}
 

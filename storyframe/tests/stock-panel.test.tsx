@@ -63,6 +63,70 @@ function installBackend(options: { initialMedia?: MediaRecord[]; reused?: boolea
         return jsonResponse({ ok: true, media: initialMedia });
       }
       if (url.pathname === "/api/stock/search" && method === "GET") {
+        if (url.searchParams.get("page") === "2") {
+          return jsonResponse({
+            ok: true,
+            query: "rain",
+            type: "image",
+            sources: ["pexels", "pixabay"],
+            page: 2,
+            resultsPerProvider: 20,
+            fetchedAt: NOW,
+            providers: [
+              {
+                provider: "pexels",
+                ok: true,
+                count: 1,
+                page: 2,
+                hasMore: false,
+                cached: false,
+                rateLimitRemaining: 198,
+                error: null,
+              },
+              {
+                provider: "pixabay",
+                ok: false,
+                count: 0,
+                page: 2,
+                hasMore: false,
+                cached: false,
+                rateLimitRemaining: null,
+                error: "STOCK_PROVIDER_UNAVAILABLE",
+              },
+            ],
+            results: [
+              {
+                provider: "pexels",
+                providerName: "Pexels",
+                providerId: "102",
+                type: "image",
+                title: "Wet rooftop",
+                previewUrl: "https://images.pexels.com/photos/102/large.jpg",
+                renditions: [
+                  {
+                    label: "original",
+                    url: "https://images.pexels.com/photos/102/original.jpg",
+                    width: 3000,
+                    height: 2000,
+                    contentType: "image/jpeg",
+                    byteSize: null,
+                    fps: null,
+                  },
+                ],
+                selectedRendition: "original",
+                sourcePage: "https://www.pexels.com/photo/102/",
+                creator: "Bo",
+                creatorUrl: "https://www.pexels.com/@bo",
+                attribution: "Photo by Bo on Pexels",
+                license: "Pexels License",
+                licenseUrl: "https://www.pexels.com/license/",
+                width: 3000,
+                height: 2000,
+                durationSeconds: null,
+              },
+            ],
+          });
+        }
         return jsonResponse({
           ok: true,
           query: "rain",
@@ -221,6 +285,37 @@ describe("stock search in the media panel", () => {
     expect(source.getAttribute("target")).toBe("_blank");
     expect(source.getAttribute("rel")).toContain("noreferrer");
     expect(provenance.getByText("Pexels License")).toBeTruthy();
+  });
+
+  it("loads the next provider page and appends only new previews", async () => {
+    const backend = installBackend();
+    render(
+      <MediaPanel
+        projectId={PROJECT_ID}
+        scenes={[]}
+        getAccessToken={async () => "token"}
+        onAttachAsset={async () => true}
+        onDetachAsset={async () => true}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Stock search"), { target: { value: "rain" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search stock" }));
+    await screen.findByRole("link", { name: "Photo by Ada on Pexels" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more (page 2)" }));
+
+    await screen.findByRole("link", { name: "Photo by Bo on Pexels" });
+    expect(screen.getByRole("link", { name: "Photo by Ada on Pexels" })).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: "Import to project" })).toHaveLength(2);
+    // The second page reports no further results, so the control disappears.
+    expect(screen.queryByRole("button", { name: /Load more/ })).toBeNull();
+
+    const pages = backend.requests
+      .filter((request) => request.path === "/api/stock/search")
+      .map((request) => request.search);
+    expect(pages.some((search) => search.includes("page=2"))).toBe(true);
+    expect(pages[1]).toContain("q=rain");
   });
 
   it("reports an asset that is already in the project without adding a duplicate", async () => {
