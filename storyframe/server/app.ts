@@ -56,6 +56,7 @@ import {
   type MediaStore,
 } from "./media";
 import { R2Error, createR2Client, type R2Client } from "./r2";
+import { startMediaSweeper } from "./media-scheduler";
 import {
   PROFILE_LIMITS,
   createSupabaseProfileStore,
@@ -379,6 +380,37 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
 
   const mediaObjects: R2Client | null = config.r2 ? createR2Client(config.r2, { fetchImpl, now }) : null;
   let lastMediaSweep = 0;
+  let mediaSweep: Promise<void> | null = null;
+
+  /**
+   * One bounded sweep pass, shared by the timer and opportunistic media
+   * requests so two passes never run over the same rows at once. Cleanup never
+   * fails the request that triggered it.
+   */
+  function runMediaSweep(): Promise<void> {
+    const store = mediaStore;
+    const objects = mediaObjects;
+    if (!store || !objects) return Promise.resolve();
+    if (mediaSweep) return mediaSweep;
+    lastMediaSweep = now();
+    mediaSweep = (async () => {
+      try {
+        await sweepMedia({
+          store,
+          objects,
+          projects: requireProjects(),
+          limits: config.media,
+          now,
+          logger: log,
+        });
+      } catch {
+        log.error("[media] MEDIA_SWEEP_FAILED");
+      } finally {
+        mediaSweep = null;
+      }
+    })();
+    return mediaSweep;
+  }
 
   const server = createHttpServer((request, response) => {
     void handleRequest(request, response).catch((error: unknown) => {
@@ -388,6 +420,15 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       else response.end();
     });
   });
+
+  // An idle server still expires interrupted uploads and retention rows. With a
+  // zero interval the timer is off and media requests keep triggering a pass.
+  const mediaSweeper = startMediaSweeper({
+    intervalMs: config.media.sweepIntervalMs,
+    sweep: runMediaSweep,
+    logger: log,
+  });
+  if (mediaSweeper) server.on("close", () => mediaSweeper.stop());
 
   async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const method = request.method ?? "GET";
@@ -519,15 +560,10 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     return mediaObjects;
   }
 
-  async function maybeSweepMedia(store: MediaStore, objects: R2Client): Promise<void> {
+  async function maybeSweepMedia(): Promise<void> {
+    if (!mediaStore || !mediaObjects) return;
     if (now() - lastMediaSweep < config.media.sweepIntervalMs) return;
-    lastMediaSweep = now();
-    try {
-      await sweepMedia({ store, objects, projects: requireProjects(), limits: config.media, now, logger: log });
-    } catch {
-      // Cleanup is opportunistic; it must never fail the request that triggered it.
-      log.error("[media] MEDIA_SWEEP_FAILED");
-    }
+    await runMediaSweep();
   }
 
   function requireProfile(): ProfileStore {
@@ -716,7 +752,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     // Same ownership rule as every other project route: a foreign project id is
     // answered exactly like a missing one, before any media row is read.
     const project = await requireProjects().get(user.id, projectId);
-    await maybeSweepMedia(store, objects);
+    await maybeSweepMedia();
 
     if (rest.length === 0) {
       if (method === "GET") {

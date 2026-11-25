@@ -64,6 +64,12 @@ try {
   const prefixed = await client.readRange(key, 32);
   check("signed range GET reads the leading bytes", prefixed !== null && prefixed.equals(payload.subarray(0, 32)));
 
+  // The bucket audit depends on a correctly signed ListObjectsV2 request. The
+  // narrow prefix keeps this independent of whatever else the bucket holds.
+  const listed = await client.listObjects("media/verify-");
+  const found = listed.objects.find((object) => object.key === key);
+  check("signed list finds the test object with its size", found?.byteSize === payload.length);
+
   const get = client.presignGet(key, 60);
   const getResponse = await fetch(get.url);
   const downloaded = getResponse.ok ? Buffer.from(await getResponse.arrayBuffer()) : Buffer.alloc(0);

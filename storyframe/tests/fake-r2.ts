@@ -19,6 +19,10 @@ export interface FakeR2 {
   close: () => Promise<void>;
 }
 
+function xmlEscape(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 export async function startFakeR2(bucket = "storyframe-test-media"): Promise<FakeR2> {
   const objects = new Map<string, FakeR2Object>();
   let puts = 0;
@@ -26,6 +30,39 @@ export async function startFakeR2(bucket = "storyframe-test-media"): Promise<Fak
   const server = createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://localhost");
     const prefix = `/${bucket}/`;
+
+    // S3 ListObjectsV2: the bucket root with list-type=2, prefix and a keyset
+    // continuation token. The audit relies on this being paged.
+    if (
+      (url.pathname === `/${bucket}` || url.pathname === `/${bucket}/`) &&
+      request.method === "GET" &&
+      url.searchParams.get("list-type") === "2"
+    ) {
+      const objectPrefix = url.searchParams.get("prefix") ?? "";
+      const requested = Math.floor(Number(url.searchParams.get("max-keys") ?? "1000"));
+      const maxKeys = Number.isFinite(requested) ? Math.max(1, Math.min(1000, requested)) : 1000;
+      const token = url.searchParams.get("continuation-token");
+      const all = [...objects.keys()].filter((key) => key.startsWith(objectPrefix)).sort();
+      const remaining = token ? all.filter((key) => key > token) : all;
+      const page = remaining.slice(0, maxKeys);
+      const truncated = remaining.length > page.length;
+      const contents = page
+        .map((key) => {
+          const size = objects.get(key)?.body.length ?? 0;
+          return `<Contents><Key>${xmlEscape(key)}</Key><Size>${size}</Size></Contents>`;
+        })
+        .join("");
+      const next =
+        truncated && page.length > 0
+          ? `<NextContinuationToken>${xmlEscape(page[page.length - 1])}</NextContinuationToken>`
+          : "";
+      response.writeHead(200, { "Content-Type": "application/xml" });
+      response.end(
+        `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><IsTruncated>${truncated}</IsTruncated>${contents}${next}</ListBucketResult>`,
+      );
+      return;
+    }
+
     if (!url.pathname.startsWith(prefix)) {
       response.writeHead(404).end();
       return;

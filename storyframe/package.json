@@ -17,6 +17,7 @@
     "verify:media-live": "tsx scripts/verify-media-live.ts",
     "verify:r2-live": "tsx scripts/verify-r2-live.ts",
     "verify:sql": "tsx scripts/verify-sql.ts",
+    "audit:media": "tsx scripts/audit-media.ts",
     "start:server": "tsx server/index.ts"
   },
   "dependencies": {

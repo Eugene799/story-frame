@@ -62,6 +62,16 @@ async function putObject(ticket: MediaInitiateResponse, bytes: Buffer): Promise<
   expect(response.status).toBe(200);
 }
 
+/** Polls a condition a background pass is expected to satisfy. */
+async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("Timed out waiting for the scheduled media sweep.");
+}
+
 async function complete(appUrl: string, projectId: string, mediaId: string, token: string = USER_A.token) {
   return apiRequest(
     appUrl,
@@ -563,6 +573,30 @@ describe("private media storage", () => {
       const afterSweep = await apiRequest(app.url, `/api/projects/${projectId}/media`);
       const list = (await afterSweep.json()) as { media: MediaRecord[] };
       expect(list.media).toHaveLength(0);
+      expect(app.supabase.media).toHaveLength(0);
+      expect(app.r2.objects.size).toBe(0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("cleans an expired upload on the scheduled sweep without a media request", async () => {
+    const app = await startTestServer({
+      env: { MEDIA_SWEEP_INTERVAL_MS: "40", MEDIA_UPLOAD_TTL_MS: "0" },
+    });
+    try {
+      const projectId = await createProject(app.url);
+      const ticket = await initiateUpload(app.url, projectId, {
+        kind: "image",
+        contentType: "image/png",
+        byteSize: PNG.length,
+      });
+      await putObject(ticket, PNG);
+      expect(app.supabase.media).toHaveLength(1);
+
+      // No media route is called after the upload, so only the timer can clean
+      // this interrupted upload and its object.
+      await waitFor(() => app.supabase.media.length === 0 && app.r2.objects.size === 0);
       expect(app.supabase.media).toHaveLength(0);
       expect(app.r2.objects.size).toBe(0);
     } finally {

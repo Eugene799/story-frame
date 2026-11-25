@@ -239,9 +239,12 @@ export function mediaTypeMatches(kind: MediaKind, detected: { kind: MediaKind; c
   return ALLOWED_CONTENT_TYPES[kind].includes(detected.contentType);
 }
 
+/** Every media object lives under this prefix, which is also what the audit lists. */
+export const MEDIA_OBJECT_PREFIX = "media/";
+
 /** The object key is generated here: stable, private, and never an authorization token. */
 export function mediaObjectKey(ownerId: string, mediaId: string): string {
-  return `media/${ownerId}/${mediaId}`;
+  return `${MEDIA_OBJECT_PREFIX}${ownerId}/${mediaId}`;
 }
 
 const MEDIA_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -263,6 +266,11 @@ export interface StoredObjectRow {
   projectId: string;
   objectKey: string;
   sceneKey: string | null;
+}
+
+/** A row as the bucket audit sees it: the address plus its lifecycle status. */
+export interface MediaAuditRow extends StoredObjectRow {
+  status: MediaStatus;
 }
 
 /** The saved-document lookup the retention sweep needs before deleting an asset. */
@@ -320,6 +328,8 @@ export interface MediaStore {
   expiredDeleted(cutoffIso: string, limit: number): Promise<StoredObjectRow[]>;
   /** Ready assets older than the cutoff, ordered by id; afterId pages the scan. */
   unreferencedReady(cutoffIso: string, limit: number, afterId?: string): Promise<StoredObjectRow[]>;
+  /** Every row, ordered by id; afterId pages the bucket audit. */
+  listStoredObjects(limit: number, afterId?: string): Promise<MediaAuditRow[]>;
 }
 
 // object_key stays server-side: it is selected for storage operations but omitted
@@ -374,6 +384,12 @@ function toStoredObjectRow(row: Record<string, unknown>): StoredObjectRow {
     objectKey: rowText(row, "object_key"),
     sceneKey: rowNullableText(row, "scene_key"),
   };
+}
+
+function toAuditRow(row: Record<string, unknown>): MediaAuditRow {
+  const status = row.status;
+  if (!["pending", "ready", "deleted"].includes(String(status))) corrupt("status");
+  return { ...toStoredObjectRow(row), status: status as MediaStatus };
 }
 
 function toReference(row: Record<string, unknown>): MediaReferenceRecord {
@@ -778,6 +794,19 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
         ),
       );
       return found.map(toStoredObjectRow);
+    },
+
+    async listStoredObjects(limit, afterId) {
+      const query: Record<string, string> = {
+        select: `${STORED_OBJECT_COLUMNS},status`,
+        order: "id.asc",
+        limit: String(limit),
+      };
+      if (afterId !== undefined) query.id = `gt.${afterId}`;
+      const found = rows(
+        await request(tableUrl("media_metadata", query), { headers: readHeaders }, "the media audit list"),
+      );
+      return found.map(toAuditRow);
     },
 
     async unreferencedReady(cutoffIso, limit, afterId) {

@@ -72,6 +72,7 @@ npm run verify:live-routes # provider-free two-user live route + ledger checks
 npm run verify:media-live # opt-in: two disposable accounts, real upload + playback through the routes
 npm run verify:r2-live    # opt-in: real R2 presign/upload/read/delete check (no bucket is created)
 npm run verify:sql        # apply every migration to in-memory PostgreSQL and assert RLS, triggers, cascades
+npm run audit:media       # read-only bucket-vs-database orphan audit (needs hosted Supabase + R2 values)
 npm run start:server      # server without watch
 ```
 
@@ -172,7 +173,8 @@ anon) key; never the service-role key.
 | `MEDIA_IMAGE_MAX_BYTES`, `MEDIA_AUDIO_MAX_BYTES`, `MEDIA_VIDEO_MAX_BYTES` | Per-file bounds (defaults 10 MiB, 25 MiB, 200 MiB). |
 | `MEDIA_OWNER_STORAGE_BYTES` | Total pending + ready bytes per account (default 2 GiB). |
 | `MEDIA_UPLOAD_URL_SECONDS`, `MEDIA_DOWNLOAD_URL_SECONDS`, `MEDIA_UPLOAD_TTL_MS` | Presigned URL and upload-window lifetimes. |
-| `MEDIA_DELETED_RETENTION_MS`, `MEDIA_UNREFERENCED_RETENTION_MS`, `MEDIA_SWEEP_INTERVAL_MS` | Retention and cleanup policy. |
+| `MEDIA_DELETED_RETENTION_MS`, `MEDIA_UNREFERENCED_RETENTION_MS` | Retention windows for deleted rows and unreferenced ready assets. |
+| `MEDIA_SWEEP_INTERVAL_MS` | Background sweep cadence and the minimum gap between opportunistic request-triggered passes (default 60000). `0` turns the background timer off. |
 
 `.env` is git-ignored; `.env.example` contains placeholders only. Only public Supabase auth configuration uses a
 `VITE_` name; no secret is prefixed with `VITE_`, returned by the API, logged, or placed in a URL. The Supabase client
@@ -434,7 +436,10 @@ cascade with the project, then each object is deleted after the project row is g
 bucket failure at that moment leaves an object without a record and is logged, rather than refusing a project delete
 the caller asked for.
 
-Cleanup is opportunistic and bounded (one batch per pass, at most every `MEDIA_SWEEP_INTERVAL_MS`):
+Cleanup is scheduled and bounded. A background sweeper runs one batch every `MEDIA_SWEEP_INTERVAL_MS` (default 60 s),
+so an idle server still expires interrupted uploads and retention rows; media requests may also trigger a pass, but
+never sooner than the same interval, and a pass that is still running is never overlapped. A failed pass is logged and
+retried on the next tick. Setting the interval to `0` turns the timer off and leaves only the request-triggered pass:
 
 - pending uploads past their window are removed (interrupted uploads);
 - deleted rows past `MEDIA_DELETED_RETENTION_MS` are removed;
@@ -442,6 +447,27 @@ Cleanup is opportunistic and bounded (one batch per pass, at most every `MEDIA_S
 
 A database row is removed only after its object removal is attempted, so a bucket hiccup leaves the row for the next
 pass instead of orphaning an object. Signed URL query strings are never logged.
+
+### Bucket-vs-database audit
+
+```bash
+R2_BUCKET_NAME=<bucket> npm run audit:media
+```
+
+The ordered removals above normally leave no drift, but a bucket failure during a project deletion is logged and
+cannot be retried from the deleted rows, and a crash between the two steps can leave one side behind. This command is
+the safety net: it lists every object under `media/` and every `media_metadata` row, both fully paged, and reports
+
+- **orphan objects**: bucket objects that no row owns (a cleanup that never reached the bucket);
+- **ready rows without an object**: playback would fail with `409 MEDIA_OBJECT_MISSING`.
+
+A pending upload without an object is the normal in-flight state, and a deleted row whose object is already gone is
+just waiting for retention, so neither is drift. The command is **read-only** and prints at most 100 entries per side
+while counting all of them. Exit codes: `0` clean, `1` drift found (or the audit could not complete, so drift is
+unknown), `2` missing configuration. It needs
+`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and the R2 endpoint, bucket, and credentials; it never prints a key or a
+signed URL. Run on 2026-11-25 against the configured project and the `story-frame` bucket: 0 rows, 0 objects, no
+drift.
 
 ## Phase 4: dashboard, brief, script, and storyboard (2026-11-24)
 
@@ -490,7 +516,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 140/140; `verify:sql` 69/69; `verify:live-routes` exit 0; `verify:r2-live` 6/6; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 149/149; `verify:sql` 69/69; `verify:live-routes` exit 0; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -502,6 +528,8 @@ editable project JSON and the script as plain text; video export is not offered 
 | A document-listed asset cannot be deleted | **PASS** | `tests/media.test.ts`: with no reference but the saved scene still listing the asset id, `DELETE` returns `409 MEDIA_ASSET_IN_DOCUMENT` and keeps the object and row; removing the id lets the same delete return `200`. `verify:media-live` checks the same guard against hosted Supabase and real R2 |
 | Retention spares a document-listed asset | **PASS** | `tests/media.test.ts`: an unreferenced ready asset past retention survives two sweeps while a saved scene lists it, then is removed once the id is gone; 30 protected rows (more than one 25-row batch) do not stop a later expired asset from being cleaned |
 | Saved scene asset ids must be ready media | **PASS** | `tests/media.test.ts`: a ready asset in the project saves; a malformed id is refused before the media lookup, as are an unknown id, a pending upload, an asset from another project, and a deleted asset (`422 MEDIA_ASSET_INVALID`), and the stored document keeps its previous ids; creating a project with any asset id is also refused; 101 UUID-shaped ids spanning two lookup chunks save, while a missing id in the second chunk is refused |
+| Expired media is cleaned without waiting for a media request | **PASS** | `tests/media.test.ts`: with a 40 ms interval and a zero upload window, an interrupted upload and its object are removed by the timer while no media route is called. `tests/media-scheduler.test.ts`: one pass per interval, no overlap while a pass runs, a failing pass is logged and the next tick still runs, and interval `0` disables the timer |
+| Bucket and database drift is detectable | **PASS** | `tests/media-audit.test.ts`: a matching pair reports no drift (a pending upload without an object is not drift); a bucket object with no row and a ready row with no object are each reported; the scan pages past 205 rows and 205 objects with page size 25; the audit leaves both sides untouched. `npm run audit:media` ran clean on 2026-11-25 against hosted Supabase and the real bucket (0 rows, 0 objects), and `verify:r2-live` proves the signed list it pages |
 
 The browser run on 2026-11-24 also exposed a double-counted media reference: the Media tab sent `sceneKey` at initiate
 and then attached the same scene as an explicit reference, so the store counted two references while the list showed
@@ -521,7 +549,7 @@ in Phase 4.
 | Authorized playback and another account refused | **PASS** | Playback URL returns the exact bytes; cross-owner read/complete/delete are `404` |
 | Safe deletion and shared references | **PASS** | Shared asset blocked while referenced, remains playable after one reference is released |
 | Retention and interrupted-upload cleanup | **PASS** | Clock-driven sweep tests, including a document-listed asset surviving retention until its saved scene id is removed and keyset paging past a full batch of protected rows |
-| Real R2 signing and bucket access | **PASS** | `npm run verify:r2-live`: presigned PUT/GET, signed HEAD/range/DELETE, 6/6 against the `story-frame` bucket |
+| Real R2 signing and bucket access | **PASS** | `npm run verify:r2-live`: presigned PUT/GET, signed HEAD/range/DELETE/list, 7/7 against the `story-frame` bucket |
 | Migration applied to the hosted Supabase project | **PASS** | Applied through the Management API; catalog checked (columns, table, RLS, policy, grants) |
 | Full upload through the app with a real signed-in session | **PASS** | `npm run verify:media-live`: two disposable hosted accounts, 37/37 checks, including a real bucket upload, playback, the document-delete guard, and project-deletion object cleanup |
 | Two-account isolation on the hosted project | **PASS** | Same check: RLS reads, refused browser write, and `404` for foreign routes |
@@ -585,7 +613,9 @@ logic and the policies themselves, but not the live project’s role configurati
 ## Tests
 
 All automated provider tests use a local mock and are labelled `MOCKED`. Supabase is replaced by a local fake Auth and
-PostgREST service, so tests exercise the real HTTP client code without external calls.
+PostgREST service, so tests exercise the real HTTP client code without external calls. CI (`.github/workflows/ci.yml`)
+runs `check`, `test`, `build`, and `verify:sql` on every push and pull request; the live suites stay opt-in because they
+need the hosted project and the real bucket.
 
 Coverage includes:
 
@@ -648,6 +678,10 @@ Coverage includes:
   next Detach skips the already-missing reference and saves the removal
 - Retention: a ready asset past its unreferenced window is kept while a saved scene lists it, and removed on the next
   sweep after the id is removed; the sweep pages by id past protected rows, so a full batch cannot starve other assets
+- Scheduled cleanup: the background sweeper runs one pass per interval, never overlaps a running pass, logs a failure
+  and keeps scheduling, and stops with the server; an idle server removes an expired upload with no media request
+- Bucket audit: an agreeing pair reports no drift, an object without a row and a ready row without its object are each
+  reported (a pending upload without an object is not drift), both sides page past one page, and it changes nothing
 - Save validation: scene asset ids are checked for UUID shape, then against ready media in the same project, so
   malformed, unknown, pending, foreign, and deleted ids are refused instead of being stored
 - Missing key, unknown/disabled model, oversized prompt/body, provider auth failure, rate limiting, timeout,
@@ -698,7 +732,7 @@ This check is **opt-in** and touches real storage: it writes one tiny, clearly n
 it back through a presigned URL and a signed range request, deletes it, and confirms it is gone. It never creates a
 bucket or any other resource, never prints the access key, secret, or a signed URL, and exits non-zero on failure. It
 uses `R2_ENDPOINT`/`R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY` or the `CLOUDFLARE_*` fallbacks. Run on 2026-11-24 against
-the `story-frame` bucket: 6/6 checks passed.
+the `story-frame` bucket: **7/7 checks passed**, including the signed `ListObjectsV2` list the audit pages through.
 
 ### Live media route check
 
@@ -747,7 +781,8 @@ the document-delete guard and project-deletion object cleanup.
   the reference and saves the asset id out of the document, so deletion is reachable from the UI. Saves also refuse
   scene asset ids that are not ready media in the same project, so a direct API write cannot create a dangling id.
 - Project deletion removes its media objects best effort after the row cascade. A failure at that point is logged and
-  cannot be retried from the deleted rows, so a later bucket audit is the safety net for that narrow window.
+  cannot be retried from the deleted rows, so `npm run audit:media` is the safety net for that narrow window; the
+  audit reports the orphan object and leaves the decision to the operator.
 - The migrations are verified against a real PostgreSQL engine by `npm run verify:sql`, by the test fakes, and by
   live routes against the configured project. The project is empty again after test cleanup.
 - A workspace is one profile per user, with no shared or multi-user workspace, which matches the isolation
@@ -758,9 +793,9 @@ the document-delete guard and project-deletion object cleanup.
 - The per-account storage quota is checked from the declared size before a reservation and counts pending and ready
   rows; it is not a durable cross-instance lock, so two simultaneous reservations can briefly exceed it. A presigned
   PUT cannot pin the body size (browsers cannot set `Content-Length`), so an object larger than declared is rejected
-  and removed at completion; until its upload window closes, that object is not counted against the quota. Cleanup is
-  opportunistic (triggered by media routes, one bounded batch), not a scheduled job: an idle project's expired rows
-  wait until the next media call.
+  and removed at completion; until its upload window closes, that object is not counted against the quota. Cleanup runs
+  on a background timer as well as opportunistically on media requests, but each pass is one bounded batch per process;
+  a large backlog drains over several intervals, and two processes do not coordinate their passes.
 - Media type detection covers the common container signatures listed above. A valid file in an unlisted format is
   refused rather than guessed at, and an empty or truncated file is treated as unusable.
 - Child routes record what the server is told; they do not call a provider. Nothing yet writes a provider job or a

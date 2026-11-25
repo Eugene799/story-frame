@@ -33,6 +33,17 @@ export interface R2ObjectInfo {
   byteSize: number;
 }
 
+export interface R2ListedObject {
+  key: string;
+  byteSize: number;
+}
+
+export interface R2ListPage {
+  objects: R2ListedObject[];
+  /** Set when the bucket has more objects after this page. */
+  nextToken: string | null;
+}
+
 export class R2Error extends Error {
   readonly code: string;
 
@@ -50,6 +61,11 @@ export interface R2Client {
   /** Reads the first bytes of an object. Null when the object does not exist. */
   readRange(key: string, byteCount: number): Promise<Buffer | null>;
   delete(key: string): Promise<boolean>;
+  /** One page of the bucket's object list under a prefix (S3 ListObjectsV2). */
+  listObjects(
+    prefix: string,
+    options?: { continuationToken?: string | null; maxKeys?: number },
+  ): Promise<R2ListPage>;
 }
 
 function sha256Hex(data: string | Buffer): string {
@@ -123,10 +139,14 @@ export function createR2Client(config: R2Config, options: { fetchImpl?: typeof f
     };
   }
 
-  async function signedRequest(method: "HEAD" | "GET" | "DELETE", key: string, extraHeaders: Record<string, string> = {}) {
+  async function signedFetch(
+    method: "HEAD" | "GET" | "DELETE",
+    uri: string,
+    canonicalQuery: string,
+    extraHeaders: Record<string, string> = {},
+  ): Promise<Response> {
     const { amzDate, dateStamp } = amzDateParts(now());
     const scope = `${dateStamp}/${REGION}/${SERVICE}/aws4_request`;
-    const uri = canonicalUri(config.bucket, key);
     const headers: Record<string, string> = {
       host: base.host,
       "x-amz-content-sha256": EMPTY_SHA256,
@@ -137,13 +157,13 @@ export function createR2Client(config: R2Config, options: { fetchImpl?: typeof f
     const canonicalHeaders = names.map((name) => `${name}:${headers[name].trim()}\n`).join("");
     const signedHeaders = names.join(";");
 
-    const canonicalRequest = [method, uri, "", canonicalHeaders, signedHeaders, EMPTY_SHA256].join("\n");
+    const canonicalRequest = [method, uri, canonicalQuery, canonicalHeaders, signedHeaders, EMPTY_SHA256].join("\n");
     const stringToSign = [ALGORITHM, amzDate, scope, sha256Hex(canonicalRequest)].join("\n");
     const signature = hmac(signingKey(config.secretAccessKey, dateStamp), stringToSign).toString("hex");
 
-    let response: Response;
+    const target = `${base.protocol}//${base.host}${uri}${canonicalQuery ? `?${canonicalQuery}` : ""}`;
     try {
-      response = await fetchImpl(`${base.protocol}//${base.host}${uri}`, {
+      return await fetchImpl(target, {
         method,
         headers: {
           ...headers,
@@ -154,7 +174,10 @@ export function createR2Client(config: R2Config, options: { fetchImpl?: typeof f
     } catch {
       throw new R2Error("R2_UNAVAILABLE", "The media bucket is unreachable.");
     }
-    return response;
+  }
+
+  function signedRequest(method: "HEAD" | "GET" | "DELETE", key: string, extraHeaders: Record<string, string> = {}) {
+    return signedFetch(method, canonicalUri(config.bucket, key), "", extraHeaders);
   }
 
   return {
@@ -195,5 +218,51 @@ export function createR2Client(config: R2Config, options: { fetchImpl?: typeof f
       if (response.status === 204 || response.status === 200 || response.status === 404) return true;
       throw new R2Error("R2_UNAVAILABLE", `The media bucket rejected the object removal (HTTP ${response.status}).`);
     },
+
+    async listObjects(prefix, options = {}) {
+      const maxKeys = Math.min(1000, Math.max(1, Math.floor(options.maxKeys ?? 1000)));
+      const pairs: [string, string][] = [
+        ["list-type", "2"],
+        ["max-keys", String(maxKeys)],
+      ];
+      if (prefix.length > 0) pairs.push(["prefix", prefix]);
+      if (options.continuationToken) pairs.push(["continuation-token", options.continuationToken]);
+      const canonicalQuery = pairs
+        .map(([name, value]) => [encodeRfc3986(name), encodeRfc3986(value)] as const)
+        .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+        .map(([name, value]) => `${name}=${value}`)
+        .join("&");
+      const response = await signedFetch("GET", `/${encodeRfc3986(config.bucket)}`, canonicalQuery);
+      if (!response.ok) {
+        throw new R2Error(
+          "R2_UNAVAILABLE",
+          `The media bucket rejected the object list (HTTP ${response.status}).`,
+        );
+      }
+      return parseObjectList(await response.text());
+    },
   };
+}
+
+function xmlUnescape(value: string): string {
+  return value
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+/** Reads the S3 ListObjectsV2 document without a full XML parser. */
+function parseObjectList(document: string): R2ListPage {
+  const objects: R2ListedObject[] = [];
+  for (const match of document.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
+    const key = /<Key>([\s\S]*?)<\/Key>/.exec(match[1])?.[1];
+    if (key === undefined) continue;
+    const size = Number(/<Size>([\s\S]*?)<\/Size>/.exec(match[1])?.[1]);
+    objects.push({ key: xmlUnescape(key), byteSize: Number.isFinite(size) ? size : 0 });
+  }
+  const truncated = /<IsTruncated>\s*true\s*<\/IsTruncated>/i.test(document);
+  const token = /<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/.exec(document)?.[1];
+  return { objects, nextToken: truncated && token ? xmlUnescape(token) : null };
 }
