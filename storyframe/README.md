@@ -1080,8 +1080,10 @@ re-checked before a byte is read. A foreign host fails the export with `LIPSYNC_
 The host Everypixel actually serves outputs from has not been observed live yet, so the first real render may
 need one entry in `LIPSYNC_OUTPUT_HOSTS` — the refusal is explicit rather than silent.
 - A finished video is downloaded, re-detected as video, uploaded to R2 under a new media row, and settled at
-the reserved seconds. A provider `FAILURE`/`REVOKED`, an abandoned task, or a success without a usable URL
-fails the export and settles zero seconds.
+the duration read from the MP4's own movie header (`server/mp4.ts`), so a six-second clip settles six seconds
+rather than the twenty reserved for it. A header that cannot be read keeps the reserved ceiling and logs
+`LIPSYNC_DURATION_UNMEASURED`; fragmented output is the case to watch. A provider `FAILURE`/`REVOKED`, an
+abandoned task, or a success without a usable URL fails the export and settles zero seconds.
 - The Preview tab's `LipsyncPanel` picks the source, audio and resolution, shows the seconds/USD window and an
 estimate, submits with an idempotency key, polls only while pending, plays the stored copy from a private
 presigned URL, and deletes after a confirmation. A pending task cannot be deleted.

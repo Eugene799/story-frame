@@ -8,6 +8,7 @@ import {
 } from "../server/lipsync";
 import type { MediaLimits, MediaStore } from "../server/media";
 import type { R2Client } from "../server/r2";
+import { readMp4DurationSeconds } from "../server/mp4";
 import type { MediaRecord } from "../shared/media-contract";
 
 /**
@@ -21,10 +22,29 @@ const SOURCE = "33333333-3333-4333-8333-333333333333";
 const AUDIO = "44444444-4444-4444-8444-444444444444";
 const NOW = Date.parse("2026-11-26T12:00:00.000Z");
 
-const MP4 = Buffer.from([
-  0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00,
-  0x69, 0x73, 0x6f, 0x6d, 0x69, 0x73, 0x6f, 0x32, 0x61, 0x76, 0x63, 0x31, 0x6d, 0x70, 0x34, 0x31,
-]);
+function box(type: string, payload: Buffer): Buffer {
+  const head = Buffer.alloc(8);
+  head.writeUInt32BE(payload.length + 8, 0);
+  head.write(type, 4, "ascii");
+  return Buffer.concat([head, payload]);
+}
+
+/** A real MP4 skeleton: an ftyp box and a movie header carrying the duration. */
+function mp4WithDuration(seconds: number, version: 0 | 1 = 0): Buffer {
+  const payload = Buffer.alloc(version === 1 ? 112 : 100);
+  payload.writeUInt8(version, 0);
+  if (version === 1) {
+    payload.writeUInt32BE(1000, 20);
+    payload.writeBigUInt64BE(BigInt(Math.round(seconds * 1000)), 24);
+  } else {
+    payload.writeUInt32BE(1000, 12);
+    payload.writeUInt32BE(Math.round(seconds * 1000), 16);
+  }
+  return Buffer.concat([box("ftyp", Buffer.from("isomisomiso2", "ascii")), box("moov", box("mvhd", payload))]);
+}
+
+/** A six-second clip: the copy must settle 6 s, not the 20 s ceiling. */
+const MP4 = mp4WithDuration(6);
 
 const LIMITS: LipsyncLimits = {
   timeoutMs: 5_000,
@@ -276,6 +296,19 @@ function service(options: {
   });
 }
 
+describe("mp4 duration reader", () => {
+  it("reads the movie header instead of trusting a header-less prefix", () => {
+    expect(readMp4DurationSeconds(mp4WithDuration(6))).toBe(6);
+    expect(readMp4DurationSeconds(mp4WithDuration(6.5))).toBe(6.5);
+    expect(readMp4DurationSeconds(mp4WithDuration(6, 1))).toBe(6);
+  });
+
+  it("returns null rather than a guess when the bytes do not say", () => {
+    expect(readMp4DurationSeconds(Buffer.from("not an mp4 at all"))).toBeNull();
+    expect(readMp4DurationSeconds(box("ftyp", Buffer.from("isomisomiso2", "ascii")))).toBeNull();
+  });
+});
+
 describe("lipsync output host guard", () => {
   it("accepts Everypixel hosts only, plus explicit extra hosts", () => {
     expect(isLipsyncOutputHost("everypixel.com", [])).toBe(true);
@@ -374,7 +407,8 @@ describe("lipsync sweep", () => {
     expect(updated.status).toBe("ready");
     expect(updated.outputMediaId).toBeTruthy();
     expect(updated.byteSize).toBe(MP4.length);
-    expect(store.settled.at(-1)).toMatchObject({ status: "succeeded", seconds: 20 });
+    expect(updated.secondsCounted).toBe(6);
+    expect(store.settled.at(-1)).toMatchObject({ status: "succeeded", seconds: 6 });
     expect(media.created).toHaveLength(1);
   });
 

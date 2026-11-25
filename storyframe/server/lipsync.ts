@@ -1,5 +1,6 @@
 import { ApiError } from "./api-error";
 import { detectMediaType, mediaObjectKey, newMediaId, type MediaLimits, type MediaStore } from "./media";
+import { readMp4DurationSeconds } from "./mp4";
 import { R2Error, type R2Client } from "./r2";
 import {
   EverypixelError,
@@ -655,8 +656,14 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
 
     try {
       const download = await downloadOutput(state.resultUrl ?? "");
+      // Bill the seconds the file actually holds, not the ceiling reserved for it.
+      const measured = readMp4DurationSeconds(download.bytes);
+      if (measured === null) {
+        // A fragmented or malformed header: keep the reservation rather than guessing low.
+        log.error("[lipsync] LIPSYNC_DURATION_UNMEASURED");
+      }
+      const counted = measured === null ? row.secondsEstimate : measured;
       const stored = await storeOutput(row.ownerId, row.projectId, download.bytes, download.contentType);
-      const counted = row.secondsEstimate;
       await deps.store.update(row.ownerId, row.id, {
         status: "ready",
         providerStatus: state.providerStatus,

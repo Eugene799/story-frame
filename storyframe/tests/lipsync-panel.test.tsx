@@ -160,7 +160,7 @@ describe("lip sync panel", () => {
         status: "ready",
         providerStatus: "SUCCESS",
         outputMediaId: "66666666-6666-4666-8666-666666666666",
-        secondsCounted: 20,
+        secondsCounted: 6,
         byteSize: 4096,
       }),
     });
@@ -177,6 +177,8 @@ describe("lip sync panel", () => {
     const video = await screen.findByLabelText("Lip sync playback", {}, { timeout: 3000 });
     expect(video.getAttribute("src")).toBe("https://r2.test/get/media/output.mp4");
     expect(screen.getByText(/READY/)).toBeTruthy();
+    // The card reports the measured file length, not the reserved ceiling.
+    expect(screen.getByText(/6 s used/)).toBeTruthy();
 
     const posts = backend.requests.filter((request) => request.method === "POST");
     expect(posts).toHaveLength(1);
