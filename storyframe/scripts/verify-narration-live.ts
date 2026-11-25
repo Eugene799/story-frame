@@ -438,7 +438,7 @@ async function main(): Promise<number> {
     for (const music of MUSIC_CASES) {
       const uploaded = await uploadAudio(user.token, music.bytes, music.contentType);
       check(
-        `a ${music.label} music file uploads and is detected from its bytes`,
+        `${music.label} music uploads and is detected from its bytes`,
         uploaded.status === "ready" &&
           uploaded.contentType === music.contentType &&
           uploaded.byteSize === music.bytes.length,
