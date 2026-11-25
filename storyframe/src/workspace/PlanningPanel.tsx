@@ -49,6 +49,42 @@ function listOf<T>(value: T[] | undefined): T[] {
   return Array.isArray(value) ? value : [];
 }
 
+const PENDING_KEY_PREFIX = "storyframe.planning.pendingKey.";
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
+
+function pendingKeyStorageName(projectId: string): string {
+  return `${PENDING_KEY_PREFIX}${projectId}`;
+}
+
+/** Survives a reload in this tab, so Retry can still replay an unsettled attempt. */
+function readPendingKey(projectId: string): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const value = window.sessionStorage.getItem(pendingKeyStorageName(projectId));
+    return value && IDEMPOTENCY_KEY_PATTERN.test(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function storePendingKey(projectId: string, key: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(pendingKeyStorageName(projectId), key);
+  } catch {
+    // Storage can be unavailable (private mode); the attempt still works in memory.
+  }
+}
+
+function clearPendingKey(projectId: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.removeItem(pendingKeyStorageName(projectId));
+  } catch {
+    // Nothing to clear when storage is unavailable.
+  }
+}
+
 function newIdempotencyKey(): string {
   const uuid =
     typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -199,8 +235,9 @@ export function PlanningPanel({
     setGenerating(true);
     setError(null);
     setNotice(null);
-    const key = pendingKey.current ?? newIdempotencyKey();
+    const key = pendingKey.current ?? readPendingKey(projectId) ?? newIdempotencyKey();
     pendingKey.current = key;
+    storePendingKey(projectId, key);
     try {
       const created = await generatePlanningProposal(
         await getAccessToken(),
@@ -209,6 +246,7 @@ export function PlanningPanel({
         key,
       );
       pendingKey.current = null;
+      clearPendingKey(projectId);
       setProposals((current) => [...(current ?? []), created]);
       setSelectedId(created.id);
       setNotice(
@@ -220,7 +258,10 @@ export function PlanningPanel({
       const requestError = toRequestError(cause);
       // Keep the key when no response arrived, the attempt is still running, or
       // the ledger is temporarily unavailable: retrying may replay a paid reply.
-      if (!keepsKeyOnRetry(requestError)) pendingKey.current = null;
+      if (!keepsKeyOnRetry(requestError)) {
+        pendingKey.current = null;
+        clearPendingKey(projectId);
+      }
       setError(requestError);
     } finally {
       setGenerating(false);
