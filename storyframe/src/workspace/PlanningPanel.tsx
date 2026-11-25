@@ -471,6 +471,14 @@ export function PlanningPanel({
   // through unknown outcomes so another tab cannot start a duplicate paid call.
   const leaseHeld = useRef(false);
   const mounted = useRef(true);
+  // Advance during render, not in an effect, so a preflight resolving between
+  // commit and passive effects cannot acquire a lease for the previous project.
+  const projectEpoch = useRef(0);
+  const renderedProject = useRef(projectId);
+  if (renderedProject.current !== projectId) {
+    renderedProject.current = projectId;
+    projectEpoch.current += 1;
+  }
   const [attempts, setAttempts] = useState<PlanningAttemptEntry[]>(() => readAttempts(projectId));
   const [otherTabGenerating, setOtherTabGenerating] = useState(false);
   const [checkingAttempt, setCheckingAttempt] = useState(false);
@@ -485,6 +493,7 @@ export function PlanningPanel({
 
   // A different project is a different attempt; never carry a key or history across it.
   useEffect(() => {
+    setCheckingAttempt(false);
     const pending = readPendingAttempt(projectId);
     pendingAttempt.current = null;
     setAttempts(readAttempts(projectId));
@@ -645,6 +654,8 @@ export function PlanningPanel({
 
   async function handleGenerate() {
     if (busy || dirty || otherTabGenerating || leaseSettling || remoteAttemptUntil !== null) return;
+    const epoch = projectEpoch.current;
+    const isCurrentProject = () => mounted.current && projectEpoch.current === epoch;
     const previous = pendingAttempt.current ?? readPendingAttempt(projectId);
     const key =
       previous && isSameRequest(previous, route, instruction, baseVersion)
@@ -657,6 +668,7 @@ export function PlanningPanel({
     try {
       try {
         const status = await getPlanningAttemptStatus(await getAccessToken(), projectId);
+        if (!isCurrentProject()) return;
         leaseMs =
           Number.isFinite(status.abandonAfterMs) && status.abandonAfterMs > 0
             ? status.abandonAfterMs
@@ -672,7 +684,7 @@ export function PlanningPanel({
       } catch {
         // The reservation's unique pending row still enforces this server-side.
       }
-      if (!mounted.current) return;
+      if (!isCurrentProject()) return;
       if (!tryAcquirePlanningLock(projectId, tabId.current, leaseMs)) {
         setOtherTabGenerating(true);
         setNotice("Another tab is already generating a proposal for this project. Wait for it to finish before starting one here.");
@@ -681,7 +693,7 @@ export function PlanningPanel({
       leaseHeld.current = true;
       setGenerating(true);
     } finally {
-      setCheckingAttempt(false);
+      if (isCurrentProject()) setCheckingAttempt(false);
     }
 
     const controller = new AbortController();

@@ -9,6 +9,7 @@ import { PlanningPanel } from "../src/workspace/PlanningPanel";
 import { documentFixture, sceneFixture } from "./project-fixture";
 
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111";
+const PROJECT_B_ID = "33333333-3333-4333-8333-333333333333";
 const PROPOSAL_ID = "22222222-2222-4222-8222-222222222222";
 const NOW = "2026-11-25T12:00:00.000Z";
 
@@ -67,9 +68,37 @@ function proposalFixture(status: GenerationProposalRecord["status"] = "proposed"
   };
 }
 
-function storedLease(): { tabId: string; expiresAt: number } | null {
-  const raw = window.localStorage.getItem(`storyframe.planning.lock.${PROJECT_ID}`);
+function storedLease(projectId = PROJECT_ID): { tabId: string; expiresAt: number } | null {
+  const raw = window.localStorage.getItem(`storyframe.planning.lock.${projectId}`);
   return raw ? (JSON.parse(raw) as { tabId: string; expiresAt: number }) : null;
+}
+
+/** A planning-status response held open until the test chooses to resolve it. */
+function deferredPreflight() {
+  let resolveStatus: ((response: Response) => void) | undefined;
+  let requested = false;
+  return {
+    handle(): Promise<Response> {
+      requested = true;
+      return new Promise<Response>((resolve) => {
+        resolveStatus = resolve;
+      });
+    },
+    resolve(idempotencyKey: string): void {
+      resolveStatus?.(
+        jsonResponse({
+          ok: true,
+          inFlight: true,
+          idempotencyKey,
+          startedAt: new Date().toISOString(),
+          abandonAfterMs: 60_000,
+        }),
+      );
+    },
+    get requested(): boolean {
+      return requested;
+    },
+  };
 }
 
 function anglesProposalFixture(): GenerationProposalRecord {
@@ -588,6 +617,94 @@ describe("PlanningPanel", () => {
       expect((screen.getByRole("button", { name: "Generate proposal" }) as HTMLButtonElement).disabled).toBe(true),
     );
     expect(screen.getByText(/Another tab is generating a proposal/)).toBeTruthy();
+  });
+
+  it("ignores a preflight that resolves after the project changes", async () => {
+    const preflight = deferredPreflight();
+    let planningCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input), "http://localhost").pathname;
+        if (path === `/api/projects/${PROJECT_ID}/proposals` || path === `/api/projects/${PROJECT_B_ID}/proposals`) {
+          return jsonResponse({ ok: true, proposals: [] });
+        }
+        if (path === `/api/projects/${PROJECT_ID}/planning/status`) return preflight.handle();
+        if (path.endsWith("/planning") && init?.method === "POST") {
+          planningCalls += 1;
+          return jsonResponse({ ok: true, proposal: proposalFixture() }, 201);
+        }
+        return jsonResponse({ ok: false, error: { code: "NOT_FOUND", message: "not found" } }, 404);
+      }),
+    );
+    const panel = (projectId: string) => (
+      <PlanningPanel
+        projectId={projectId}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />
+    );
+    const view = render(panel(PROJECT_ID));
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    await waitFor(() => expect(preflight.requested).toBe(true));
+
+    view.rerender(panel(PROJECT_B_ID));
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+
+    preflight.resolve("old-project-key-12345678");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(planningCalls).toBe(0);
+    expect(storedLease(PROJECT_ID)).toBeNull();
+    expect(storedLease(PROJECT_B_ID)).toBeNull();
+    expect(screen.queryByText(/Another device is already generating/)).toBeNull();
+    expect((screen.getByRole("button", { name: "Generate proposal" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("ignores a preflight that resolves after unmount", async () => {
+    const preflight = deferredPreflight();
+    let planningCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input), "http://localhost").pathname;
+        if (path === `/api/projects/${PROJECT_ID}/proposals`) {
+          return jsonResponse({ ok: true, proposals: [] });
+        }
+        if (path === `/api/projects/${PROJECT_ID}/planning/status`) return preflight.handle();
+        if (path.endsWith("/planning") && init?.method === "POST") {
+          planningCalls += 1;
+          return jsonResponse({ ok: true, proposal: proposalFixture() }, 201);
+        }
+        return jsonResponse({ ok: false, error: { code: "NOT_FOUND", message: "not found" } }, 404);
+      }),
+    );
+    const view = render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    await waitFor(() => expect(preflight.requested).toBe(true));
+    view.unmount();
+
+    preflight.resolve("unmounted-key-12345678");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(planningCalls).toBe(0);
+    expect(storedLease(PROJECT_ID)).toBeNull();
   });
 
   it("blocks generation when the server reports another device's live attempt", async () => {
