@@ -95,6 +95,7 @@ export interface FakeSupabase {
   imageGenerations: Record<string, unknown>[];
   narrationTracks: Record<string, unknown>[];
   narrationUsage: Record<string, unknown>[];
+  videoUsage: Record<string, unknown>[];
   close: () => Promise<void>;
 }
 
@@ -157,6 +158,7 @@ export async function startFakeSupabase(
   const imageGenerations: Record<string, unknown>[] = [];
   const narrationTracks: Record<string, unknown>[] = [];
   const narrationUsage: Record<string, unknown>[] = [];
+  const videoUsage: Record<string, unknown>[] = [];
   const childTables: Record<string, Record<string, unknown>[]> = {
     scenes,
     sources,
@@ -171,6 +173,7 @@ export async function startFakeSupabase(
     image_generations: imageGenerations,
     narration_tracks: narrationTracks,
     narration_usage: narrationUsage,
+    video_usage: videoUsage,
   };
   let failWritesRemaining = options.failWrites ?? 0;
 
@@ -526,7 +529,9 @@ export async function startFakeSupabase(
           for (const [table, data] of Object.entries(childTables)) {
             for (let position = data.length - 1; position >= 0; position -= 1) {
               if (data[position].project_id !== removed.id) continue;
-              if (table === "narration_usage") data[position].project_id = null;
+              // Both spending ledgers survive a project delete so a replacement
+              // project cannot reset the rolling window.
+              if (table === "narration_usage" || table === "video_usage") data[position].project_id = null;
               else data.splice(position, 1);
             }
           }
@@ -627,6 +632,57 @@ export async function startFakeSupabase(
             spent_usd: Number((spentUsd + costUsd).toFixed(6)),
             oldest_at: oldestAt ?? now,
           },
+        ]);
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/rest/v1/rpc/reserve_video_usage") {
+        if (
+          request.headers.apikey !== SERVICE_ROLE_KEY ||
+          request.headers.authorization !== `Bearer ${SERVICE_ROLE_KEY}`
+        ) {
+          sendJson(response, 401, { message: "unauthorized" });
+          return;
+        }
+        const body = (await readJson(request)) as Record<string, unknown>;
+        const ownerId = String(body.p_owner_id);
+        const credits = Number(body.p_credits_estimate);
+        const limit = Number(body.p_credit_limit);
+        const windowSeconds = Number(body.p_window_seconds);
+        const cutoff = Date.now() - Math.max(0, windowSeconds) * 1000;
+        const relevant = videoUsage.filter(
+          (row) =>
+            row.owner_id === ownerId &&
+            typeof row.created_at === "string" &&
+            Date.parse(row.created_at) >= cutoff,
+        );
+        const used = relevant.reduce((sum, row) => sum + Number(row.credits_counted ?? 0), 0);
+        const oldestAt =
+          relevant.map((row) => String(row.created_at)).sort((left, right) => left.localeCompare(right))[0] ??
+          null;
+        if (limit > 0 && used + credits > limit) {
+          sendJson(response, 200, [
+            { usage_id: null, allowed: false, credits_used: used, oldest_at: oldestAt },
+          ]);
+          return;
+        }
+        const now = new Date().toISOString();
+        const row = {
+          id: randomUUID(),
+          owner_id: ownerId,
+          project_id: typeof body.p_project_id === "string" ? body.p_project_id : null,
+          render_id: typeof body.p_render_id === "string" ? body.p_render_id : null,
+          status: "pending",
+          credits_estimate: credits,
+          credits_counted: credits,
+          duration_seconds: null,
+          rate_version: String(body.p_rate_version),
+          created_at: now,
+          updated_at: now,
+        };
+        videoUsage.push(row);
+        sendJson(response, 200, [
+          { usage_id: row.id, allowed: true, credits_used: used + credits, oldest_at: oldestAt ?? now },
         ]);
         return;
       }
@@ -733,6 +789,47 @@ export async function startFakeSupabase(
                 )
               ) {
                 sendJson(response, 409, { code: "23505", message: "duplicate media reference" });
+                return;
+              }
+
+              // Mirrors the kind-scoped partial unique indexes: only video
+              // exports are constrained, so generic render/job rows still insert.
+              if (
+                table === "render_snapshots" &&
+                body.kind === "video-export" &&
+                body.status === "pending" &&
+                data.some(
+                  (row) =>
+                    row.kind === "video-export" &&
+                    row.project_id === body.project_id &&
+                    row.status === "pending",
+                )
+              ) {
+                sendJson(response, 409, { code: "23505", message: "one live video export per project" });
+                return;
+              }
+              if (
+                table === "render_snapshots" &&
+                typeof body.idempotency_key === "string" &&
+                data.some(
+                  (row) => row.owner_id === body.owner_id && row.idempotency_key === body.idempotency_key,
+                )
+              ) {
+                sendJson(response, 409, { code: "23505", message: "duplicate idempotency key" });
+                return;
+              }
+              if (
+                table === "provider_jobs" &&
+                body.kind === "video-export" &&
+                (body.status === "queued" || body.status === "running") &&
+                data.some(
+                  (row) =>
+                    row.kind === "video-export" &&
+                    row.project_id === body.project_id &&
+                    (row.status === "queued" || row.status === "running"),
+                )
+              ) {
+                sendJson(response, 409, { code: "23505", message: "one live export job per project" });
                 return;
               }
 
@@ -881,6 +978,12 @@ export async function startFakeSupabase(
             const order = url.searchParams.get("order");
             if (order === "position.asc") {
               rows = rows.slice().sort((a, b) => Number(a.position) - Number(b.position));
+            } else if (order === "created_at.asc") {
+              rows = rows.slice().sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+            } else if (order === "created_at.desc") {
+              rows = rows
+                .slice()
+                .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
             } else if (order === "id.asc") {
               // Match the lexicographic order used by the gt. cursor, not locale collation.
               rows = rows.slice().sort((a, b) => {
@@ -936,6 +1039,7 @@ export async function startFakeSupabase(
     imageGenerations,
     narrationTracks,
     narrationUsage,
+    videoUsage,
     close: () =>
       new Promise<void>((resolve, reject) => {
         server.closeAllConnections();

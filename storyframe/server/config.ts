@@ -1,6 +1,8 @@
 import { resolveModels, type ResolvedModel } from "./models";
 import { loadMediaLimits, type MediaLimits } from "./media";
 import { loadStockLimits, type StockLimits } from "./stock";
+import { resolveVideoResolution } from "./json2video";
+import type { VideoLimits } from "./video-exports";
 import { OLLAMA_BASE_URL } from "./ollama";
 import {
   MAX_PLANNING_PROVIDER_CALLS,
@@ -50,6 +52,8 @@ export interface AppConfig {
   };
   /** One configured model per planning route; see Phase 5 in the README. */
   planning: { routes: ResolvedPlanningRoute[] };
+  /** Phase 9 render bounds, single-copy download limits, and the credit guard. */
+  video: VideoLimits & { sweepIntervalMs: number };
 }
 
 function intEnv(
@@ -192,6 +196,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       usageWindowMs: 24 * 60 * 60 * 1000,
     },
     planning: { routes: planningRoutes(env) },
+    video: {
+      resolution: resolveVideoResolution(env.VIDEO_RESOLUTION),
+      timeoutMs: intEnv(env, "VIDEO_TIMEOUT_MS", 30_000, 5_000, 120_000),
+      // Zero disables the timer; the tests use a short cadence instead.
+      sweepIntervalMs: intEnv(env, "VIDEO_SWEEP_INTERVAL_MS", 60_000, 0, 600_000),
+      // Never below the provider's own 15-minute timeout.
+      renderTimeoutMs: intEnv(env, "VIDEO_RENDER_TIMEOUT_MS", 20 * 60 * 1000, 15 * 60 * 1000, 6 * 60 * 60 * 1000),
+      abandonAfterMs: intEnv(env, "VIDEO_ABANDON_AFTER_MS", 45 * 60 * 1000, 15 * 60 * 1000, 12 * 60 * 60 * 1000),
+      // Must outlive queueing plus the render window; the floor is 20 minutes.
+      inputUrlSeconds: intEnv(env, "VIDEO_INPUT_URL_SECONDS", 7_200, 1_200, 604_800),
+      downloadTimeoutMs: intEnv(env, "VIDEO_DOWNLOAD_TIMEOUT_MS", 60_000, 5_000, 300_000),
+      maxBytes: intEnv(env, "VIDEO_MAX_BYTES", 256 * 1024 * 1024, 1024 * 1024, 1024 * 1024 * 1024),
+      maxSeconds: intEnv(env, "VIDEO_MAX_SECONDS", 600, 1, 3600),
+      timingToleranceSeconds: usdEnv(env, "VIDEO_TIMING_TOLERANCE_SECONDS", 0.5, 0, 5),
+      // Rolling 24-hour credit window. Zero disables the dimension.
+      dailyCreditsLimit: intEnv(env, "VIDEO_DAILY_CREDITS_PER_USER", 600, 0, 100_000),
+      spendWindowMs: 24 * 60 * 60 * 1000,
+    },
   };
 }
 

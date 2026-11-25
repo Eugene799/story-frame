@@ -100,6 +100,12 @@ import {
   readNarrationScript,
   type NarrationStore,
 } from "./narration";
+import { loadJson2VideoSettings, parseVideoExportInput } from "./json2video";
+import {
+  createSupabaseVideoExportStore,
+  createVideoExportService,
+  type VideoExportService,
+} from "./video-exports";
 import {
   DEEPGRAM_AURA2_USD_PER_1K_CHARS,
   DEEPGRAM_RATE_VERSION,
@@ -572,6 +578,33 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
   // projects cannot race the usage read and spend twice.
   const narrationInFlight = new Set<string>();
 
+  const videoExportStore: ReturnType<typeof createSupabaseVideoExportStore> | null =
+    config.supabaseUrl && config.supabaseServiceRoleKey
+      ? createSupabaseVideoExportStore({
+          url: config.supabaseUrl,
+          serviceRoleKey: config.supabaseServiceRoleKey,
+          timeoutMs: config.authTimeoutMs,
+        })
+      : null;
+  // The service exists without a provider key so listing, reading, playback and
+  // deletion keep working; only submission refuses when the key is absent.
+  const videoExports: VideoExportService | null =
+    videoExportStore && mediaStore && narrationStore && projectStore && mediaObjects
+      ? createVideoExportService({
+          store: videoExportStore,
+          media: mediaStore,
+          narration: narrationStore,
+          projects: projectStore,
+          objects: mediaObjects,
+          settings: loadJson2VideoSettings(options.env ?? process.env),
+          limits: config.video,
+          mediaLimits: config.media,
+          fetchImpl,
+          now,
+          logger: log,
+        })
+      : null;
+
   const stockCache: StockCacheStore | null =
     config.supabaseUrl && config.supabaseServiceRoleKey
       ? createSupabaseStockCache({
@@ -658,6 +691,17 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     logger: log,
   });
   if (mediaSweeper) server.on("close", () => mediaSweeper.stop());
+
+  // A live video export is advanced by the sweep alone, so a restart resumes a
+  // paid render and GET never triggers a provider call.
+  const videoSweeper =
+    videoExports && config.video.sweepIntervalMs > 0
+      ? setInterval(() => {
+          void videoExports.sweep().catch(() => log.error("[video] VIDEO_SWEEP_FAILED"));
+        }, config.video.sweepIntervalMs)
+      : null;
+  videoSweeper?.unref?.();
+  if (videoSweeper) server.on("close", () => clearInterval(videoSweeper));
 
   // Pending image jobs expire even if no request ever asks about them again.
   const imageSweeper =
@@ -847,6 +891,17 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       );
     }
     return mediaStore;
+  }
+
+  function requireVideoExports(): VideoExportService {
+    if (!videoExports) {
+      throw new HttpError(
+        503,
+        "VIDEO_EXPORT_UNAVAILABLE",
+        "Video export is not configured on the server. Set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and the R2 keys.",
+      );
+    }
+    return videoExports;
   }
 
   function requireNarrationUsageStore(): NarrationUsageStore {
@@ -1835,6 +1890,11 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST, PATCH, or DELETE for music.");
     }
 
+    if (segments.length >= 3 && segments[1] === "exports" && segments[2] === "video") {
+      await handleVideoExports(request, response, user, projectId, segments.slice(3), method);
+      return;
+    }
+
     if (segments.length > 1 && segments[1] === "media") {
       await handleMedia(request, response, user, projectId, segments.slice(2));
       return;
@@ -2351,6 +2411,79 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     if (!track) throw new HttpError(404, "AUDIO_TRACK_NOT_FOUND", `This project has no active ${kind} track.`);
     await releaseAudioReference(user.id, projectId, track);
     sendJson(response, 200, { ok: true, track });
+  }
+
+  /**
+   * Phase 9 export routes. They are registered before the generic child-table
+   * handlers and use their own `exportId` segment, so a malformed id can never
+   * fall through to `/renders` or `/jobs`.
+   */
+  async function handleVideoExports(
+    request: IncomingMessage,
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+    rest: string[],
+    method: string,
+  ): Promise<void> {
+    const service = requireVideoExports();
+    // Ownership is proven before any export or spend row is read.
+    await requireProjects().get(user.id, projectId);
+
+    if (rest.length === 0) {
+      if (method === "GET") {
+        const listed = await service.list(user.id, projectId);
+        sendJson(response, 200, { ok: true, exports: listed.exports, usage: listed.usage });
+        return;
+      }
+      if (method === "POST") {
+        // A replay returns the same export and never submits (or bills) twice.
+        const idempotencyKey = readIdempotencyKey(request);
+        const input = parseVideoExportInput(await readJsonBody(request, PROJECT_LIMITS.bodyBytes));
+        const result = await service.submit(user.id, projectId, input, idempotencyKey);
+        sendJson(response, result.replayed ? 200 : 202, {
+          ok: true,
+          export: result.record,
+          media: null,
+          usage: result.usage,
+        });
+        return;
+      }
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET or POST for video exports.");
+    }
+
+    const [exportId, action, ...extra] = rest;
+    if (!isChildId(exportId) || extra.length > 0) {
+      throw new HttpError(404, "VIDEO_EXPORT_NOT_FOUND", "No video export with that id belongs to this project.");
+    }
+
+    if (action === undefined) {
+      if (method === "GET") {
+        const detail = await service.get(user.id, projectId, exportId);
+        sendJson(response, 200, {
+          ok: true,
+          export: detail.record,
+          media: detail.media,
+          usage: detail.usage,
+        });
+        return;
+      }
+      if (method === "DELETE") {
+        await service.remove(user.id, projectId, exportId);
+        sendJson(response, 200, { ok: true, deletedId: exportId });
+        return;
+      }
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET or DELETE for one video export.");
+    }
+
+    if (action === "url") {
+      if (method !== "GET") throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for a playback URL.");
+      const playback = await service.playback(user.id, projectId, exportId);
+      sendJson(response, 200, { ok: true, ...playback });
+      return;
+    }
+
+    throw new HttpError(404, "NOT_FOUND", "Unknown endpoint.");
   }
 
   async function handleMedia(
