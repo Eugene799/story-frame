@@ -481,14 +481,22 @@ like a missing one (`404`).
 Browser uploads and playback are cross-origin requests to the bucket, so the bucket needs an exact-origin CORS rule.
 [`cors.json`](cors.json) holds the narrow rule applied to `story-frame` on 2026-11-24: `GET`/`PUT`/`HEAD`, the
 `Content-Type` request header, and `ETag`/`Content-Length` exposed, for `http://localhost:3000` and the current cloud
-preview origin. Apply or replace it with:
+preview origin. The preview hostname is per-chat, so point both the bucket and `cors.json` at the origin the browser
+actually uses before a browser check:
+
+```bash
+npm run cors:preview -- https://<preview-host>
+```
+
+That reads the rule from `cors.json`, replaces every non-localhost origin with the one passed, applies it through the
+Cloudflare API, rewrites `cors.json` to match so the live upload checks preflight the same origin, and then preflights a
+real presigned upload from it (a foreign origin must still be refused). It needs `CLOUDFLARE_API_TOKEN` with R2 edit
+access and `CLOUDFLARE_ACCOUNT_ID`. The same thing through Wrangler:
 
 ```bash
 npx wrangler r2 bucket cors set <bucket> --file cors.json
 npx wrangler r2 bucket cors list <bucket>
 ```
-
-The preview hostname in `cors.json` is per-chat; replace it when the preview origin changes or before a deployment.
 A stale origin shows up as a `pending` media row: initiation succeeds, the browser's presigned `PUT` is refused by CORS,
 and completion never runs. On 2026-11-25 that is exactly what the first upload through the Media panel hit.
 Probed against the real bucket: an allowed-origin preflight returned `204` with that exact origin, a disallowed origin
@@ -986,7 +994,7 @@ deferred Phase 8 concern is JSON2Video's temporary input access, which is Phase 
 | Migration applied to the hosted Supabase project | **PASS** | Applied through the Management API; catalog checked (columns, table, RLS, policy, grants) |
 | Full upload through the app with a real signed-in session | **PASS** | `npm run verify:media-live`: two disposable hosted accounts, 38/38 checks, including a real bucket upload, playback, the upload-ticket CORS preflight, the document-delete guard, and project-deletion object cleanup |
 | Two-account isolation on the hosted project | **PASS** | Same check: RLS reads, refused browser write, and `404` for foreign routes |
-| Bucket CORS | **PASS** | Rule applied and probed (allowed preflight `204`, foreign origin `403`, presigned `GET` header); `verify:r2-live`, `verify:media-live`, and `verify:narration-live` now fail when the bucket does not echo the `cors.json` preview origin |
+| Bucket CORS | **PASS** | Rule applied and probed (allowed preflight `204`, foreign origin `403`, presigned `GET` header); `verify:r2-live`, `verify:media-live`, and `verify:narration-live` now fail when the bucket does not echo the `cors.json` preview origin. `npm run cors:preview -- <origin>` applies the rule through the Cloudflare API, rewrites `cors.json` to the same origin, and preflights a presigned upload from it, so a moved preview host is one command (3/3 against the real bucket on 2026-11-25 after moving the rule to a new preview host) |
 | Upload from the UI in a browser | **PASS (live browser)** | On 2026-11-25 a disposable hosted account signed in through the real sign-in form, opened its project, and uploaded a 43 540-byte JPEG through the Media tab from the VM preview origin: the panel initiated the upload, PUT the bytes to the presigned ticket, completed it, attached it to Scene 1, and rendered it from private R2 at 600 px (`IMAGE READY`, `1 reference`, stored object `ffd8…` at 43 540 bytes). Project deletion removed the object, the account was deleted, and no media rows or probe users remained. The first attempt stalled as a `pending` row because `cors.json` still named an older preview host, so the bucket rule must name the current preview origin |
 | JSON2Video temporary input access | **RESOLVED** | Closed in Phase 9: every render input is presigned with `VIDEO_INPUT_URL_SECONDS` (7 200 by default), which must outlive queueing plus the render window; the live render consumed those URLs successfully |
 

@@ -24,21 +24,26 @@ export interface Preflight {
   detail: string;
 }
 
-/** Ask the bucket whether a browser on the preview origin may PUT this upload. */
-export async function preflightUpload(uploadUrl: string): Promise<Preflight> {
-  if (!PREVIEW_ORIGIN) return { ok: false, detail: "cors.json names no preview origin to test" };
+/**
+ * Ask the bucket whether a browser on the preview origin may PUT this upload.
+ * `origin` overrides the `cors.json` one for the script that sets the rule: it
+ * has to preflight the origin it just applied before `cors.json` is read again.
+ */
+export async function preflightUpload(uploadUrl: string, origin?: string): Promise<Preflight> {
+  const from = origin ?? PREVIEW_ORIGIN;
+  if (!from) return { ok: false, detail: "cors.json names no preview origin to test" };
 
   const response = await fetch(uploadUrl, {
     method: "OPTIONS",
     headers: {
-      Origin: PREVIEW_ORIGIN,
+      Origin: from,
       "Access-Control-Request-Method": "PUT",
       "Access-Control-Request-Headers": "content-type",
     },
   });
   const allowOrigin = response.headers.get("access-control-allow-origin") ?? "none";
   return {
-    ok: response.status >= 200 && response.status < 300 && allowOrigin === PREVIEW_ORIGIN,
-    detail: `origin=${PREVIEW_ORIGIN} status=${response.status} allow-origin=${allowOrigin}`,
+    ok: response.status >= 200 && response.status < 300 && allowOrigin === from,
+    detail: `origin=${from} status=${response.status} allow-origin=${allowOrigin}`,
   };
 }
