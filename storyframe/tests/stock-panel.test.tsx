@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MediaProvenance, MediaRecord } from "../shared/media-contract";
 import { MediaPanel } from "../src/workspace/MediaPanel";
@@ -208,5 +208,17 @@ describe("stock search in the media panel", () => {
       expect(screen.getAllByText("ready").length).toBeGreaterThan(0);
     });
     expect(screen.getByText(/image\/jpeg · 604 B/)).toBeTruthy();
+
+    // The project media list keeps the stored credit: provider, creator, a
+    // source link, and the license, all scoped to the imported asset.
+    const item = await screen.findByLabelText(`Media ${MEDIA_ID}`);
+    const provenance = within(item);
+    expect(provenance.getByText("Pexels")).toBeTruthy();
+    expect(provenance.getByText("Ada")).toBeTruthy();
+    const source = provenance.getByRole("link", { name: "Source on Pexels" });
+    expect(source.getAttribute("href")).toBe(PROVENANCE.sourcePage);
+    expect(source.getAttribute("target")).toBe("_blank");
+    expect(source.getAttribute("rel")).toContain("noreferrer");
+    expect(provenance.getByText("Pexels License")).toBeTruthy();
   });
 });

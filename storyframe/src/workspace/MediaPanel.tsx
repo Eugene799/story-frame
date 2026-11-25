@@ -596,6 +596,10 @@ export function MediaPanel({
   );
 }
 
+function providerName(provider: "pexels" | "pixabay"): string {
+  return provider === "pexels" ? "Pexels" : "Pixabay";
+}
+
 function MediaItem({
   media,
   projectId,
@@ -721,6 +725,21 @@ function MediaItem({
           )}
         </div>
       </div>
+
+      {media.provenance && (
+        <div className="media-provenance">
+          <span className="field-label">Stock provenance</span>
+          <p className="stock-credit">
+            <span className="status">{providerName(media.provenance.provider)}</span>{" "}
+            <span>{media.provenance.creator}</span>{" · "}
+            <a href={media.provenance.sourcePage} target="_blank" rel="noreferrer noopener">
+              Source on {providerName(media.provenance.provider)}
+            </a>
+            {" · "}
+            <span>{media.provenance.license}</span>
+          </p>
+        </div>
+      )}
 
       {attached.length > 0 && (
         <div className="media-attachments">
