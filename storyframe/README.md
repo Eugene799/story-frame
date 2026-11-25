@@ -489,6 +489,8 @@ npx wrangler r2 bucket cors list <bucket>
 ```
 
 The preview hostname in `cors.json` is per-chat; replace it when the preview origin changes or before a deployment.
+A stale origin shows up as a `pending` media row: initiation succeeds, the browser's presigned `PUT` is refused by CORS,
+and completion never runs. On 2026-11-25 that is exactly what the first upload through the Media panel hit.
 Probed against the real bucket: an allowed-origin preflight returned `204` with that exact origin, a disallowed origin
 returned `403` with no allow-origin header, and a presigned `GET` carried the allow-origin and exposed headers.
 Every live check that uploads (`verify:r2-live`, `verify:media-live`, `verify:narration-live`) now preflights a real
@@ -985,7 +987,7 @@ deferred Phase 8 concern is JSON2Video's temporary input access, which is Phase 
 | Full upload through the app with a real signed-in session | **PASS** | `npm run verify:media-live`: two disposable hosted accounts, 38/38 checks, including a real bucket upload, playback, the upload-ticket CORS preflight, the document-delete guard, and project-deletion object cleanup |
 | Two-account isolation on the hosted project | **PASS** | Same check: RLS reads, refused browser write, and `404` for foreign routes |
 | Bucket CORS | **PASS** | Rule applied and probed (allowed preflight `204`, foreign origin `403`, presigned `GET` header); `verify:r2-live`, `verify:media-live`, and `verify:narration-live` now fail when the bucket does not echo the `cors.json` preview origin |
-| Upload from the UI in a browser | **UNVERIFIED (browser)** | The upload UI exists: `MediaPanel` is mounted in `ProjectEditor` and rendered by `tests/stock-panel.test.tsx`, which covers the picker, the initiation, the PUT, completion, playback, and the error states. What is still unverified is a real-browser upload against the hosted bucket; the hosted uploads so far went through the routes (`verify:media-live`) |
+| Upload from the UI in a browser | **PASS (live browser)** | On 2026-11-25 a disposable hosted account signed in through the real sign-in form, opened its project, and uploaded a 43 540-byte JPEG through the Media tab from the VM preview origin: the panel initiated the upload, PUT the bytes to the presigned ticket, completed it, attached it to Scene 1, and rendered it from private R2 at 600 px (`IMAGE READY`, `1 reference`, stored object `ffd8…` at 43 540 bytes). Project deletion removed the object, the account was deleted, and no media rows or probe users remained. The first attempt stalled as a `pending` row because `cors.json` still named an older preview host, so the bucket rule must name the current preview origin |
 | JSON2Video temporary input access | **RESOLVED** | Closed in Phase 9: every render input is presigned with `VIDEO_INPUT_URL_SECONDS` (7 200 by default), which must outlive queueing plus the render window; the live render consumed those URLs successfully |
 
 ### Phase 9: video export through JSON2Video (2026-11-25) — complete
