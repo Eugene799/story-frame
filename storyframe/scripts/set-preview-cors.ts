@@ -104,6 +104,13 @@ if (rules.length === 0) {
 
 // The localhost origin stays for local browser checks; every other entry is a
 // per-chat preview hostname and becomes the origin passed here.
+const staleOrigins = [
+  ...new Set(
+    rules
+      .flatMap((rule) => rule.allowed.origins)
+      .filter((origin) => !origin.startsWith("http://localhost") && origin !== previewOrigin),
+  ),
+];
 const policy = {
   rules: rules.map((rule) => ({
     ...rule,
@@ -155,8 +162,28 @@ const client = createR2Client({
   secretAccessKey: r2.secretAccessKey,
 });
 const probeUrl = client.presignPut(`media/cors-probe-${Date.now()}.bin`, 120).url;
-const cors = await preflightUpload(probeUrl, previewOrigin);
+let cors = await preflightUpload(probeUrl, previewOrigin);
+let replaced = await Promise.all(
+  staleOrigins.map(async (origin) => ({ origin, verdict: await preflightUpload(probeUrl, origin) })),
+);
+// R2 can answer the previous rule for a few seconds after the write, which makes
+// both verdicts lie; measured, not assumed, so re-probe before reporting either.
+for (let attempt = 0; attempt < 6; attempt += 1) {
+  if (cors.ok && replaced.every((entry) => !entry.verdict.ok)) break;
+  await new Promise((resolve) => setTimeout(resolve, 2_000));
+  cors = await preflightUpload(probeUrl, previewOrigin);
+  replaced = await Promise.all(
+    staleOrigins.map(async (origin) => ({ origin, verdict: await preflightUpload(probeUrl, origin) })),
+  );
+}
 check("a presigned upload preflight is allowed from that origin", cors.ok, cors.detail);
+
+// The origin this rule replaced is the one that stalled a browser upload, so it
+// has to be refused now; a foreign origin covers the rule not being a wildcard.
+for (const entry of replaced) {
+  check(`the replaced origin ${entry.origin} is refused`, !entry.verdict.ok, entry.verdict.detail);
+}
+if (staleOrigins.length === 0) console.log("SKIP  cors.json named no other preview origin to check");
 
 const foreign = await preflightUpload(probeUrl, "https://example.invalid");
 check("a foreign origin is still refused", !foreign.ok, foreign.detail);
