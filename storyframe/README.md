@@ -1077,8 +1077,11 @@ the window.
 - The copy is host-guarded the way `OUTPUT_HOSTS` guards JSON2Video: `isLipsyncOutputHost` trusts
 `everypixel.com` and its subdomains plus anything in `LIPSYNC_OUTPUT_HOSTS`, and every redirect hop is
 re-checked before a byte is read. A foreign host fails the export with `LIPSYNC_OUTPUT_HOST` and no download.
-The host Everypixel actually serves outputs from has not been observed live yet, so the first real render may
-need one entry in `LIPSYNC_OUTPUT_HOSTS` — the refusal is explicit rather than silent.
+A live 720p request on 2026-11-25 delivered its finished MP4 from `s.api.everypixel.com`, which the suffix rule
+already trusts, so no extra host was needed. That file measured **5.08 s** from its movie header against a
+**5.088 s** voice track (an untouched source clip measured 7.103 s, matching `music-metadata`'s 7.104 s);
+`music-metadata` computes 5.1227 s for the same output because it follows the longest track rather than the movie
+header, so the reader under-reports by about 40 ms on a real file.
 - A finished video is downloaded, re-detected as video, uploaded to R2 under a new media row, and settled at
 the duration read from the MP4's own movie header (`server/mp4.ts`), so a six-second clip settles six seconds
 rather than the twenty reserved for it. A header that cannot be read keeps the reserved ceiling and logs
@@ -1090,11 +1093,13 @@ abandoned task, or a success without a usable URL fails the export and settles z
 - The Preview tab's `LipsyncPanel` picks the source, audio and resolution, shows the seconds/USD window and an
 estimate, submits with an idempotency key, polls only while pending, plays the stored copy from a private
 presigned URL, and deletes after a confirmation. A pending task cannot be deleted.
-- `tests/lipsync.test.ts` (9) and `tests/lipsync-panel.test.tsx` (3) cover the host guard, the seconds refusal,
+- `tests/lipsync.test.ts` (14) and `tests/lipsync-panel.test.tsx` (3) cover the host guard, the seconds refusal,
 wrong-kind assets, the inline submit, the copy, a foreign output host, provider failure, success without an
 output, the disabled reasons, polling to playback and the confirmed delete.
 
-**No live call was made**, so the adapter contract and the copy path are proven against fakes only.
+A single live 720p call confirmed the provider contract, the observed output host, and the duration reader on a
+genuine file. The R2 copy, ledger settlement and panel are still proven against fakes only, because that call went
+through the adapter directly rather than through a project.
 
 #### Earlier slice (2026-11-25)
 
