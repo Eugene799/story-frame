@@ -4,6 +4,7 @@ import { loadEnvFile } from "node:process";
 import { fileURLToPath } from "node:url";
 import { createStoryframeServer } from "../server/app";
 import { createR2Client } from "../server/r2";
+import { preflightUpload } from "./preview-origin";
 
 /**
  * Opt-in live check of the Phase 3 media routes against the hosted Supabase
@@ -206,6 +207,11 @@ try {
     "ticket contains a presigned URL, not a credential",
     ticket.upload.url.includes("X-Amz-Signature=") && !ticket.upload.url.includes(r2.secretAccessKey!),
   );
+
+  // The browser uploads straight to this ticket, so the bucket must answer the
+  // preview origin's preflight. A rule left on an old hostname fails here.
+  const cors = await preflightUpload(ticket.upload.url);
+  check("the bucket CORS rule lets the browser upload from the cors.json preview origin", cors.ok, cors.detail);
 
   const put = await fetch(ticket.upload.url, {
     method: "PUT",

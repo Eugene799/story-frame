@@ -474,6 +474,10 @@ npx wrangler r2 bucket cors list <bucket>
 The preview hostname in `cors.json` is per-chat; replace it when the preview origin changes or before a deployment.
 Probed against the real bucket: an allowed-origin preflight returned `204` with that exact origin, a disallowed origin
 returned `403` with no allow-origin header, and a presigned `GET` carried the allow-origin and exposed headers.
+Every live check that uploads (`verify:r2-live`, `verify:media-live`, `verify:narration-live`) now preflights a real
+presigned upload from the origin in `cors.json`, so a bucket rule left on an old hostname fails the run instead of only
+surfacing as a 403 in the browser. Measured with a stale origin: `403`, no allow-origin, and the suites dropped to
+`7/8`, `37/38`, and `34/35`.
 
 ### Deletion, references, and retention
 
@@ -568,9 +572,9 @@ license: the JSON includes a deduplicated credit list and the per-scene render p
 | Duration totals and target comparison | **PASS** | Script/storyboard totals update through duplicate, delete, and retime; asserted `0:30` → `0:50` → `0:35` against a `1:00` target |
 | Optimistic conflicts keep the draft and allow reload | **PASS** | Server `409 PROJECT_VERSION_CONFLICT`; UI test asserts the draft survives and **Load latest version** restores the stored brief |
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
-| Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
+| Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 38/38 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 261/261; `verify:sql` 89/89; `verify:stock-live` 8/8; `verify:stock-routes-live` 23/23; `verify:live-routes` 51/51; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 261/261; `verify:sql` 89/89; `verify:stock-live` 8/8; `verify:stock-routes-live` 23/23; `verify:live-routes` 51/51; `verify:r2-live` 8/8; `verify:media-live` 38/38 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -945,11 +949,11 @@ that reference. Deepgram transcription for Mode C is a separate capability and i
 | Authorized playback and another account refused | **PASS** | Playback URL returns the exact bytes; cross-owner read/complete/delete are `404` |
 | Safe deletion and shared references | **PASS** | Shared asset blocked while referenced, remains playable after one reference is released |
 | Retention and interrupted-upload cleanup | **PASS** | Clock-driven sweep tests, including a document-listed asset surviving retention until its saved scene id is removed and keyset paging past a full batch of protected rows |
-| Real R2 signing and bucket access | **PASS** | `npm run verify:r2-live`: presigned PUT/GET, signed HEAD/range/DELETE/list, 7/7 against the `story-frame` bucket |
+| Real R2 signing and bucket access | **PASS** | `npm run verify:r2-live`: presigned PUT/GET, signed HEAD/range/DELETE/list, 8/8 against the `story-frame` bucket, including a preflight from the `cors.json` preview origin |
 | Migration applied to the hosted Supabase project | **PASS** | Applied through the Management API; catalog checked (columns, table, RLS, policy, grants) |
-| Full upload through the app with a real signed-in session | **PASS** | `npm run verify:media-live`: two disposable hosted accounts, 37/37 checks, including a real bucket upload, playback, the document-delete guard, and project-deletion object cleanup |
+| Full upload through the app with a real signed-in session | **PASS** | `npm run verify:media-live`: two disposable hosted accounts, 38/38 checks, including a real bucket upload, playback, the upload-ticket CORS preflight, the document-delete guard, and project-deletion object cleanup |
 | Two-account isolation on the hosted project | **PASS** | Same check: RLS reads, refused browser write, and `404` for foreign routes |
-| Bucket CORS | **PASS** | Rule applied and probed (allowed preflight `204`, foreign origin `403`, presigned `GET` header) |
+| Bucket CORS | **PASS** | Rule applied and probed (allowed preflight `204`, foreign origin `403`, presigned `GET` header); `verify:r2-live`, `verify:media-live`, and `verify:narration-live` now fail when the bucket does not echo the `cors.json` preview origin |
 | Upload from the UI in a browser | **UNVERIFIED** | There is still no media UI; the flow is API-only until the workspace is built |
 | JSON2Video temporary input access | **DEFERRED** | Phase 9; the presign TTL policy above is the design constraint |
 
@@ -995,7 +999,7 @@ user session token was available in this environment. On 2026-11-24 the configur
 `public` schema was exported and replaced with the migrations (six in total, the last added for Phase 3; see
 [Applying the migrations](#applying-the-migrations)). The hosted catalog now matches this code: 12 tables, RLS and a
 select-own policy on each, the revision trigger, no `auth.users` trigger, and `/api/ai/status` reporting
-`ledger.ready: true`. Live routes were then exercised with two disposable users (37/37 checks,
+`ledger.ready: true`. Live routes were then exercised with two disposable users (38/38 checks,
 including two-user isolation), and `smoke:live` exited 0 with 5/5 model families and an identical
 stored replay. The test users and rows were deleted; the project is empty again.
 
@@ -1163,7 +1167,8 @@ This check is **opt-in** and touches real storage: it writes one tiny, clearly n
 it back through a presigned URL and a signed range request, deletes it, and confirms it is gone. It never creates a
 bucket or any other resource, never prints the access key, secret, or a signed URL, and exits non-zero on failure. It
 uses `R2_ENDPOINT`/`R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY` or the `CLOUDFLARE_*` fallbacks. Run on 2026-11-24 against
-the `story-frame` bucket: **7/7 checks passed**, including the signed `ListObjectsV2` list the audit pages through.
+the `story-frame` bucket on 2026-11-25: **8/8 checks passed**, including the signed `ListObjectsV2` list the audit pages
+through and a preflight of the presigned upload from the `cors.json` preview origin.
 
 ### Live media route check
 
@@ -1177,8 +1182,8 @@ presigned upload, completion, presigned playback with byte comparison, reference
 deletion, RLS reads for both accounts, a refused browser write, cross-owner `404`s, refusing the delete of an asset a
 saved scene lists (`409 MEDIA_ASSET_IN_DOCUMENT`), and project deletion removing the remaining object. It deletes the
 users, projects, rows, and objects afterwards and checks that they are gone. It never prints keys, tokens, or signed
-URLs. Cleanup covers the project even if the run fails midway. Run on 2026-11-24: **37/37 checks passed**, including
-the document-delete guard and project-deletion object cleanup.
+URLs. Cleanup covers the project even if the run fails midway. Run on 2026-11-25: **38/38 checks passed**, including the upload
+ticket's CORS preflight from the `cors.json` preview origin, the document-delete guard, and project-deletion object cleanup.
 
 ## Security limitations
 

@@ -1,6 +1,7 @@
 import { loadEnvFile } from "node:process";
 import { fileURLToPath } from "node:url";
 import { createR2Client } from "../server/r2";
+import { preflightUpload } from "./preview-origin";
 
 /**
  * Opt-in live check of the R2 signing and bucket access the media routes use.
@@ -40,9 +41,9 @@ if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) {
 }
 
 const results: { name: string; ok: boolean }[] = [];
-function check(name: string, ok: boolean): void {
+function check(name: string, ok: boolean, detail = ""): void {
   results.push({ name, ok });
-  console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+  console.log(`${ok ? "PASS" : "FAIL"}  ${name}${ok || !detail ? "" : `  (${detail})`}`);
 }
 
 const client = createR2Client({ endpoint, bucket, accessKeyId, secretAccessKey });
@@ -51,6 +52,12 @@ const payload = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 
 
 try {
   const put = client.presignPut(key, 120);
+
+  // The browser uploads straight to this URL, so the bucket must answer the
+  // preview origin's preflight. A rule left on an old hostname fails here.
+  const cors = await preflightUpload(put.url);
+  check("the bucket CORS rule lets the browser upload from the cors.json preview origin", cors.ok, cors.detail);
+
   const putResponse = await fetch(put.url, {
     method: "PUT",
     headers: { "Content-Type": "image/png" },

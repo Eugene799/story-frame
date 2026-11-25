@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { createStoryframeServer } from "../server/app";
 import { DEEPGRAM_PREVIEW_TEXT } from "../server/deepgram";
 import { sceneFingerprint } from "../shared/scene-fingerprint";
+import { preflightUpload } from "./preview-origin";
 
 /**
  * Opt-in Phase 8 acceptance check against real Deepgram, Supabase, and R2.
@@ -108,15 +109,6 @@ function wavBytes(seconds = 1): Buffer {
   bytes.writeUInt32LE(dataSize, 40);
   return bytes;
 }
-
-/** The browser's upload origin: what `cors.json` says, not what the bucket happens to allow. */
-const PREVIEW_ORIGIN = (
-  JSON.parse(readFileSync(new URL("../cors.json", import.meta.url), "utf8")) as {
-    rules: { allowed: { origins: string[] } }[];
-  }
-).rules
-  .flatMap((rule) => rule.allowed.origins)
-  .find((origin) => !origin.startsWith("http://localhost"));
 
 const MUSIC_CASES = [
   { label: "WAV", contentType: "audio/wav", bytes: wavBytes(1) },
@@ -386,28 +378,8 @@ async function main(): Promise<number> {
         uploadedNarration.contentType === previewType,
       `type=${uploadedNarration.contentType} bytes=${uploadedNarration.byteSize}`,
     );
-    const corsPreflight = PREVIEW_ORIGIN
-      ? await fetch(uploadedNarration.uploadUrl, {
-          method: "OPTIONS",
-          headers: {
-            Origin: PREVIEW_ORIGIN,
-            "Access-Control-Request-Method": "PUT",
-            "Access-Control-Request-Headers": "content-type",
-          },
-        })
-      : null;
-    const allowedOrigin = corsPreflight?.headers.get("access-control-allow-origin") ?? "none";
-    check(
-      "the bucket CORS rule lets the browser upload from the cors.json preview origin",
-      PREVIEW_ORIGIN !== undefined &&
-        corsPreflight !== null &&
-        corsPreflight.status >= 200 &&
-        corsPreflight.status < 300 &&
-        allowedOrigin === PREVIEW_ORIGIN,
-      PREVIEW_ORIGIN
-        ? `origin=${PREVIEW_ORIGIN} status=${corsPreflight?.status} allow-origin=${allowedOrigin}`
-        : "cors.json names no preview origin to test",
-    );
+    const cors = await preflightUpload(uploadedNarration.uploadUrl);
+    check("the bucket CORS rule lets the browser upload from the cors.json preview origin", cors.ok, cors.detail);
 
     const attachedNarration = await api(
       user.token,
