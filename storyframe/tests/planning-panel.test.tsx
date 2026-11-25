@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { BroadcastChannel as NodeBroadcastChannel } from "node:worker_threads";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { GenerationProposalRecord } from "../shared/child-contract";
 import type { PlanningPayload } from "../shared/planning-contract";
@@ -616,6 +617,55 @@ describe("PlanningPanel", () => {
     expect(window.sessionStorage.getItem("storyframe.planning.tabId")).not.toBe(sharedTabId);
     expect((screen.getByRole("button", { name: "Generate proposal" }) as HTMLButtonElement).disabled).toBe(true);
     expect(backend.requests.some((request) => request.path.endsWith("/planning"))).toBe(false);
+  });
+
+  it("blocks a second mounted panel using a real BroadcastChannel while the original holds the lease", async () => {
+    vi.stubGlobal("BroadcastChannel", NodeBroadcastChannel);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input), "http://localhost").pathname;
+        if (path.endsWith("/proposals")) return jsonResponse({ ok: true, proposals: [] });
+        if (path.endsWith("/planning")) {
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+          });
+        }
+        return jsonResponse({ ok: false, error: { code: "NOT_FOUND", message: "not found" } }, 404);
+      }),
+    );
+
+    const panel = (
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />
+    );
+    render(panel);
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByRole("button", { name: "Stop waiting" })).toBeTruthy();
+    const originalTabId = window.sessionStorage.getItem("storyframe.planning.tabId");
+    expect(originalTabId).toBeTruthy();
+    expect(storedLease()?.tabId).toBe(originalTabId);
+
+    // A duplicated tab shares sessionStorage, so this mount starts with the
+    // original's tab id and lease while the original page is still live.
+    render(panel);
+    const notice = await screen.findByText(/inherited another tab's planning lease/);
+    expect(window.sessionStorage.getItem("storyframe.planning.tabId")).not.toBe(originalTabId);
+    expect(storedLease()?.tabId).toBe(originalTabId);
+    expect(screen.getByRole("button", { name: "Stop waiting" })).toBeTruthy();
+    const duplicatePanel = notice.closest("section");
+    expect(duplicatePanel).not.toBeNull();
+    expect(
+      (within(duplicatePanel as HTMLElement).getByRole("button", { name: "Generate proposal" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
   });
 
   it("allows generation when the lease handshake times out with no live duplicate", async () => {
