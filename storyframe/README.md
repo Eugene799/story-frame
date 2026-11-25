@@ -3,10 +3,12 @@
 This repository state keeps the Phase 2 pieces — a **server-verified Supabase session boundary**, a **durable,
 idempotent usage ledger**, and the **project data model** with owner-scoped access — and the Phase 3 **private media
 storage in Cloudflare R2**. It adds Phase 4: a signed-in **workspace** with a dashboard, brief, script, storyboard,
-media panel, honest preview, and editable project/script export.
+media panel, honest preview, and editable project/script export. Phase 5 adds configurable one-model-per-task planning:
+validated JSON proposals for angles, scripts, storyboards, ad concepts, and transcript analysis, kept separate from
+accepted content.
 
 The connection-test screen still uses real Supabase email/password sign-in and remains a development harness only.
-Scene generation, video rendering, billing, discovery, and deployment are **not** started here.
+Video rendering, billing, discovery, and deployment are **not** started here.
 
 ## Architecture
 
@@ -57,7 +59,7 @@ npm run dev
 - API: `http://127.0.0.1:8787`
 - Web: `http://localhost:3000` (Vite proxies `/api` to the API)
 
-Before using the ledger or any project route, apply the six migrations in order. See
+Before using the ledger or any project route, apply the seven migrations in order. See
 [Applying the migrations](#applying-the-migrations) for the compatibility check that must pass
 first and the current state of the configured project.
 
@@ -94,6 +96,7 @@ these tables. Apply them in filename order:
 4. `20261124140000_create_project_children.sql`
 5. `20261124150000_create_profiles.sql`
 6. `20261124160000_create_media_storage.sql` (Phase 3: upload timestamps, `media_references`)
+7. `20261125120000_create_planning.sql` (Phase 5: source excerpts, claim quotes, proposal route/base version, `model_health`)
 
 Run the compatibility check first. It must return no rows:
 
@@ -104,7 +107,7 @@ where table_schema = 'public'
   and table_name in (
     'ai_usage', 'projects', 'project_revisions', 'scenes', 'media_metadata',
     'media_references', 'sources', 'claims', 'generation_proposals',
-    'provider_jobs', 'render_snapshots', 'profiles'
+    'provider_jobs', 'render_snapshots', 'profiles', 'model_health'
   );
 ```
 
@@ -125,14 +128,17 @@ Afterwards, check the running server rather than assuming the schema is ready:
 3. Set `SMOKE_SUPABASE_ACCESS_TOKEN` to a session token and run `npm run smoke:live` (five
    billable calls, described under Tests).
 
-**All six migrations are applied to the configured project (`myrohtkfsuppcabedwmn`), the sixth on 2026-11-24.** After
+**The first six migrations are applied to the configured project (`myrohtkfsuppcabedwmn`), the sixth on 2026-11-24.
+The seventh (Phase 5) is committed and verified against PostgreSQL by `verify:sql`, but is not applied to the hosted
+project yet: this workspace has no management token, and a direct REST probe answers `42703 column sources.excerpt does
+not exist` and `PGRST205 model_health`.** Apply it before relying on Phase 5 against the hosted project. After
 applying it, the hosted catalog was checked directly: `media_metadata` has the four added columns, `media_references`
 exists with RLS enabled, one `select` policy for `authenticated`, and only `select` granted to `authenticated`. The
 obsolete `public` schema in
 `myrohtkfsuppcabedwmn` (16 tables from an earlier project, plus `public.handle_new_user()` attached
 to `auth.users`) was exported first — six `model_registry` rows and a catalog snapshot — and then
 replaced with the first five migrations (the sixth followed on 2026-11-24). The hosted schema now has
-the 12 tables listed above, RLS and one select-own policy on each, and the `projects_record_revision`
+the 12 tables the first six migrations define, RLS and one select-own policy on each, and the `projects_record_revision`
 trigger; the old `auth.users` trigger is gone. `GET /api/ai/status` reports `ledger.ready: true`. Live profile, project, child, and
 two-user isolation routes were then exercised with disposable users; those users and their rows were
 deleted afterwards. `npm run smoke:live` was run twice: the first five-call run exposed a missing
@@ -163,6 +169,7 @@ anon) key; never the service-role key.
 | `SUPABASE_SERVICE_ROLE_KEY` | Server-only key for ledger reads/writes. Never expose it to the browser. |
 | `AUTH_TIMEOUT_MS` | Supabase Auth/ledger timeout (default 5000). |
 | `OLLAMA_MODEL_*` | Optional exact-request-id overrides for the six families. |
+| `AI_ROUTE_ANGLES`, `AI_ROUTE_SCRIPT`, `AI_ROUTE_STORYBOARD`, `AI_ROUTE_AD_CONCEPT`, `AI_ROUTE_TRANSCRIPT_ANALYSIS` | Planning route override, naming a family key from the allowlist (`gemma`, `deepseek`, `glm`, `gpt-oss`, `minimax`). The default for every route is `gemma`; a value that is unknown, disabled, or lacks the capability disables that route instead of falling back. |
 | `AI_TIMEOUT_MS`, `AI_MAX_PROMPT_CHARS`, `AI_MAX_OUTPUT_TOKENS`, `AI_MAX_REQUESTS_PER_MINUTE` | Optional bounds. |
 | `AI_ABANDON_AFTER_MS` | Age at which a pending reservation may be settled as abandoned instead of retried (default 90000, floored at the provider timeout plus three auth timeouts). |
 | `APP_ORIGIN` | Optional additional origin restriction for API calls. |
@@ -337,7 +344,7 @@ The remaining Phase 2 tables follow the same ownership pattern and are created b
 | `media_metadata` | Uploaded or generated media: kind, private object key, content type, size, status. Ownership lives in `owner_id`, never in the object key. |
 | `sources` | Where material came from: kind, title, URL, retrieval time. |
 | `claims` | Statements checked against a source, with an `unverified`/`supported`/`contradicted` status. |
-| `generation_proposals` | A proposed generation (model, prompt, proposal JSON) and whether it was accepted. |
+| `generation_proposals` | A proposed generation (route, base project version, model, prompt, validated proposal JSON) and whether it was accepted. |
 | `provider_jobs` | Asynchronous provider work such as JSON2Video: provider, status, external id, request/result. |
 | `render_snapshots` | Outputs pinned to a project revision that must exist, enforced by a composite foreign key. |
 
@@ -353,7 +360,9 @@ of those policies, so no table can drift from the pattern. Six of them are reach
 | `GET`/`POST /api/projects/:id/claims` | List claims, or add one, optionally linked to a source of the same project. |
 | `PATCH /api/projects/:id/claims/:claimId` | Set `unverified`, `supported`, or `contradicted`. |
 | `GET`/`POST /api/projects/:id/proposals` | List generation proposals, or record a frozen proposal. |
-| `PATCH /api/projects/:id/proposals/:proposalId` | Accept or reject a proposal. |
+| `PATCH /api/projects/:id/proposals/:proposalId` | Accept or reject a hand-recorded proposal. |
+| `POST /api/projects/:id/planning` | Ask one configured model for a validated planning proposal (`201`); stored against the given base version and never applied. |
+| `POST /api/projects/:id/proposals/:proposalId/accept` | Apply a pending planning proposal, respecting locks, and save one new project version (`200`); stale proposals are `409`. |
 | `GET`/`POST /api/projects/:id/jobs` | List provider jobs, or queue one. |
 | `PATCH /api/projects/:id/jobs/:jobId` | Move a job's status and record its result. |
 | `GET`/`POST /api/projects/:id/renders` | List render snapshots, or create one pinned to an existing revision. |
@@ -516,7 +525,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 149/149; `verify:sql` 69/69; `verify:live-routes` exit 0; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 165/165; `verify:sql` 77/77; `verify:live-routes` exit 0; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -538,6 +547,65 @@ reference; the row and the delete guard agree.
 
 **FAIL: none in the Phase 4 scope.** Restoring an old revision from Settings is not implemented; history is read-only
 in Phase 4.
+
+## Phase 5: six-model routing and AI planning (2026-11-25)
+
+Planning is the first billable generation step. One configured model answers one JSON request per task, and the reply is
+validated here, never trusted. A validated reply is stored as a **proposal**; accepting it is a separate, explicit
+action that writes a new project version.
+
+**Registry and routing.** `server/planning.ts` holds the registry metadata: family, capabilities, input/output limits,
+cost-rate version (`unpriced` until Phase 14), catalog check date, and `testedOn` (null until a route is really
+evaluated). `GET /api/ai/status.planning` reports every route, its configured model, availability and reason, plus each
+model's last successful call read from the `model_health` table. Routing is configuration, not a quality claim:
+
+| Route | Environment variable | Default |
+| --- | --- | --- |
+| `angles` | `AI_ROUTE_ANGLES` | `gemma` |
+| `script` | `AI_ROUTE_SCRIPT` | `gemma` |
+| `storyboard` | `AI_ROUTE_STORYBOARD` | `gemma` |
+| `ad-concept` | `AI_ROUTE_AD_CONCEPT` | `gemma` |
+| `transcript-analysis` | `AI_ROUTE_TRANSCRIPT_ANALYSIS` | `gemma` |
+
+A value that is unknown, disabled, or missing the capability disables the route (`503
+PLANNING_ROUTE_UNAVAILABLE`) instead of silently falling back. One request uses one model; there is no fan-out across
+the six families.
+
+**Validated JSON, one disclosed repair.** The prompt asks for JSON; the server parses and validates every field itself,
+because Ollama Cloud does not enforce a schema. Exactly one repair request is made after a validation failure, and the
+stored proposal carries `repairAttempted: true`. A second failure is `422 PLANNING_INVALID_JSON` and nothing is stored.
+Unknown fields (including any attempt to supply media ids), provider-set flags, scene durations outside 1–600, rewritten
+storyboard wording, and citations that are not verbatim excerpts all fail validation.
+
+**Proposals are not accepted content.** `POST /api/projects/:id/planning` stores a proposal against the reviewed
+project version. `POST /api/projects/:id/proposals/:proposalId/accept` re-checks that it is still pending and that its
+base version still matches the project (`409 PROPOSAL_STALE` otherwise; a hand-recorded Phase 2 proposal is `409
+PROPOSAL_NOT_APPLICABLE`). Accepting applies the payload, respects every lock, clears approvals for changed content,
+writes one new revision, and marks the proposal accepted. Angles record the decision without changing the document;
+transcript clips become appended scene drafts with new ids and no media links.
+
+**Factual mode and storyboards.** Claims carry a source id and a quote. The server marks a claim supported only when the
+quote is a verbatim excerpt of that supplied source; an empty quote is stored as `unverified`. Factual planning (and
+transcript analysis) with no supplied excerpt never calls a model: it stores planning notes with
+`insufficientEvidence: true`. A storyboard must return one draft per stored scene, in order, with heading and narration
+copied word for word. Claims are written only on acceptance, and the response says whether that write succeeded.
+
+### Phase 5 verification (2026-11-25)
+
+| Criterion | Status | Evidence |
+| --- | --- | --- |
+| Registry is configurable and exposes real health | **PASS** | `tests/planning.test.ts`: an override naming an unregistered model disables the route (`503`, status reports `available: false`), and a successful call records `lastSuccessAt` reported by `/api/ai/status.planning` |
+| One model per task, no fan-out | **PASS** | The script generation test asserts exactly one provider call, with the route's request id and a planning output bound |
+| JSON is independently validated with one repair | **PASS** | Invalid reply then valid reply → stored with `repairAttempted: true`, two calls; invalid twice → `422 PLANNING_INVALID_JSON`, two calls, no proposal row; unknown field (media id) → refused |
+| Proposals stay separate from accepted content | **PASS** | Generating leaves the project at version 1; accepting writes version 2 and the reopened project carries the script; accepting twice is `409 PROPOSAL_NOT_PENDING` |
+| Stale results are refused | **PASS** | A save after generation makes acceptance `409 PROPOSAL_STALE` and leaves the stored document untouched |
+| Locks win over a proposal | **PASS** | Script proposal with a rewritten locked narration: acceptance keeps the locked line, writes the unlocked visual, and appends the new scene |
+| Storyboard preserves wording, order, and valid durations | **PASS** | Two-scene document: headings/narration/ids unchanged, visual direction and durations applied; a rewritten narration is refused after repair |
+| Factual evidence maps to sources and exact quotes | **PASS** | Quoted claim is `supported` with its verbatim quote; unquoted claim is `unverified`; acceptance stores both with the quote; no excerpts → planning notes and zero provider calls |
+| Transcript analysis quotes real transcript text | **PASS** | Clip becomes a scene with the quoted words and computed duration; an invented quote is refused and stores nothing |
+| Planning is owner-scoped | **PASS** | Another account gets `404` on generate and on accept, and the provider is not called |
+| Hosted planning route checks | **UNVERIFIED** | Migration 7 is not applied to the hosted project (no management token in this workspace); direct probes return `42703 sources.excerpt` and `PGRST205 model_health`. The SQL is covered by `verify:sql` 77/77 and the routes by the mocked suite |
+| Plan tab behavior | **PASS (DOM)** | `tests/planning-panel.test.tsx`: list, generate, review, and accept through the panel, with nothing applied before acceptance and both actions disabled while the draft is dirty; included in the production build. Not exercised in a real browser in this environment |
 
 ### Phase 3 verification (2026-11-24)
 
@@ -603,7 +671,7 @@ select-own policy on each, the revision trigger, no `auth.users` trigger, and `/
 including two-user isolation), and `smoke:live` exited 0 with 5/5 model families and an identical
 stored replay. The test users and rows were deleted; the project is empty again.
 
-`npm run verify:sql` applies all six migrations to a real PostgreSQL engine (PGlite, PostgreSQL compiled to
+`npm run verify:sql` applies all seven migrations to a real PostgreSQL engine (PGlite, PostgreSQL compiled to
 WebAssembly) with Supabase-like `anon`, `authenticated`, and `service_role` roles plus an `auth.uid()` stub, then
 asserts what the server relies on: the revision trigger, owner-only reads on every table, refused browser writes, the
 conditional version update, constraint and foreign-key rejections, and the cascades from both `projects` and
@@ -661,6 +729,17 @@ Coverage includes:
   or proposal id is `404`; child rows cascade when their project is deleted
 - Child payload validation (duplicate scene key, unknown or client-supplied fields, non-http URL, unknown enum value,
   render revision below 1)
+- Planning: one provider call per route with the route's model and output bound, JSON validated independently, one
+  disclosed repair, and a second failure refused with no stored row
+- Planning contract edges: unknown fields (including media ids), provider-owned flags, invalid durations, rewritten
+  storyboard wording, invented clip quotes, and an unavailable route are all refused
+- Proposals stay separate from accepted content: generation does not touch the project, acceptance applies locks and
+  saves one new version, a second acceptance is `409`, and a stale base version is `409`
+- Factual planning without a supplied excerpt makes zero provider calls and stores planning notes; claims are marked
+  `supported` only for a verbatim source excerpt and `unverified` otherwise, and are written on acceptance
+- Transcript clips become scene drafts with the quoted words, and planning routes are owner-scoped (`404` cross-account)
+- Plan tab: generate/review/accept through the real panel component, nothing applied before acceptance, and both actions
+  disabled while the workspace draft is dirty
 - Media upload lifecycle for image, audio, and video: presigned ticket, direct upload, real-size and magic-byte
   validation, playback through a second presigned URL, and the stored detected content type
 - Media type mismatch and empty/oversized uploads discarded; oversized declarations and the per-account quota refused
@@ -754,7 +833,8 @@ the document-delete guard and project-deletion object cleanup.
 - Email/password sign-in only; there is no sign-up, password-reset, MFA, OAuth, or account-management UI. The
   Supabase client persists session tokens in browser `localStorage`; production needs an explicit session-storage and
   CSP review. Sign-out is local to this browser and does not revoke the account's other sessions.
-- The migrations and RLS policies are applied to the configured Supabase project. The hosted catalog was checked (11
+- The first six migrations and RLS policies are applied to the configured Supabase project; the Phase 5 migration is not
+  applied there yet (see Applying the migrations). The hosted catalog was checked (11
   tables, RLS, policies, grants, revision trigger), live profile/project/child routes and two-user isolation passed
   39/39 checks on the hardening commit, and the disposable users were deleted afterwards. Rerun these checks with
   `npm run verify:live-routes`. `smoke:live` exposed a live-only missing-column
@@ -775,8 +855,15 @@ the document-delete guard and project-deletion object cleanup.
   durable quotas, and a real auth flow.
 - The workspace is single-user per project and has no conflict merging: a stale save is refused, the draft is kept,
   and the caller must load the latest version. Revision history is read-only; restoring an old version is future work.
-- Scene generation, model planning, and video rendering are not implemented. The planning budget is recorded in the
-  brief but nothing spends it, and Preview/Export are explicitly storyboard and editable-document outputs.
+- Scene generation and video rendering are not implemented. Phase 5 plans angles, scripts, storyboards, ad concepts, and
+  transcript clips as proposals; the planning budget is recorded in the brief but nothing spends or enforces it, and
+  Preview/Export remain storyboard and editable-document outputs.
+- Planning has no idempotency key: a retried generate is a second billable call and a second proposal. Proposals are
+  never deleted, and accepting one does not release the project version it was based on beyond the staleness check.
+- The model-health counters are read-then-written in the API process, so two concurrent calls can lose one count; the
+  timestamps and error codes are best-effort evidence, not an audit log. Cost rates stay `unpriced` until Phase 14.
+- Planning is verified against the local fake and `verify:sql`; it has not been run against the hosted project because
+  its migration is unapplied, and the new Plan tab has not been exercised in a browser in this environment.
 - Media deletion is refused while an asset is referenced. The Media tab can detach an attached scene, which releases
   the reference and saves the asset id out of the document, so deletion is reachable from the UI. Saves also refuse
   scene asset ids that are not ready media in the same project, so a direct API write cannot create a dangling id.

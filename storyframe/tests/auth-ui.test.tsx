@@ -34,6 +34,7 @@ const STATUS: AiStatusResponse = {
       catalogStatus: "listed",
     },
   ],
+  planning: { routes: [], registry: [] },
 };
 
 const SUCCESS = {

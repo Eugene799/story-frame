@@ -3,15 +3,17 @@ import type { ProjectDocumentV2, ProjectRecord } from "../../shared/project-cont
 import { AiRequestError, getProject, updateProject } from "../api";
 import { BriefPanel } from "./BriefPanel";
 import { MediaPanel } from "./MediaPanel";
+import { PlanningPanel } from "./PlanningPanel";
 import { PreviewPanel } from "./PreviewPanel";
 import { ScriptPanel } from "./ScriptPanel";
 import { SettingsPanel } from "./SettingsPanel";
 import { StoryboardPanel } from "./StoryboardPanel";
 
-type EditorTab = "brief" | "script" | "storyboard" | "media" | "preview" | "settings";
+type EditorTab = "brief" | "plan" | "script" | "storyboard" | "media" | "preview" | "settings";
 
 const TABS: { id: EditorTab; label: string }[] = [
   { id: "brief", label: "Brief" },
+  { id: "plan", label: "Plan" },
   { id: "script", label: "Script" },
   { id: "storyboard", label: "Storyboard" },
   { id: "media", label: "Media" },
@@ -51,11 +53,12 @@ export function ProjectEditor({
   const [tab, setTab] = useState<EditorTab>("brief");
   const [saving, setSaving] = useState(false);
   const [mediaBusy, setMediaBusy] = useState(false);
+  const [planBusy, setPlanBusy] = useState(false);
   const [error, setError] = useState<AiRequestError | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [conflict, setConflict] = useState(false);
 
-  const busy = saving || mediaBusy;
+  const busy = saving || mediaBusy || planBusy;
   const dirty = title !== saved.title || JSON.stringify(draft) !== JSON.stringify(saved.document);
 
   useEffect(() => {
@@ -232,6 +235,24 @@ export function ProjectEditor({
       <div role="tabpanel" aria-label={TABS.find((item) => item.id === tab)?.label}>
         {tab === "brief" && (
           <BriefPanel brief={draft.brief} onChange={(brief) => setDraft({ ...draft, brief })} />
+        )}
+        {tab === "plan" && (
+          <PlanningPanel
+            projectId={saved.id}
+            baseVersion={saved.version}
+            scenes={draft.scenes}
+            dirty={dirty}
+            getAccessToken={getAccessToken}
+            onBusyChange={setPlanBusy}
+            onAccepted={(updated) => {
+              setSaved(updated);
+              setDraft(updated.document);
+              setTitle(updated.title);
+              setConflict(false);
+              setNotice(`Accepted proposal; saved version ${updated.version}.`);
+              onSaved?.(updated);
+            }}
+          />
         )}
         {tab === "script" && (
           <ScriptPanel

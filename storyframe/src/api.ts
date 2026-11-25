@@ -5,6 +5,8 @@ import type {
   MediaReferenceRecord,
   MediaUploadTicket,
 } from "../shared/media-contract";
+import type { GenerationProposalRecord } from "../shared/child-contract";
+import type { PlanningAcceptedResponse, PlanningStartRequest } from "../shared/planning-contract";
 import type {
   ProjectDeletedResponse,
   ProjectDocumentV2,
@@ -256,6 +258,58 @@ export async function deleteMediaRecord(
     { method: "DELETE" },
   );
   return body.deletedId;
+}
+
+export async function listProjectProposals(
+  accessToken: string,
+  projectId: string,
+): Promise<GenerationProposalRecord[]> {
+  return (
+    await authorizedJson<{ ok: true; proposals: GenerationProposalRecord[] }>(
+      `/api/projects/${projectId}/proposals`,
+      accessToken,
+    )
+  ).proposals;
+}
+
+export async function generatePlanningProposal(
+  accessToken: string,
+  projectId: string,
+  request: PlanningStartRequest,
+): Promise<GenerationProposalRecord> {
+  return (
+    await authorizedJson<{ ok: true; proposal: GenerationProposalRecord }>(
+      `/api/projects/${projectId}/planning`,
+      accessToken,
+      { method: "POST", body: request },
+    )
+  ).proposal;
+}
+
+export async function acceptPlanningProposal(
+  accessToken: string,
+  projectId: string,
+  proposalId: string,
+): Promise<PlanningAcceptedResponse> {
+  return authorizedJson<PlanningAcceptedResponse>(
+    `/api/projects/${projectId}/proposals/${proposalId}/accept`,
+    accessToken,
+    { method: "POST", body: {} },
+  );
+}
+
+export async function rejectPlanningProposal(
+  accessToken: string,
+  projectId: string,
+  proposalId: string,
+): Promise<GenerationProposalRecord> {
+  return (
+    await authorizedJson<{ ok: true; proposal: GenerationProposalRecord }>(
+      `/api/projects/${projectId}/proposals/${proposalId}`,
+      accessToken,
+      { method: "PATCH", body: { status: "rejected" } },
+    )
+  ).proposal;
 }
 
 export interface AiTestOutcome {

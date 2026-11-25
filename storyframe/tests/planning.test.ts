@@ -1,0 +1,621 @@
+import { describe, expect, it, vi } from "vitest";
+import type { AiStatusResponse } from "../shared/ai-contract";
+import type { GenerationProposalRecord } from "../shared/child-contract";
+import type { PlanningPayload } from "../shared/planning-contract";
+import type { ProjectDocumentV2, ProjectRecord } from "../shared/project-contract";
+import { USER_A, USER_B } from "./fake-supabase";
+import { documentFixture, sceneFixture } from "./project-fixture";
+import { apiRequest, startTestServer, type TestApp } from "./server-helpers";
+
+// MOCKED: the provider is a local stub. Supabase is the local fake. The SQL
+// migration behind the new columns is verified separately by `verify:sql`.
+
+interface ProviderCall {
+  model: string;
+  prompt: string;
+  numPredict: number;
+}
+
+/** Returns queued replies; the last reply repeats if the server asks again. */
+function stubProvider(replies: string[]) {
+  const calls: ProviderCall[] = [];
+  let index = 0;
+  const impl = vi.fn<typeof fetch>(async (input, init) => {
+    if (!String(input).endsWith("/api/chat")) return new Response("not found", { status: 404 });
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      model?: string;
+      messages?: { content?: string }[];
+      options?: { num_predict?: number };
+    };
+    calls.push({
+      model: body.model ?? "",
+      prompt: body.messages?.[0]?.content ?? "",
+      numPredict: body.options?.num_predict ?? 0,
+    });
+    const reply = replies[Math.min(index, replies.length - 1)] ?? "";
+    index += 1;
+    return new Response(
+      JSON.stringify({ model: body.model ?? "gemma4:31b", message: { content: reply }, done: true }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  });
+  return { impl, calls };
+}
+
+async function createProject(
+  appUrl: string,
+  document: ProjectDocumentV2 = documentFixture(),
+  projectType: "story" | "product-ad" | "repurpose" = "story",
+): Promise<string> {
+  const response = await apiRequest(appUrl, "/api/projects", {
+    method: "POST",
+    body: JSON.stringify({ projectType, title: "Planning subject", document }),
+  });
+  expect(response.status).toBe(201);
+  return ((await response.json()) as { project: { id: string } }).project.id;
+}
+
+function generate(
+  appUrl: string,
+  projectId: string,
+  body: { route: string; instruction?: string; baseVersion: number },
+  token: string = USER_A.token,
+) {
+  return apiRequest(appUrl, `/api/projects/${projectId}/planning`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  }, token);
+}
+
+function accept(appUrl: string, projectId: string, proposalId: string, token: string = USER_A.token) {
+  return apiRequest(
+    appUrl,
+    `/api/projects/${projectId}/proposals/${proposalId}/accept`,
+    { method: "POST", body: "{}" },
+    token,
+  );
+}
+
+function scriptReply(narration: string, extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    summary: "The courier opens the letter.",
+    notes: ["Kept the letter as the through-line."],
+    angles: [],
+    clips: [],
+    claims: [],
+    scenes: [
+      {
+        heading: "INT. TRAIN CAR - NIGHT",
+        narration,
+        visualDirection: "Close on the envelope.",
+        onScreenText: "",
+        durationSeconds: 8,
+      },
+    ],
+    ...extra,
+  });
+}
+
+function twoSceneDocument(): ProjectDocumentV2 {
+  return documentFixture({
+    scenes: [
+      sceneFixture({ id: "scene-1", heading: "INT. TRAIN CAR - NIGHT", body: "The letter waits." }),
+      sceneFixture({ id: "scene-2", heading: "EXT. PLATFORM - DAWN", body: "She runs for the train." }),
+    ],
+  });
+}
+
+describe("Phase 5 planning", () => {
+  it("generates validated JSON, records health, and applies it only on acceptance", async () => {
+    const provider = stubProvider([scriptReply("The letter is opened at last.")]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url);
+      const response = await generate(app.url, projectId, { route: "script", baseVersion: 1 });
+      expect(response.status).toBe(201);
+      const { proposal } = (await response.json()) as { proposal: GenerationProposalRecord };
+      const payload = proposal.proposal as unknown as PlanningPayload;
+
+      expect(provider.calls).toHaveLength(1);
+      expect(provider.calls[0].model).toBe("gemma4:31b");
+      expect(provider.calls[0].numPredict).toBeGreaterThan(120);
+      expect(provider.calls[0].prompt).toContain("A letter that arrives too late");
+      expect(proposal).toMatchObject({ route: "script", baseVersion: 1, status: "proposed", modelId: "gemma" });
+      expect(payload).toMatchObject({ route: "script", repairAttempted: false, insufficientEvidence: false });
+      expect(payload.scenes).toHaveLength(1);
+
+      // A generated proposal is not accepted content.
+      const before = await apiRequest(app.url, `/api/projects/${projectId}`);
+      expect(((await before.json()) as { project: ProjectRecord }).project.version).toBe(1);
+
+      const accepted = await accept(app.url, projectId, proposal.id);
+      expect(accepted.status).toBe(200);
+      const acceptedBody = (await accepted.json()) as {
+        proposal: GenerationProposalRecord;
+        project: ProjectRecord;
+        claimsRecorded: boolean;
+      };
+      expect(acceptedBody.claimsRecorded).toBe(true);
+      expect(acceptedBody.proposal.status).toBe("accepted");
+      expect(acceptedBody.project.version).toBe(2);
+      expect(acceptedBody.project.document.scenes[0].body).toBe("The letter is opened at last.");
+
+      const reopened = await apiRequest(app.url, `/api/projects/${projectId}`);
+      const stored = ((await reopened.json()) as { project: ProjectRecord }).project;
+      expect(stored.version).toBe(2);
+      expect(stored.document.scenes[0].body).toBe("The letter is opened at last.");
+
+      const second = await accept(app.url, projectId, proposal.id);
+      expect(second.status).toBe(409);
+      expect(await second.json()).toMatchObject({ ok: false, error: { code: "PROPOSAL_NOT_PENDING" } });
+
+      // Registry health is evidence, not a name-based claim.
+      const status = (await (await fetch(`${app.url}/api/ai/status`)).json()) as AiStatusResponse;
+      const gemma = status.planning.registry.find((entry) => entry.modelId === "gemma");
+      expect(gemma?.lastSuccessAt).not.toBeNull();
+      expect(status.planning.routes.find((route) => route.route === "script")).toMatchObject({
+        modelId: "gemma",
+        available: true,
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("repairs invalid JSON once, then accepts the repaired reply", async () => {
+    const provider = stubProvider(["Sure! Here is your plan.", scriptReply("Repaired wording.")]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url);
+      const response = await generate(app.url, projectId, { route: "script", baseVersion: 1 });
+      expect(response.status).toBe(201);
+      const { proposal } = (await response.json()) as { proposal: GenerationProposalRecord };
+      const payload = proposal.proposal as unknown as PlanningPayload;
+
+      expect(provider.calls).toHaveLength(2);
+      expect(provider.calls[1].prompt).toContain("rejected by validation");
+      expect(payload.repairAttempted).toBe(true);
+      expect(payload.scenes[0].narration).toBe("Repaired wording.");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("refuses a reply that stays invalid after one repair, storing nothing", async () => {
+    const invalid = JSON.stringify({
+      summary: "S",
+      notes: [],
+      angles: [],
+      clips: [],
+      claims: [],
+      scenes: [
+        {
+          heading: "H",
+          narration: "N",
+          visualDirection: "",
+          onScreenText: "",
+          durationSeconds: 0,
+        },
+      ],
+    });
+    const provider = stubProvider(["not json at all", invalid]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url);
+      const response = await generate(app.url, projectId, { route: "script", baseVersion: 1 });
+      expect(response.status).toBe(422);
+      expect(await response.json()).toMatchObject({ ok: false, error: { code: "PLANNING_INVALID_JSON" } });
+      expect(provider.calls).toHaveLength(2);
+      expect(app.supabase.proposals).toHaveLength(0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("rejects fields outside the contract, including invented media ids", async () => {
+    const withAsset = scriptReply("Word.", {
+      scenes: [
+        {
+          heading: "INT. TRAIN CAR - NIGHT",
+          narration: "Word.",
+          visualDirection: "",
+          onScreenText: "",
+          durationSeconds: 8,
+          assetIds: ["11111111-1111-4111-8111-111111111111"],
+        },
+      ],
+    });
+    const provider = stubProvider([withAsset, withAsset]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url);
+      const response = await generate(app.url, projectId, { route: "script", baseVersion: 1 });
+      expect(response.status).toBe(422);
+      const body = (await response.json()) as { error: { message: string } };
+      expect(body.error.message).toContain("unexpected field");
+      expect(app.supabase.proposals).toHaveLength(0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("keeps storyboard wording and order word for word", async () => {
+    const document = twoSceneDocument();
+    const storyboard = JSON.stringify({
+      summary: "Two beats from the existing script.",
+      notes: [],
+      angles: [],
+      clips: [],
+      claims: [],
+      scenes: document.scenes.map((scene, index) => ({
+        heading: scene.heading,
+        narration: scene.body,
+        visualDirection: `Board ${index + 1}`,
+        onScreenText: index === 0 ? "ONE LAST TRAIN" : "",
+        durationSeconds: 10 + index,
+      })),
+    });
+    const provider = stubProvider([storyboard]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url, document);
+      const response = await generate(app.url, projectId, { route: "storyboard", baseVersion: 1 });
+      expect(response.status).toBe(201);
+      const { proposal } = (await response.json()) as { proposal: GenerationProposalRecord };
+      const accepted = await accept(app.url, projectId, proposal.id);
+      expect(accepted.status).toBe(200);
+      const body = (await accepted.json()) as { project: ProjectRecord };
+
+      expect(body.project.document.scenes.map((scene) => scene.body)).toEqual([
+        "The letter waits.",
+        "She runs for the train.",
+      ]);
+      expect(body.project.document.scenes.map((scene) => scene.visualDirection)).toEqual(["Board 1", "Board 2"]);
+      expect(body.project.document.scenes.map((scene) => scene.durationSeconds)).toEqual([10, 11]);
+      expect(body.project.document.scenes.map((scene) => scene.id)).toEqual(["scene-1", "scene-2"]);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("refuses a storyboard that rewrites the script", async () => {
+    const document = twoSceneDocument();
+    const rewritten = JSON.stringify({
+      summary: "Better wording, allegedly.",
+      notes: [],
+      angles: [],
+      clips: [],
+      claims: [],
+      scenes: document.scenes.map((scene, index) => ({
+        heading: scene.heading,
+        narration: index === 0 ? "A reworded line." : scene.body,
+        visualDirection: "Board",
+        onScreenText: "",
+        durationSeconds: 10,
+      })),
+    });
+    const provider = stubProvider([rewritten, rewritten]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url, document);
+      const response = await generate(app.url, projectId, { route: "storyboard", baseVersion: 1 });
+      expect(response.status).toBe(422);
+      expect(await response.json()).toMatchObject({ ok: false, error: { code: "PLANNING_INVALID_JSON" } });
+      expect(provider.calls).toHaveLength(2);
+      expect(app.supabase.proposals).toHaveLength(0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("never replaces a locked component when a proposal is accepted", async () => {
+    const document = documentFixture({
+      scenes: [
+        sceneFixture({
+          id: "scene-1",
+          body: "Locked line.",
+          locks: { narration: true, visualDirection: false, onScreenText: false, duration: false },
+        }),
+      ],
+    });
+    const reply = JSON.stringify({
+      summary: "Two beats.",
+      notes: [],
+      angles: [],
+      clips: [],
+      claims: [],
+      scenes: [
+        {
+          heading: "INT. TRAIN CAR - NIGHT",
+          narration: "The model rewrote the locked line.",
+          visualDirection: "New visual.",
+          onScreenText: "",
+          durationSeconds: 9,
+        },
+        {
+          heading: "EXT. PLATFORM - DAWN",
+          narration: "A second beat.",
+          visualDirection: "Platform.",
+          onScreenText: "",
+          durationSeconds: 6,
+        },
+      ],
+    });
+    const provider = stubProvider([reply]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url, document);
+      const response = await generate(app.url, projectId, { route: "script", baseVersion: 1 });
+      const { proposal } = (await response.json()) as { proposal: GenerationProposalRecord };
+      const accepted = await accept(app.url, projectId, proposal.id);
+      expect(accepted.status).toBe(200);
+      const body = (await accepted.json()) as { project: ProjectRecord };
+
+      expect(body.project.document.scenes[0].body).toBe("Locked line.");
+      expect(body.project.document.scenes[0].visualDirection).toBe("New visual.");
+      expect(body.project.document.scenes).toHaveLength(2);
+      expect(body.project.document.scenes[1].body).toBe("A second beat.");
+      expect(body.project.document.scenes[1].locks.narration).toBe(false);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("returns planning notes instead of a sourced script when factual evidence is missing", async () => {
+    const provider = stubProvider([scriptReply("Should never be requested.")]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const document = documentFixture({ brief: { ...documentFixture().brief, mode: "factual" } });
+      const projectId = await createProject(app.url, document);
+      const response = await generate(app.url, projectId, { route: "script", baseVersion: 1 });
+      expect(response.status).toBe(201);
+      const { proposal } = (await response.json()) as { proposal: GenerationProposalRecord };
+      const payload = proposal.proposal as unknown as PlanningPayload;
+
+      expect(provider.calls).toHaveLength(0);
+      expect(payload.insufficientEvidence).toBe(true);
+      expect(payload.scenes).toHaveLength(0);
+      expect(payload.notes.length).toBeGreaterThan(0);
+      expect(proposal.prompt).toContain("No provider call");
+
+      const accepted = await accept(app.url, projectId, proposal.id);
+      expect(accepted.status).toBe(200);
+      const body = (await accepted.json()) as { project: ProjectRecord };
+      expect(body.project.version).toBe(1);
+      expect(body.project.document.scenes[0].body).toBe("The letter waits under a seat, addressed to nobody.");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("maps claims to source ids and verbatim excerpts, flagging unquoted claims", async () => {
+    // The source id only exists after it is created, so the reply is built from
+    // the source line the server put in the prompt.
+    const impl = vi.fn<typeof fetch>(async (input, init) => {
+      if (!String(input).endsWith("/api/chat")) return new Response("not found", { status: 404 });
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        model?: string;
+        messages?: { content?: string }[];
+      };
+      const prompt = body.messages?.[0]?.content ?? "";
+      const sourceId = /\[source ([0-9a-f-]{36})\]/.exec(prompt)?.[1] ?? "";
+      const reply = scriptReply("The city moved more people.", {
+        claims: [
+          { sourceId, statement: "Ridership rose 12 percent.", quote: "ridership rose 12 percent" },
+          { sourceId, statement: "The agency plans to expand service.", quote: "" },
+        ],
+      });
+      return new Response(
+        JSON.stringify({ model: "gemma4:31b", message: { content: reply }, done: true }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+    const app = await startTestServer({ fetchImpl: impl });
+    try {
+      const document = documentFixture({ brief: { ...documentFixture().brief, mode: "factual" } });
+      const projectId = await createProject(app.url, document);
+      const sourceResponse = await apiRequest(app.url, `/api/projects/${projectId}/sources`, {
+        method: "POST",
+        body: JSON.stringify({
+          kind: "web",
+          title: "Ridership report",
+          url: "https://example.com/report",
+          excerpt: "City ridership rose 12 percent in 2025.",
+        }),
+      });
+      expect(sourceResponse.status).toBe(201);
+      const source = ((await sourceResponse.json()) as { source: { id: string } }).source;
+
+      const generated = await generate(app.url, projectId, { route: "script", baseVersion: 1 });
+      expect(generated.status).toBe(201);
+      const { proposal } = (await generated.json()) as { proposal: GenerationProposalRecord };
+      const payload = proposal.proposal as unknown as PlanningPayload;
+      expect(payload.claims).toHaveLength(2);
+      expect(payload.claims[0]).toMatchObject({
+        sourceId: source.id,
+        supported: true,
+        quote: "ridership rose 12 percent",
+      });
+      expect(payload.claims[1]).toMatchObject({ sourceId: source.id, supported: false, quote: "" });
+
+      const accepted = await accept(app.url, projectId, proposal.id);
+      expect(accepted.status).toBe(200);
+      const body = (await accepted.json()) as { claimsRecorded: boolean };
+      expect(body.claimsRecorded).toBe(true);
+      expect(app.supabase.claims).toHaveLength(2);
+      expect(app.supabase.claims[0]).toMatchObject({
+        source_id: source.id,
+        status: "supported",
+        supporting_quote: "ridership rose 12 percent",
+      });
+      expect(app.supabase.claims[1]).toMatchObject({ status: "unverified", supporting_quote: null });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("rejects a stale proposal after the project changes", async () => {
+    const provider = stubProvider([scriptReply("First attempt wording.")]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url);
+      const generated = await generate(app.url, projectId, { route: "script", baseVersion: 1 });
+      const { proposal } = (await generated.json()) as { proposal: GenerationProposalRecord };
+
+      const saved = await apiRequest(app.url, `/api/projects/${projectId}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          title: "Planning subject (renamed)",
+          document: documentFixture(),
+          version: 1,
+        }),
+      });
+      expect(saved.status).toBe(200);
+
+      const response = await accept(app.url, projectId, proposal.id);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ ok: false, error: { code: "PROPOSAL_STALE" } });
+
+      const after = await apiRequest(app.url, `/api/projects/${projectId}`);
+      const stored = ((await after.json()) as { project: ProjectRecord }).project;
+      expect(stored.version).toBe(2);
+      expect(stored.document.scenes[0].body).toBe("The letter waits under a seat, addressed to nobody.");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("reports an unavailable route instead of guessing a model", async () => {
+    const provider = stubProvider([scriptReply("unused")]);
+    const app = await startTestServer({
+      fetchImpl: provider.impl,
+      env: { AI_ROUTE_SCRIPT: "not-a-registered-model" },
+    });
+    try {
+      const projectId = await createProject(app.url);
+      const response = await generate(app.url, projectId, { route: "script", baseVersion: 1 });
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({ ok: false, error: { code: "PLANNING_ROUTE_UNAVAILABLE" } });
+      expect(provider.calls).toHaveLength(0);
+
+      const status = (await (await fetch(`${app.url}/api/ai/status`)).json()) as AiStatusResponse;
+      const script = status.planning.routes.find((route) => route.route === "script");
+      expect(script?.available).toBe(false);
+      expect(script?.reason).toMatch(/without planning metadata/);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("turns transcript clips into scene drafts with the quoted words", async () => {
+    const transcript = "We rebuilt the whole engine in a weekend. It shipped on Monday.";
+    const reply = JSON.stringify({
+      summary: "One usable clip.",
+      notes: [],
+      angles: [],
+      scenes: [],
+      claims: [],
+      clips: [
+        {
+          startSeconds: 2,
+          endSeconds: 12,
+          quote: "We rebuilt the whole engine in a weekend.",
+          heading: "Engine rebuild",
+          rationale: "Concrete and specific.",
+        },
+      ],
+    });
+    const provider = stubProvider([reply]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const document = documentFixture({ scenes: [] });
+      const projectId = await createProject(app.url, document, "repurpose");
+      const created = await apiRequest(app.url, `/api/projects/${projectId}/sources`, {
+        method: "POST",
+        body: JSON.stringify({ kind: "interview", title: "Founder interview", excerpt: transcript }),
+      });
+      expect(created.status).toBe(201);
+
+      const generated = await generate(app.url, projectId, { route: "transcript-analysis", baseVersion: 1 });
+      expect(generated.status).toBe(201);
+      const { proposal } = (await generated.json()) as { proposal: GenerationProposalRecord };
+      const accepted = await accept(app.url, projectId, proposal.id);
+      expect(accepted.status).toBe(200);
+      const body = (await accepted.json()) as { project: ProjectRecord };
+
+      expect(body.project.document.scenes).toHaveLength(1);
+      expect(body.project.document.scenes[0]).toMatchObject({
+        heading: "Engine rebuild",
+        body: "We rebuilt the whole engine in a weekend.",
+        durationSeconds: 10,
+        onScreenText: "",
+        assetIds: [],
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("refuses a clip that is not quoted from the supplied transcript", async () => {
+    const reply = JSON.stringify({
+      summary: "Invented quote.",
+      notes: [],
+      angles: [],
+      scenes: [],
+      claims: [],
+      clips: [
+        {
+          startSeconds: 0,
+          endSeconds: 8,
+          quote: "We rebuilt it in a day.",
+          heading: "Invented",
+          rationale: "Not in the transcript.",
+        },
+      ],
+    });
+    const provider = stubProvider([reply, reply]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url, documentFixture({ scenes: [] }), "repurpose");
+      await apiRequest(app.url, `/api/projects/${projectId}/sources`, {
+        method: "POST",
+        body: JSON.stringify({ kind: "interview", title: "Founder interview", excerpt: "We rebuilt it in a weekend." }),
+      });
+      const response = await generate(app.url, projectId, { route: "transcript-analysis", baseVersion: 1 });
+      expect(response.status).toBe(422);
+      expect(app.supabase.proposals).toHaveLength(0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("keeps planning private and refuses a hand-recorded proposal", async () => {
+    const provider = stubProvider([scriptReply("Scoped.")]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url);
+      const foreign = await generate(app.url, projectId, { route: "script", baseVersion: 1 }, USER_B.token);
+      expect(foreign.status).toBe(404);
+      expect(await foreign.json()).toMatchObject({ ok: false, error: { code: "PROJECT_NOT_FOUND" } });
+      expect(provider.calls).toHaveLength(0);
+
+      const generated = await generate(app.url, projectId, { route: "script", baseVersion: 1 });
+      const { proposal } = (await generated.json()) as { proposal: GenerationProposalRecord };
+      const foreignAccept = await accept(app.url, projectId, proposal.id, USER_B.token);
+      expect(foreignAccept.status).toBe(404);
+
+      const manual = await apiRequest(app.url, `/api/projects/${projectId}/proposals`, {
+        method: "POST",
+        body: JSON.stringify({ modelId: "gemma", prompt: "Hand recorded", proposal: { scenes: [] } }),
+      });
+      expect(manual.status).toBe(201);
+      const manualProposal = ((await manual.json()) as { proposal: GenerationProposalRecord }).proposal;
+      expect(manualProposal.route).toBe("legacy");
+      const manualAccept = await accept(app.url, projectId, manualProposal.id);
+      expect(manualAccept.status).toBe(409);
+      expect(await manualAccept.json()).toMatchObject({ ok: false, error: { code: "PROPOSAL_NOT_APPLICABLE" } });
+    } finally {
+      await app.close();
+    }
+  });
+});

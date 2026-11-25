@@ -57,6 +57,25 @@ import {
 } from "./media";
 import { R2Error, createR2Client, type R2Client } from "./r2";
 import { startMediaSweeper } from "./media-scheduler";
+import { createSupabaseModelHealthStore, type ModelHealthStore } from "./model-health";
+import {
+  PLANNING_LIMITS,
+  PLANNING_MODELS,
+  applyPlanningProposal,
+  buildPlanningPrompt,
+  findPlanningRoute,
+  generatePlanningPayload,
+  insufficientEvidencePayload,
+  planningRegistryWithModels,
+  type ResolvedPlanningRoute,
+} from "./planning";
+import {
+  PLANNING_ROUTES,
+  type PlanningPayload,
+  type PlanningRoute,
+  type PlanningStartRequest,
+  type PlanningStatus,
+} from "../shared/planning-contract";
 import {
   PROFILE_LIMITS,
   createSupabaseProfileStore,
@@ -85,6 +104,7 @@ const LEDGER_READY_TTL_MS = 30_000;
 const CHILD_RESOURCES = new Set(["scenes", "sources", "claims", "proposals", "jobs", "renders"]);
 const PROJECT_REVISIONS_LIMIT = 20;
 const USAGE_PAGE_SIZE = 20;
+const PLANNING_BODY_BYTES = 8 * 1024;
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 const ABANDONED_MESSAGE =
   "This attempt did not finish, so its outcome is unknown and it was not retried. Ollama may have charged for it. Use a new Idempotency-Key only if you accept a possible duplicate charge.";
@@ -150,7 +170,7 @@ function sendJson(
   response.end(JSON.stringify(body));
 }
 
-function buildStatus(config: AppConfig, ledgerReady: boolean): AiStatusResponse {
+function buildStatus(config: AppConfig, ledgerReady: boolean, planning: PlanningStatus): AiStatusResponse {
   const authConfigured = config.supabaseUrl !== null && config.supabasePublishableKey !== null;
   const ledgerConfigured = config.supabaseUrl !== null && config.supabaseServiceRoleKey !== null;
 
@@ -182,6 +202,7 @@ function buildStatus(config: AppConfig, ledgerReady: boolean): AiStatusResponse 
       abandonAfterMs: config.abandonAfterMs,
     },
     models: config.models,
+    planning,
   };
 }
 
@@ -281,6 +302,49 @@ function readJsonBody(request: IncomingMessage, maxBytes: number): Promise<unkno
   });
 }
 
+function parsePlanningStart(body: unknown, currentVersion: number): PlanningStartRequest {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "INVALID_PLANNING_REQUEST", "Request body must be a JSON object.");
+  }
+  const record = body as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (key !== "route" && key !== "instruction" && key !== "baseVersion") {
+      throw new HttpError(400, "UNEXPECTED_FIELD", "Request body may only contain route, instruction, and baseVersion.");
+    }
+  }
+  if (typeof record.route !== "string" || !PLANNING_ROUTES.includes(record.route as PlanningRoute)) {
+    throw new HttpError(400, "INVALID_PLANNING_ROUTE", `route must be one of ${PLANNING_ROUTES.join(", ")}.`);
+  }
+  let instruction = "";
+  if (record.instruction !== undefined && record.instruction !== null) {
+    if (typeof record.instruction !== "string") {
+      throw new HttpError(400, "INVALID_PLANNING_REQUEST", "instruction must be a string.");
+    }
+    instruction = record.instruction.trim();
+    if (instruction.length > PLANNING_LIMITS.instructionChars) {
+      throw new HttpError(
+        400,
+        "INVALID_PLANNING_REQUEST",
+        `instruction must be at most ${PLANNING_LIMITS.instructionChars} characters.`,
+      );
+    }
+  }
+  const baseVersion = record.baseVersion;
+  if (typeof baseVersion !== "number" || !Number.isInteger(baseVersion) || baseVersion < 1) {
+    throw new HttpError(400, "INVALID_PLANNING_REQUEST", "baseVersion must be a positive integer.");
+  }
+  if (baseVersion !== currentVersion) {
+    // The caller reviewed a different document; refusing here keeps a stale
+    // plan from being generated against wording the user can no longer see.
+    throw new HttpError(
+      409,
+      "STALE_PLANNING_REQUEST",
+      `This project is at version ${currentVersion}, not ${baseVersion}. Reload it before planning.`,
+    );
+  }
+  return { route: record.route as PlanningRoute, instruction, baseVersion };
+}
+
 function validateTestBody(body: unknown, config: AppConfig): { modelId: string; prompt: string } {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw new HttpError(400, "INVALID_BODY", "Request body must be a JSON object.");
@@ -378,6 +442,15 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         })
       : null;
 
+  const modelHealth: ModelHealthStore | null =
+    config.supabaseUrl && config.supabaseServiceRoleKey
+      ? createSupabaseModelHealthStore({
+          url: config.supabaseUrl,
+          serviceRoleKey: config.supabaseServiceRoleKey,
+          timeoutMs: config.authTimeoutMs,
+        })
+      : null;
+
   const mediaObjects: R2Client | null = config.r2 ? createR2Client(config.r2, { fetchImpl, now }) : null;
   let lastMediaSweep = 0;
   let mediaSweep: Promise<void> | null = null;
@@ -437,7 +510,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     if (path === "/api/ai/status") {
       if (method !== "GET") throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for this endpoint.");
       const ledgerReady = await readLedgerReadiness();
-      sendJson(response, 200, buildStatus(config, ledgerReady));
+      sendJson(response, 200, buildStatus(config, ledgerReady, await readPlanningStatus()));
       return;
     }
 
@@ -492,6 +565,41 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         throw new HttpError(error.status, error.code, error.message);
       }
       throw error;
+    }
+  }
+
+  async function readPlanningStatus(): Promise<PlanningStatus> {
+    const lastSuccessByModel = new Map<string, string | null>();
+    if (modelHealth) {
+      try {
+        for (const row of await modelHealth.list()) lastSuccessByModel.set(row.modelId, row.lastSuccessAt);
+      } catch {
+        // The registry itself is still reportable; only health is unknown.
+        log.error("[planning] MODEL_HEALTH_READ_FAILED");
+      }
+    }
+    return {
+      routes: config.planning.routes.map((route) => ({
+        route: route.route,
+        modelId: route.modelId,
+        requestId: route.requestId,
+        available: route.available,
+        reason: route.reason,
+        capabilities: route.capabilities,
+      })),
+      registry: planningRegistryWithModels(config.planning.routes, PLANNING_MODELS, lastSuccessByModel),
+    };
+  }
+
+  /** Records a planning outcome for the registry; health is not worth failing a request over. */
+  async function recordModelOutcome(modelId: string, outcome: "success" | "failure", code?: string): Promise<void> {
+    if (!modelHealth) return;
+    const at = new Date(now()).toISOString();
+    try {
+      if (outcome === "success") await modelHealth.recordSuccess(modelId, at);
+      else await modelHealth.recordFailure(modelId, at, code ?? "UNKNOWN");
+    } catch {
+      log.error("[planning] MODEL_HEALTH_WRITE_FAILED");
     }
   }
 
@@ -663,6 +771,22 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       await store.get(user.id, projectId);
       const revisions = await store.listRevisions(user.id, projectId, PROJECT_REVISIONS_LIMIT);
       sendJson(response, 200, { ok: true, revisions });
+      return;
+    }
+
+    if (segments.length === 2 && segments[1] === "planning") {
+      if (method !== "POST") {
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to generate a planning proposal.");
+      }
+      await handlePlanning(request, response, user, projectId);
+      return;
+    }
+
+    if (segments.length === 4 && segments[1] === "proposals" && segments[3] === "accept") {
+      if (method !== "POST") {
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to accept a planning proposal.");
+      }
+      await handleProposalAccept(response, user, projectId, segments[2]);
       return;
     }
 
@@ -979,6 +1103,187 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     throw new HttpError(404, "NOT_FOUND", "Unknown endpoint.");
   }
 
+  async function handlePlanning(
+    request: IncomingMessage,
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+  ): Promise<void> {
+    const project = await requireProjects().get(user.id, projectId);
+    const children = requireChildren();
+    const start = parsePlanningStart(await readJsonBody(request, PLANNING_BODY_BYTES), project.version);
+    const route = findPlanningRoute(config.planning.routes, start.route);
+    if (!route || !route.available || !route.requestId) {
+      throw new HttpError(
+        503,
+        "PLANNING_ROUTE_UNAVAILABLE",
+        route?.reason ?? `No model is configured for the ${start.route} route.`,
+      );
+    }
+
+    const supplied = (await children.listSources(user.id, projectId))
+      .filter((source) => source.excerpt !== null && source.excerpt.trim().length > 0)
+      .slice(0, PLANNING_LIMITS.sourcesProvided);
+
+    // Factual mode and transcript analysis cannot be honest without evidence:
+    // return planning notes instead of asking a model to invent a sourced script.
+    const needsEvidence = project.document.brief.mode === "factual" || start.route === "transcript-analysis";
+    if (needsEvidence && supplied.length === 0) {
+      const payload = insufficientEvidencePayload(start.route);
+      const proposal = await children.createProposal(user.id, projectId, {
+        modelId: route.modelId ?? "none",
+        prompt: "No provider call: no source excerpt was supplied.",
+        sceneKey: null,
+        route: start.route,
+        baseVersion: project.version,
+        proposal: payload as unknown as Record<string, unknown>,
+      });
+      sendJson(response, 201, { ok: true, proposal });
+      return;
+    }
+
+    if (!config.apiKey) {
+      throw new HttpError(
+        503,
+        "PROVIDER_NOT_CONFIGURED",
+        "OLLAMA_API_KEY is not configured on the server. Add it to the server environment and restart.",
+      );
+    }
+
+    const prompt = buildPlanningPrompt({
+      route: start.route,
+      instruction: start.instruction,
+      projectType: project.projectType,
+      document: project.document,
+      sources: supplied,
+      inputLimitChars: route.inputLimitChars,
+    });
+
+    beginProviderRequest(user.id);
+    let generation;
+    try {
+      generation = await generatePlanningPayload({
+        route: start.route,
+        requestId: route.requestId,
+        apiKey: config.apiKey,
+        prompt,
+        timeoutMs: config.providerTimeoutMs,
+        maxOutputTokens: route.outputTokenLimit,
+        fetchImpl,
+        context: {
+          route: start.route,
+          projectType: project.projectType,
+          document: project.document,
+          sources: supplied,
+        },
+      });
+      await recordModelOutcome(route.modelId ?? "unknown", "success");
+    } catch (error) {
+      const code =
+        error instanceof ProviderError
+          ? error.code
+          : error instanceof ApiError
+            ? error.code
+            : "INTERNAL_ERROR";
+      await recordModelOutcome(route.modelId ?? "unknown", "failure", code);
+      throw error;
+    } finally {
+      endProviderRequest(user.id);
+    }
+
+    const proposal = await children.createProposal(user.id, projectId, {
+      modelId: route.modelId ?? "unknown",
+      prompt,
+      sceneKey: null,
+      route: start.route,
+      baseVersion: project.version,
+      proposal: generation.payload as unknown as Record<string, unknown>,
+    });
+    sendJson(response, 201, { ok: true, proposal });
+  }
+
+  async function handleProposalAccept(
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+    proposalId: string,
+  ): Promise<void> {
+    if (!isChildId(proposalId)) {
+      throw new HttpError(404, "CHILD_RECORD_NOT_FOUND", "No generation proposal with that id is owned by this account.");
+    }
+    const projects = requireProjects();
+    const children = requireChildren();
+    const project = await projects.get(user.id, projectId);
+    const proposal = await children.getProposal(user.id, projectId, proposalId);
+
+    if (proposal.status !== "proposed") {
+      throw new HttpError(409, "PROPOSAL_NOT_PENDING", "This proposal was already accepted or rejected.");
+    }
+    if (proposal.baseVersion !== project.version) {
+      throw new HttpError(
+        409,
+        "PROPOSAL_STALE",
+        `This proposal was generated from version ${proposal.baseVersion}; the project is now at version ${project.version}. Generate a new proposal.`,
+      );
+    }
+    const payload = proposal.proposal as unknown as PlanningPayload;
+    if (
+      proposal.route === "legacy" ||
+      payload.route !== proposal.route ||
+      !Array.isArray(payload.scenes) ||
+      !Array.isArray(payload.angles) ||
+      !Array.isArray(payload.clips) ||
+      !Array.isArray(payload.claims) ||
+      typeof payload.insufficientEvidence !== "boolean"
+    ) {
+      throw new HttpError(
+        409,
+        "PROPOSAL_NOT_APPLICABLE",
+        "This proposal has no applying planning payload. Mark it accepted or rejected with PATCH instead.",
+      );
+    }
+
+    const applied = applyPlanningProposal(project.document, payload);
+    let updatedProject = project;
+    if (applied.document !== project.document) {
+      assertSceneLocks(project.document, applied.document);
+      updatedProject = await projects.update(user.id, projectId, {
+        title: project.title,
+        document: applied.document,
+        version: project.version,
+      });
+    }
+
+    const accepted = await children.updateProposal(user.id, projectId, proposalId, { status: "accepted" });
+
+    let claimsRecorded = true;
+    for (const claim of payload.claims) {
+      try {
+        await children.createClaim(
+          user.id,
+          projectId,
+          {
+            statement: claim.statement,
+            sourceId: claim.sourceId,
+            sceneKey: null,
+            quote: claim.quote.length > 0 ? claim.quote : null,
+          },
+          claim.supported ? "supported" : "unverified",
+        );
+      } catch {
+        claimsRecorded = false;
+      }
+    }
+    if (!claimsRecorded) log.error("[planning] CLAIMS_WRITE_FAILED");
+
+    sendJson(response, 200, {
+      ok: true,
+      proposal: accepted,
+      project: updatedProject,
+      claimsRecorded,
+    });
+  }
+
   /** Removes an object that failed validation, then settles its row as deleted. */
   async function discardMedia(
     store: MediaStore,
@@ -1141,45 +1446,58 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET or POST for the render snapshots of a project.");
   }
 
-  async function handleTest(request: IncomingMessage, response: ServerResponse): Promise<void> {
-    checkOrigin(request);
-    const user = await authenticate(request);
-    const usageLedger = requireLedger();
-    const idempotencyKey = readIdempotencyKey(request);
-
+  /**
+   * One billable call per account at a time, six per minute. Shared by the
+   * connection test and planning, so one account cannot consume every slot
+   * and deny the other routes.
+   */
+  function beginProviderRequest(userId: string): void {
     const nowMs = now();
     const cutoff = nowMs - RATE_LIMIT_WINDOW_MS;
 
-    // Limits are per verified account. A global window let one account consume
-    // every slot and deny service to all other signed-in users.
     if (nowMs - lastRateLimitSweep >= RATE_LIMIT_WINDOW_MS) {
       lastRateLimitSweep = nowMs;
-      for (const [userId, times] of recentRequestsByUser) {
-        if (times.every((at) => at <= cutoff)) recentRequestsByUser.delete(userId);
+      for (const [id, times] of recentRequestsByUser) {
+        if (times.every((at) => at <= cutoff)) recentRequestsByUser.delete(id);
       }
     }
 
-    const recentRequests = (recentRequestsByUser.get(user.id) ?? []).filter((at) => at > cutoff);
-    if (recentRequests.length >= config.requestsPerMinute) {
-      recentRequestsByUser.set(user.id, recentRequests);
+    const recent = (recentRequestsByUser.get(userId) ?? []).filter((at) => at > cutoff);
+    if (recent.length >= config.requestsPerMinute) {
+      recentRequestsByUser.set(userId, recent);
       throw new HttpError(
         429,
         "TOO_MANY_REQUESTS",
         "This account reached its development request limit. Wait a minute before retrying.",
       );
     }
-    const activeRequests = inFlightByUser.get(user.id) ?? 0;
-    if (activeRequests >= MAX_CONCURRENT_PER_USER) {
+    const active = inFlightByUser.get(userId) ?? 0;
+    if (active >= MAX_CONCURRENT_PER_USER) {
       throw new HttpError(
         429,
         "REQUEST_IN_PROGRESS",
-        "A test request for this account is already running. Wait for it to finish.",
+        "A request for this account is already running. Wait for it to finish.",
       );
     }
 
-    recentRequests.push(nowMs);
-    recentRequestsByUser.set(user.id, recentRequests);
-    inFlightByUser.set(user.id, activeRequests + 1);
+    recent.push(nowMs);
+    recentRequestsByUser.set(userId, recent);
+    inFlightByUser.set(userId, active + 1);
+  }
+
+  function endProviderRequest(userId: string): void {
+    const remaining = (inFlightByUser.get(userId) ?? 1) - 1;
+    if (remaining > 0) inFlightByUser.set(userId, remaining);
+    else inFlightByUser.delete(userId);
+  }
+
+  async function handleTest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    checkOrigin(request);
+    const user = await authenticate(request);
+    const usageLedger = requireLedger();
+    const idempotencyKey = readIdempotencyKey(request);
+
+    beginProviderRequest(user.id);
 
     try {
       const body = await readJsonBody(request, config.bodyMaxBytes);
@@ -1365,9 +1683,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         recorded ? undefined : { "X-Storyframe-Usage": "unrecorded" },
       );
     } finally {
-      const remaining = (inFlightByUser.get(user.id) ?? 1) - 1;
-      if (remaining > 0) inFlightByUser.set(user.id, remaining);
-      else inFlightByUser.delete(user.id);
+      endProviderRequest(user.id);
     }
   }
 

@@ -1,6 +1,7 @@
 import { resolveModels, type ResolvedModel } from "./models";
 import { loadMediaLimits, type MediaLimits } from "./media";
 import { OLLAMA_BASE_URL } from "./ollama";
+import { resolvePlanningRoutes, type ResolvedPlanningRoute } from "./planning";
 import type { R2Config } from "./r2";
 
 export interface AppConfig {
@@ -19,6 +20,8 @@ export interface AppConfig {
   models: ResolvedModel[];
   r2: R2Config | null;
   media: MediaLimits;
+  /** One configured model per planning route; see Phase 5 in the README. */
+  planning: { routes: ResolvedPlanningRoute[] };
 }
 
 function intEnv(
@@ -117,5 +120,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     models: resolveModels(env),
     r2: r2Config(env),
     media: loadMediaLimits(env),
+    planning: { routes: planningRoutes(env) },
   };
+}
+
+function planningRoutes(env: NodeJS.ProcessEnv): ResolvedPlanningRoute[] {
+  return resolvePlanningRoutes(env, resolveModels(env));
 }

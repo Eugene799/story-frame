@@ -16,6 +16,8 @@ export interface SourceRecord {
   kind: SourceKind;
   title: string;
   url: string | null;
+  /** The supplied passage planning may quote verbatim. */
+  excerpt: string | null;
   retrievedAt: string | null;
   createdAt: string;
 }
@@ -27,6 +29,8 @@ export interface ClaimRecord {
   sourceId: string | null;
   sceneKey: string | null;
   statement: string;
+  /** The verbatim source passage behind a supported claim. */
+  quote: string | null;
   status: ClaimStatus;
   createdAt: string;
 }
@@ -39,6 +43,10 @@ export interface GenerationProposalRecord {
   modelId: string;
   prompt: string;
   status: ProposalStatus;
+  /** Which planning route produced it, or `legacy` for a hand-recorded proposal. */
+  route: string;
+  /** The project version the proposal was generated against. */
+  baseVersion: number;
   proposal: Record<string, unknown>;
   createdAt: string;
 }

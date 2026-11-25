@@ -1,3 +1,5 @@
+import type { PlanningStatus } from "./planning-contract";
+
 /**
  * Types shared by the browser and the server. These carry no credentials.
  */
@@ -49,6 +51,8 @@ export interface AiStatusResponse {
     abandonAfterMs: number;
   };
   models: AiModelInfo[];
+  /** Configured route per planning task, plus registry health. */
+  planning: PlanningStatus;
 }
 
 export interface AiUsage {

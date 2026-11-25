@@ -44,6 +44,7 @@ const STATUS: AiStatusResponse = {
       catalogStatus: "not-listed",
     },
   ],
+  planning: { routes: [], registry: [] },
 };
 
 const SUCCESS: AiTestSuccess = {

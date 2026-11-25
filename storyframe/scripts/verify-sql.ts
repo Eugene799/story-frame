@@ -19,6 +19,7 @@ const MIGRATIONS = [
   "20261124140000_create_project_children.sql",
   "20261124150000_create_profiles.sql",
   "20261124160000_create_media_storage.sql",
+  "20261125120000_create_planning.sql",
 ];
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "supabase", "migrations");
 
@@ -279,6 +280,37 @@ check("media_metadata: upload timestamps default to null",
   (await as<{ ok: boolean }>("service_role", null,
     `select (upload_expires_at is null and ready_at is null and deleted_at is null) as ok
        from public.media_metadata where project_id = $1`, [PROJECT_A]))[0].ok === true);
+
+// 8c. Phase 5: planning evidence columns, proposal routing metadata, model health.
+check("sources: an excerpt is optional and bounded",
+  (await as<{ ok: boolean }>("service_role", null,
+    `select (excerpt is null) as ok from public.sources where project_id = $1`, [PROJECT_A]))[0].ok === true);
+check("claims: a supporting quote is optional",
+  (await as<{ ok: boolean }>("service_role", null,
+    `select (supporting_quote is null) as ok from public.claims where project_id = $1`, [PROJECT_A]))[0].ok === true);
+check("generation_proposals: existing rows default to the legacy route and version 1",
+  (await as<{ route: string; base_version: number }>("service_role", null,
+    `select route, base_version from public.generation_proposals where project_id = $1`, [PROJECT_A]))
+    .every((row) => row.route === "legacy" && row.base_version === 1));
+check("generation_proposals: an unknown route is rejected (23514)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.generation_proposals (project_id, owner_id, model_id, prompt, proposal, route)
+     values ($1, $2, 'gemma4:31b', 'x', '{}'::jsonb, 'ranking')`, [PROJECT_A, USER_A]))) === "23514");
+check("generation_proposals: a base version below 1 is rejected (23514)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.generation_proposals (project_id, owner_id, model_id, prompt, proposal, base_version)
+     values ($1, $2, 'gemma4:31b', 'x', '{}'::jsonb, 0)`, [PROJECT_A, USER_A]))) === "23514");
+
+await as("service_role", null,
+  `insert into public.model_health (model_id, last_success_at, success_count)
+   values ('gemma', now(), 1)`);
+check("model_health: the service role reads the registry",
+  (await count("model_health", "model_id = 'gemma'", [])) === 1);
+check("model_health: an authenticated read is refused (42501)",
+  (await errorCode(() => as("authenticated", USER_A, "select count(*) from public.model_health"))) === "42501");
+check("model_health: a duplicate model id is rejected (23505)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.model_health (model_id) values ('gemma')`))) === "23505");
 
 check("render_snapshots rejects a revision that does not exist (23503)",
   (await errorCode(() => as("service_role", null,

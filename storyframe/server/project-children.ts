@@ -26,6 +26,7 @@ export const CHILD_LIMITS = {
   claimStatementChars: 2000,
   modelIdChars: 120,
   promptChars: 4000,
+  excerptChars: 4000,
   proposalBytes: 16 * 1024,
   providerChars: 64,
   externalIdChars: 200,
@@ -35,6 +36,7 @@ export const CHILD_LIMITS = {
 const SOURCE_KINDS: readonly SourceKind[] = ["web", "document", "interview", "other"];
 const CLAIM_STATUSES: readonly ClaimStatus[] = ["unverified", "supported", "contradicted"];
 const PROPOSAL_STATUSES: readonly ProposalStatus[] = ["proposed", "accepted", "rejected"];
+const PROPOSAL_ROUTES = ["angles", "script", "storyboard", "ad-concept", "transcript-analysis", "legacy"] as const;
 const JOB_STATUSES: readonly JobStatus[] = ["queued", "running", "succeeded", "failed"];
 const RENDER_STATUSES: readonly RenderStatus[] = ["pending", "ready", "failed"];
 
@@ -179,11 +181,13 @@ export interface SourceWrite {
   kind: SourceKind;
   title: string;
   url: string | null;
+  /** The exact passage planning may quote; optional because not every source has one. */
+  excerpt: string | null;
   retrievedAt: string | null;
 }
 
 export function parseSourceWrite(body: unknown): SourceWrite {
-  const record = readBody(body, ["kind", "title", "url", "retrievedAt"]);
+  const record = readBody(body, ["kind", "title", "url", "excerpt", "retrievedAt"]);
   const url = readOptionalText(record.url, "url", CHILD_LIMITS.urlChars);
   if (url !== null && !/^https?:\/\//i.test(url)) {
     throw new ApiError(400, "INVALID_CHILD_RECORD", "url must start with http:// or https://.");
@@ -192,6 +196,7 @@ export function parseSourceWrite(body: unknown): SourceWrite {
     kind: readEnum(record.kind, SOURCE_KINDS, "kind"),
     title: readText(record.title, "title", CHILD_LIMITS.sourceTitleChars),
     url,
+    excerpt: readOptionalText(record.excerpt, "excerpt", CHILD_LIMITS.excerptChars),
     retrievedAt: readTimestamp(record.retrievedAt, "retrievedAt"),
   };
 }
@@ -202,14 +207,17 @@ export interface ClaimWrite {
   statement: string;
   sourceId: string | null;
   sceneKey: string | null;
+  /** A verbatim supporting passage; the server, not the client, decides status. */
+  quote: string | null;
 }
 
 export function parseClaimWrite(body: unknown): ClaimWrite {
-  const record = readBody(body, ["statement", "sourceId", "sceneKey"]);
+  const record = readBody(body, ["statement", "sourceId", "sceneKey", "quote"]);
   return {
     statement: readText(record.statement, "statement", CHILD_LIMITS.claimStatementChars),
     sourceId: record.sourceId === undefined || record.sourceId === null ? null : readUuid(record.sourceId, "sourceId"),
     sceneKey: readOptionalText(record.sceneKey, "sceneKey", CHILD_LIMITS.sceneKeyChars),
+    quote: readOptionalText(record.quote, "quote", CHILD_LIMITS.excerptChars),
   };
 }
 
@@ -224,15 +232,26 @@ export interface ProposalWrite {
   modelId: string;
   prompt: string;
   sceneKey: string | null;
+  route: string;
+  baseVersion: number;
   proposal: Record<string, unknown>;
 }
 
 export function parseProposalWrite(body: unknown): ProposalWrite {
-  const record = readBody(body, ["modelId", "prompt", "sceneKey", "proposal"]);
+  const record = readBody(body, ["modelId", "prompt", "sceneKey", "route", "baseVersion", "proposal"]);
+  // Hand-recorded proposals keep working: they default to the legacy route at
+  // version 1, and only the planning endpoint sets a real route.
+  const route = record.route === undefined ? "legacy" : readEnum(record.route, PROPOSAL_ROUTES, "route");
+  const baseVersion = record.baseVersion === undefined ? 1 : record.baseVersion;
+  if (typeof baseVersion !== "number" || !Number.isInteger(baseVersion) || baseVersion < 1) {
+    throw new ApiError(400, "INVALID_CHILD_RECORD", "baseVersion must be a positive integer.");
+  }
   return {
     modelId: readText(record.modelId, "modelId", CHILD_LIMITS.modelIdChars),
     prompt: readText(record.prompt, "prompt", CHILD_LIMITS.promptChars),
     sceneKey: readOptionalText(record.sceneKey, "sceneKey", CHILD_LIMITS.sceneKeyChars),
+    route,
+    baseVersion,
     proposal: readJsonObject(record.proposal, "proposal", CHILD_LIMITS.proposalBytes),
   };
 }
@@ -347,6 +366,7 @@ function toSource(row: Record<string, unknown>): SourceRecord {
     kind: rowEnum(row.kind, SOURCE_KINDS, "source"),
     title: rowText(row, "title", "source"),
     url: rowNullableText(row, "url", "source"),
+    excerpt: rowNullableText(row, "excerpt", "source"),
     retrievedAt: rowNullableText(row, "retrieved_at", "source"),
     createdAt: rowText(row, "created_at", "source"),
   };
@@ -358,6 +378,7 @@ function toClaim(row: Record<string, unknown>): ClaimRecord {
     sourceId: rowNullableText(row, "source_id", "claim"),
     sceneKey: rowNullableText(row, "scene_key", "claim"),
     statement: rowText(row, "statement", "claim"),
+    quote: rowNullableText(row, "supporting_quote", "claim"),
     status: rowEnum(row.status, CLAIM_STATUSES, "claim"),
     createdAt: rowText(row, "created_at", "claim"),
   };
@@ -372,6 +393,8 @@ function toProposal(row: Record<string, unknown>): GenerationProposalRecord {
     modelId: rowText(row, "model_id", "generation proposal"),
     prompt: rowText(row, "prompt", "generation proposal"),
     status: rowEnum(row.status, PROPOSAL_STATUSES, "generation proposal"),
+    route: rowNullableText(row, "route", "generation proposal") ?? "legacy",
+    baseVersion: typeof row.base_version === "number" ? row.base_version : 1,
     proposal,
     createdAt: rowText(row, "created_at", "generation proposal"),
   };
@@ -413,7 +436,12 @@ export interface ChildStore {
   removeSource(ownerId: string, projectId: string, sourceId: string): Promise<void>;
 
   listClaims(ownerId: string, projectId: string): Promise<ClaimRecord[]>;
-  createClaim(ownerId: string, projectId: string, write: ClaimWrite): Promise<ClaimRecord>;
+  createClaim(
+    ownerId: string,
+    projectId: string,
+    write: ClaimWrite,
+    status?: ClaimStatus,
+  ): Promise<ClaimRecord>;
   updateClaim(
     ownerId: string,
     projectId: string,
@@ -423,6 +451,7 @@ export interface ChildStore {
   removeClaim(ownerId: string, projectId: string, claimId: string): Promise<void>;
 
   listProposals(ownerId: string, projectId: string): Promise<GenerationProposalRecord[]>;
+  getProposal(ownerId: string, projectId: string, proposalId: string): Promise<GenerationProposalRecord>;
   createProposal(ownerId: string, projectId: string, write: ProposalWrite): Promise<GenerationProposalRecord>;
   updateProposal(
     ownerId: string,
@@ -515,7 +544,7 @@ export function createSupabaseChildStore(options: SupabaseChildStoreOptions): Ch
     const found = rows(
       await request(
         tableUrl("sources", {
-          select: "id,kind,title,url,retrieved_at,created_at",
+          select: "id,kind,title,url,excerpt,retrieved_at,created_at",
           owner_id: `eq.${ownerId}`,
           project_id: `eq.${projectId}`,
           order: "created_at.asc",
@@ -532,7 +561,7 @@ export function createSupabaseChildStore(options: SupabaseChildStoreOptions): Ch
     const found = rows(
       await request(
         tableUrl("claims", {
-          select: "id,source_id,scene_key,statement,status,created_at",
+          select: "id,source_id,scene_key,statement,supporting_quote,status,created_at",
           owner_id: `eq.${ownerId}`,
           project_id: `eq.${projectId}`,
           order: "created_at.asc",
@@ -549,7 +578,7 @@ export function createSupabaseChildStore(options: SupabaseChildStoreOptions): Ch
     const found = rows(
       await request(
         tableUrl("generation_proposals", {
-          select: "id,scene_key,model_id,prompt,status,proposal,created_at",
+          select: "id,scene_key,model_id,prompt,status,route,base_version,proposal,created_at",
           owner_id: `eq.${ownerId}`,
           project_id: `eq.${projectId}`,
           order: "created_at.asc",
@@ -560,6 +589,30 @@ export function createSupabaseChildStore(options: SupabaseChildStoreOptions): Ch
       ),
     );
     return found.map(toProposal);
+  }
+
+  async function getProposal(
+    ownerId: string,
+    projectId: string,
+    proposalId: string,
+  ): Promise<GenerationProposalRecord> {
+    const found = rows(
+      await request(
+        tableUrl("generation_proposals", {
+          select: "id,scene_key,model_id,prompt,status,route,base_version,proposal,created_at",
+          id: `eq.${proposalId}`,
+          owner_id: `eq.${ownerId}`,
+          project_id: `eq.${projectId}`,
+          limit: "1",
+        }),
+        { headers: readHeaders },
+        "the proposal read",
+      ),
+    );
+    if (found.length === 0) {
+      throw new ApiError(404, "CHILD_RECORD_NOT_FOUND", CHILD_NOT_FOUND_MESSAGES.proposal);
+    }
+    return toProposal(found[0]);
   }
 
   async function listJobs(ownerId: string, projectId: string): Promise<ProviderJobRecord[]> {
@@ -676,6 +729,7 @@ export function createSupabaseChildStore(options: SupabaseChildStoreOptions): Ch
               kind: write.kind,
               title: write.title,
               url: write.url,
+              excerpt: write.excerpt,
               retrieved_at: write.retrievedAt,
             }),
           },
@@ -694,7 +748,7 @@ export function createSupabaseChildStore(options: SupabaseChildStoreOptions): Ch
 
     listClaims,
 
-    async createClaim(ownerId, projectId, write) {
+    async createClaim(ownerId, projectId, write, status = "unverified") {
       if (write.sourceId !== null) {
         const linked = rows(
           await request(
@@ -726,7 +780,8 @@ export function createSupabaseChildStore(options: SupabaseChildStoreOptions): Ch
               source_id: write.sourceId,
               scene_key: write.sceneKey,
               statement: write.statement,
-              status: "unverified",
+              supporting_quote: write.quote,
+              status,
             }),
           },
           "the claim save",
@@ -761,6 +816,7 @@ export function createSupabaseChildStore(options: SupabaseChildStoreOptions): Ch
     },
 
     listProposals,
+    getProposal,
 
     async createProposal(ownerId, projectId, write) {
       const created = rows(
@@ -776,6 +832,8 @@ export function createSupabaseChildStore(options: SupabaseChildStoreOptions): Ch
               model_id: write.modelId,
               prompt: write.prompt,
               status: "proposed",
+              route: write.route,
+              base_version: write.baseVersion,
               proposal: write.proposal,
             }),
           },
