@@ -661,8 +661,12 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
       if (measured === null) {
         // A fragmented or malformed header: keep the reservation rather than guessing low.
         log.error("[lipsync] LIPSYNC_DURATION_UNMEASURED");
+      } else if (measured > row.secondsEstimate) {
+        // The request could not have produced more than its own ceiling, so a
+        // longer header is broken. Never let it inflate the ledger.
+        log.error("[lipsync] LIPSYNC_DURATION_OUT_OF_RANGE");
       }
-      const counted = measured === null ? row.secondsEstimate : measured;
+      const counted = measured === null || measured > row.secondsEstimate ? row.secondsEstimate : measured;
       const stored = await storeOutput(row.ownerId, row.projectId, download.bytes, download.contentType);
       await deps.store.update(row.ownerId, row.id, {
         status: "ready",

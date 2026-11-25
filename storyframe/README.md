@@ -1082,7 +1082,10 @@ need one entry in `LIPSYNC_OUTPUT_HOSTS` — the refusal is explicit rather than
 - A finished video is downloaded, re-detected as video, uploaded to R2 under a new media row, and settled at
 the duration read from the MP4's own movie header (`server/mp4.ts`), so a six-second clip settles six seconds
 rather than the twenty reserved for it. A header that cannot be read keeps the reserved ceiling and logs
-`LIPSYNC_DURATION_UNMEASURED`; fragmented output is the case to watch. A provider `FAILURE`/`REVOKED`, an
+`LIPSYNC_DURATION_UNMEASURED`; fragmented output is the case to watch. An all-ones duration (`0xFFFFFFFF`, or the
+64-bit equivalent) is read as "unknown" rather than 4 294 967 seconds, the reader clamps any absurd length to
+`MAX_MP4_DURATION_SECONDS` (3 600), and settlement ignores anything longer than the request's own ceiling
+(`LIPSYNC_DURATION_OUT_OF_RANGE`), so a broken header can never inflate the ledger. A provider `FAILURE`/`REVOKED`, an
 abandoned task, or a success without a usable URL fails the export and settles zero seconds.
 - The Preview tab's `LipsyncPanel` picks the source, audio and resolution, shows the seconds/USD window and an
 estimate, submits with an idempotency key, polls only while pending, plays the stored copy from a private

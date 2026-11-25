@@ -26,6 +26,17 @@ function readBoxHeader(bytes: Buffer, offset: number): { size: number; header: n
   return { size: size32, header: 8 };
 }
 
+/**
+ * No lip sync is anywhere near this long. A header that claims more is broken
+ * (or a sender trying to inflate a bill), so the value is clamped rather than
+ * trusted, and the settlement can never land billions of seconds in the ledger.
+ */
+export const MAX_MP4_DURATION_SECONDS = 3_600;
+
+/** A 32-bit duration of all ones means "unknown", not 4 294 967.295 s. */
+const UNKNOWN_DURATION_32 = 0xffffffff;
+const UNKNOWN_DURATION_64 = 0xffffffffffffffffn;
+
 function readMovieHeader(payload: Buffer): number | null {
   const version = payload.readUInt8(0);
   // version(1) + flags(3) + created + modified, then timescale and duration.
@@ -34,12 +45,17 @@ function readMovieHeader(payload: Buffer): number | null {
   if (durationOffset + (version === 1 ? 8 : 4) > payload.length) return null;
 
   const timescale = payload.readUInt32BE(timescaleOffset);
-  const duration =
-    version === 1 ? Number(payload.readBigUInt64BE(durationOffset)) : payload.readUInt32BE(durationOffset);
-  if (timescale <= 0 || duration <= 0 || !Number.isFinite(duration)) return null;
-  const seconds = duration / timescale;
+  const durationBig =
+    version === 1 ? payload.readBigUInt64BE(durationOffset) : BigInt(payload.readUInt32BE(durationOffset));
+  // All ones is the container's "unknown", not a very long movie.
+  const sentinel = version === 1 ? UNKNOWN_DURATION_64 : BigInt(UNKNOWN_DURATION_32);
+  if (durationBig === sentinel) return null;
+  if (timescale <= 0 || durationBig <= 0n) return null;
+  if (durationBig > BigInt(Number.MAX_SAFE_INTEGER)) return MAX_MP4_DURATION_SECONDS;
+
+  const seconds = Number(durationBig) / timescale;
   if (!Number.isFinite(seconds) || seconds <= 0) return null;
-  return Number(seconds.toFixed(3));
+  return Number(Math.min(seconds, MAX_MP4_DURATION_SECONDS).toFixed(3));
 }
 
 /** Real movie duration in seconds, or null when the bytes do not say. */

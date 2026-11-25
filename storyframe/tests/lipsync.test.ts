@@ -8,7 +8,7 @@ import {
 } from "../server/lipsync";
 import type { MediaLimits, MediaStore } from "../server/media";
 import type { R2Client } from "../server/r2";
-import { readMp4DurationSeconds } from "../server/mp4";
+import { MAX_MP4_DURATION_SECONDS, readMp4DurationSeconds } from "../server/mp4";
 import type { MediaRecord } from "../shared/media-contract";
 
 /**
@@ -29,18 +29,22 @@ function box(type: string, payload: Buffer): Buffer {
   return Buffer.concat([head, payload]);
 }
 
-/** A real MP4 skeleton: an ftyp box and a movie header carrying the duration. */
-function mp4WithDuration(seconds: number, version: 0 | 1 = 0): Buffer {
+/** A real MP4 skeleton: an ftyp box and a movie header carrying a raw duration. */
+function mp4RawDuration(timescale: number, duration: bigint, version: 0 | 1 = 0): Buffer {
   const payload = Buffer.alloc(version === 1 ? 112 : 100);
   payload.writeUInt8(version, 0);
   if (version === 1) {
-    payload.writeUInt32BE(1000, 20);
-    payload.writeBigUInt64BE(BigInt(Math.round(seconds * 1000)), 24);
+    payload.writeUInt32BE(timescale, 20);
+    payload.writeBigUInt64BE(duration, 24);
   } else {
-    payload.writeUInt32BE(1000, 12);
-    payload.writeUInt32BE(Math.round(seconds * 1000), 16);
+    payload.writeUInt32BE(timescale, 12);
+    payload.writeUInt32BE(Number(duration), 16);
   }
   return Buffer.concat([box("ftyp", Buffer.from("isomisomiso2", "ascii")), box("moov", box("mvhd", payload))]);
+}
+
+function mp4WithDuration(seconds: number, version: 0 | 1 = 0): Buffer {
+  return mp4RawDuration(1000, BigInt(Math.round(seconds * 1000)), version);
 }
 
 /** A six-second clip: the copy must settle 6 s, not the 20 s ceiling. */
@@ -238,7 +242,7 @@ interface FetchCall {
   body?: string;
 }
 
-function fakeFetch(options: { status?: string; result?: string; omitResult?: boolean; objects?: Map<string, Buffer> } = {}) {
+function fakeFetch(options: { status?: string; result?: string; omitResult?: boolean; objects?: Map<string, Buffer>; clip?: Buffer } = {}) {
   const calls: FetchCall[] = [];
   const providerStatus = options.status ?? "SUCCESS";
   const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -262,7 +266,7 @@ function fakeFetch(options: { status?: string; result?: string; omitResult?: boo
       );
     }
     if (url.startsWith("https://cdn.everypixel.com/") || url.startsWith("https://evil.test/")) {
-      return new Response(new Uint8Array(MP4), { status: 200 });
+      return new Response(new Uint8Array(options.clip ?? MP4), { status: 200 });
     }
     if (url.startsWith("https://r2.test/put/")) {
       // Stand in for the bucket: the uploaded body is what `head` will report.
@@ -301,6 +305,19 @@ describe("mp4 duration reader", () => {
     expect(readMp4DurationSeconds(mp4WithDuration(6))).toBe(6);
     expect(readMp4DurationSeconds(mp4WithDuration(6.5))).toBe(6.5);
     expect(readMp4DurationSeconds(mp4WithDuration(6, 1))).toBe(6);
+  });
+
+  it("treats the all-ones duration sentinels as unmeasured", () => {
+    // 0xFFFFFFFF means "unknown" in the container, not 4 294 967 seconds.
+    expect(readMp4DurationSeconds(mp4RawDuration(1000, 0xffffffffn))).toBeNull();
+    expect(readMp4DurationSeconds(mp4RawDuration(1000, 0xffffffffffffffffn, 1))).toBeNull();
+  });
+
+  it("clamps a header that claims an absurd length instead of billing it", () => {
+    // 2 147 483.647 s, or 24.8 days: a broken header, not a real lip sync.
+    expect(readMp4DurationSeconds(mp4RawDuration(1000, 0x7fffffffn))).toBe(MAX_MP4_DURATION_SECONDS);
+    expect(readMp4DurationSeconds(mp4RawDuration(1, 10_000_000_000n, 1))).toBe(MAX_MP4_DURATION_SECONDS);
+    expect(MAX_MP4_DURATION_SECONDS).toBe(3600);
   });
 
   it("returns null rather than a guess when the bytes do not say", () => {
@@ -410,6 +427,19 @@ describe("lipsync sweep", () => {
     expect(updated.secondsCounted).toBe(6);
     expect(store.settled.at(-1)).toMatchObject({ status: "succeeded", seconds: 6 });
     expect(media.created).toHaveLength(1);
+  });
+
+  it("keeps the reservation when the header claims an unknown or absurd length", async () => {
+    for (const clip of [mp4RawDuration(1000, 0xffffffffn), mp4RawDuration(1000, 0x7fffffffn)]) {
+      const store = memoryStore([row()]);
+      const objects = new Map<string, Buffer>();
+      const { fetchImpl } = fakeFetch({ clip, objects });
+      await service({ store: store.store, mediaStore: fakeMedia(objects).media, objects: fakeObjects(objects), fetchImpl }).sweep();
+
+      // Neither 4 294 967 s nor a clamped hour may reach the ledger for a 20 s task.
+      expect(store.settled.at(-1)?.seconds).toBe(20);
+      expect(store.rows[0]?.secondsCounted).toBe(20);
+    }
   });
 
   it("refuses a result on a host outside the allowlist", async () => {
