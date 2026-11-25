@@ -57,6 +57,15 @@ function newIdempotencyKey(): string {
   return uuid.replace(/[^A-Za-z0-9._:-]/g, "-");
 }
 
+/** A retry with the same key is the safe option while the attempt's fate is unknown. */
+function keepsKeyOnRetry(error: AiRequestError): boolean {
+  return (
+    error.status === 0 ||
+    error.code === "IDEMPOTENCY_IN_PROGRESS" ||
+    error.code === "LEDGER_UNAVAILABLE"
+  );
+}
+
 function statusLabel(status: GenerationProposalRecord["status"]): string {
   if (status === "accepted") return "Accepted";
   if (status === "rejected") return "Rejected";
@@ -209,8 +218,9 @@ export function PlanningPanel({
       );
     } catch (cause) {
       const requestError = toRequestError(cause);
-      // Status 0 means no response reached us: keep the key so Retry can replay.
-      if (requestError.status !== 0) pendingKey.current = null;
+      // Keep the key when no response arrived, the attempt is still running, or
+      // the ledger is temporarily unavailable: retrying may replay a paid reply.
+      if (!keepsKeyOnRetry(requestError)) pendingKey.current = null;
       setError(requestError);
     } finally {
       setGenerating(false);

@@ -147,6 +147,91 @@ describe("PlanningPanel", () => {
     expect(screen.getByText("Accepted")).toBeTruthy();
   });
 
+  it.each([
+    ["IDEMPOTENCY_IN_PROGRESS", 409],
+    ["LEDGER_UNAVAILABLE", 503],
+  ])("keeps the Idempotency-Key after %s so Retry can replay", async (code, status) => {
+    const keys: (string | null)[] = [];
+    let attempts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input), "http://localhost").pathname;
+        const headers = new Headers(init?.headers);
+        if (path.endsWith("/proposals")) return jsonResponse({ ok: true, proposals: [] });
+        if (path.endsWith("/planning")) {
+          keys.push(headers.get("Idempotency-Key"));
+          attempts += 1;
+          if (attempts === 1) {
+            return jsonResponse({ ok: false, error: { code, message: "The attempt is not settled yet." } }, status);
+          }
+          return jsonResponse({ ok: true, proposal: proposalFixture() }, 201);
+        }
+        return jsonResponse({ ok: false, error: { code: "NOT_FOUND", message: "not found" } }, 404);
+      }),
+    );
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText(code)).toBeTruthy();
+    expect(keys[0]).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText("Accept and save")).toBeTruthy();
+    expect(keys).toHaveLength(2);
+    expect(keys[1]).toBe(keys[0]);
+  });
+
+  it("starts a fresh key after a recorded refusal", async () => {
+    const keys: (string | null)[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input), "http://localhost").pathname;
+        if (path.endsWith("/proposals")) return jsonResponse({ ok: true, proposals: [] });
+        if (path.endsWith("/planning")) {
+          keys.push(new Headers(init?.headers).get("Idempotency-Key"));
+          if (keys.length === 1) {
+            return jsonResponse(
+              { ok: false, error: { code: "PLANNING_INVALID_JSON", message: "Refused after one repair." } },
+              422,
+            );
+          }
+          return jsonResponse({ ok: true, proposal: proposalFixture() }, 201);
+        }
+        return jsonResponse({ ok: false, error: { code: "NOT_FOUND", message: "not found" } }, 404);
+      }),
+    );
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText("PLANNING_INVALID_JSON")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText("Accept and save")).toBeTruthy();
+    expect(keys).toHaveLength(2);
+    expect(keys[1]).not.toBe(keys[0]);
+  });
+
   it("blocks generation and acceptance while the draft is dirty", async () => {
     installBackend();
     render(

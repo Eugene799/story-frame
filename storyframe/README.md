@@ -525,7 +525,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 170/170; `verify:sql` 77/77; `verify:live-routes` exit 0; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 173/173; `verify:sql` 77/77; `verify:live-routes` exit 0; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -759,6 +759,8 @@ Coverage includes:
 - Planning idempotency: key required before any provider or ledger write; one `ai_usage` success row per attempt; replay
   returns the same proposal after one provider call; key reuse for a different request is `409`; a refused reply is
   stored and replayed; keys are scoped to the verified account
+- Plan tab key handling: the key is kept after a lost response, `IDEMPOTENCY_IN_PROGRESS`, or `LEDGER_UNAVAILABLE`, and a
+  recorded refusal starts a fresh key on the next attempt
 - Media upload lifecycle for image, audio, and video: presigned ticket, direct upload, real-size and magic-byte
   validation, playback through a second presigned URL, and the stored detected content type
 - Media type mismatch and empty/oversized uploads discarded; oversized declarations and the per-account quota refused
