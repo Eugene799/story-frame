@@ -659,11 +659,7 @@ describe("workspace", () => {
 
   it("generates from the Plan tab, replays a reload-persisted key, and accepts", async () => {
     const backend = makeBackend(projectFixture());
-    installBackend(backend);
-    renderWorkspace();
-
-    fireEvent.click(await screen.findByRole("button", { name: "Open The Late Letter" }));
-    await screen.findByLabelText("Project title");
+    await openProject(backend);
     fireEvent.click(screen.getByRole("tab", { name: "Plan" }));
     expect(await screen.findByText("No proposals yet.")).toBeInTheDocument();
 
@@ -675,9 +671,7 @@ describe("workspace", () => {
 
     // Reload the whole workspace: React state is gone, sessionStorage survives.
     cleanup();
-    renderWorkspace();
-    fireEvent.click(await screen.findByRole("button", { name: "Open The Late Letter" }));
-    await screen.findByLabelText("Project title");
+    await openProject(backend);
     fireEvent.click(screen.getByRole("tab", { name: "Plan" }));
     expect(await screen.findByText("No proposals yet.")).toBeInTheDocument();
 
