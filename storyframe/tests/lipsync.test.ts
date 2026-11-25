@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createLipsyncService,
   isLipsyncOutputHost,
+  LIPSYNC_TASK_ID_GRACE_MS,
   type LipsyncExportRow,
   type LipsyncLimits,
   type LipsyncStore,
@@ -440,6 +441,29 @@ describe("lipsync sweep", () => {
       expect(store.settled.at(-1)?.seconds).toBe(20);
       expect(store.rows[0]?.secondsCounted).toBe(20);
     }
+  });
+
+  it("leaves a row that is still mid-submit alone instead of killing a paid request", async () => {
+    // The sweep can see the row between its insert and the task-id write.
+    const store = memoryStore([row({ providerTaskId: null, createdAt: new Date(NOW).toISOString() })]);
+    const { fetchImpl, calls } = fakeFetch({});
+    await service({ store: store.store, mediaStore: fakeMedia(new Map()).media, objects: fakeObjects(new Map()), fetchImpl }).sweep();
+
+    expect(calls).toHaveLength(0);
+    expect(store.settled).toHaveLength(0);
+    expect(store.rows[0]?.status).toBe("pending");
+  });
+
+  it("fails a row whose task id never arrived once the submit window has passed", async () => {
+    const store = memoryStore([
+      row({ providerTaskId: null, createdAt: new Date(NOW - LIPSYNC_TASK_ID_GRACE_MS - 1_000).toISOString() }),
+    ]);
+    const { fetchImpl } = fakeFetch({});
+    await service({ store: store.store, mediaStore: fakeMedia(new Map()).media, objects: fakeObjects(new Map()), fetchImpl }).sweep();
+
+    expect(store.rows[0]?.status).toBe("failed");
+    expect(store.rows[0]?.failureCode).toBe("LIPSYNC_PROVIDER_FAILED");
+    expect(store.settled.at(-1)).toEqual({ exportId: store.rows[0]?.id, status: "failed", seconds: 0 });
   });
 
   it("refuses a result on a host outside the allowlist", async () => {

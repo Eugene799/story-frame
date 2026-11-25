@@ -1097,9 +1097,16 @@ presigned URL, and deletes after a confirmation. A pending task cannot be delete
 wrong-kind assets, the inline submit, the copy, a foreign output host, provider failure, success without an
 output, the disabled reasons, polling to playback and the confirmed delete.
 
-A single live 720p call confirmed the provider contract, the observed output host, and the duration reader on a
-genuine file. The R2 copy, ledger settlement and panel are still proven against fakes only, because that call went
-through the adapter directly rather than through a project.
+`npm run verify:lipsync-live -- --video clip.mp4 --audio voice.mp3` runs the whole path once against the hosted
+project: it creates a disposable account and project, uploads the clip and voice track through private R2, submits one
+720p lip sync, and lets the server's own sweep copy the result. On 2026-11-25 it settled the output's own length
+rather than the 20-second reservation, playback of the stored bytes re-measured exactly the settled value, and cleanup
+removed the export, both inputs, their objects, the project and the user. The panel itself is still covered by DOM
+tests only.
+
+That run also found a sweep race: a pending row exists before the task-id write, so a sweep landing in that window
+failed a request the provider had already been paid for. Rows younger than `LIPSYNC_TASK_ID_GRACE_MS` (5 minutes) are
+now skipped instead of failed; older rows without a task id still fail as lost.
 
 #### Earlier slice (2026-11-25)
 

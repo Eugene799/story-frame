@@ -418,6 +418,9 @@ export function toRecord(row: LipsyncExportRow): LipsyncExportRecord {
 
 const SWEEP_BATCH = 5;
 
+/** How long a pending row may exist before a missing task id is a real fault. */
+export const LIPSYNC_TASK_ID_GRACE_MS = 5 * 60 * 1000;
+
 export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const now = deps.now ?? (() => Date.now());
@@ -617,6 +620,11 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
 
   async function advance(row: LipsyncExportRow): Promise<void> {
     if (!row.providerTaskId) {
+      // The row is written before the provider call, so the sweep can see it
+      // mid-submit with no task id yet. Failing it here would kill a request the
+      // provider has already been paid for; only a row older than the submit
+      // window is genuinely lost.
+      if (now() - Date.parse(row.createdAt) < LIPSYNC_TASK_ID_GRACE_MS) return;
       await fail(row, "LIPSYNC_PROVIDER_FAILED", "The provider task id was lost, so this lip sync cannot be followed.", 0);
       return;
     }
