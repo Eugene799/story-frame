@@ -521,10 +521,13 @@ export async function startFakeSupabase(
           for (let position = revisions.length - 1; position >= 0; position -= 1) {
             if (revisions[position].project_id === removed.id) revisions.splice(position, 1);
           }
-          // Mirrors the `on delete cascade` on every child table.
-          for (const data of Object.values(childTables)) {
+          // Mirrors the child-table cascades. Narration usage is the exception:
+          // its project reference is cleared so the spending window survives.
+          for (const [table, data] of Object.entries(childTables)) {
             for (let position = data.length - 1; position >= 0; position -= 1) {
-              if (data[position].project_id === removed.id) data.splice(position, 1);
+              if (data[position].project_id !== removed.id) continue;
+              if (table === "narration_usage") data[position].project_id = null;
+              else data.splice(position, 1);
             }
           }
           reply(200, [removed]);

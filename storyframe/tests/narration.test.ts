@@ -318,6 +318,25 @@ describe("narration spending guard", () => {
     expect(app.supabase.narrationTracks).toHaveLength(0);
   });
 
+  it("keeps the spending window after the project is deleted", async () => {
+    const { app, calls } = await startNarrationApp({ NARRATION_DAILY_CHARS_PER_USER: "100" });
+    const projectId = await createProject(app);
+    expect((await preview(app, projectId)).status).toBe(200);
+    expect(calls()).toBe(1);
+
+    const removed = await api(app, USER_A.token, "DELETE", `/api/projects/${projectId}`);
+    expect(removed.status).toBe(200);
+    expect(app.supabase.narrationUsage).toHaveLength(1);
+    expect(app.supabase.narrationUsage[0].project_id).toBeNull();
+
+    const replacement = await createProject(app);
+    const blocked = await preview(app, replacement);
+    expect(blocked.status).toBe(429);
+    expect(blocked.body.error.code).toBe("NARRATION_SPEND_LIMIT");
+    expect(calls()).toBe(1);
+    expect(app.supabase.narrationUsage).toHaveLength(1);
+  });
+
   it("refuses a preview before the provider call when the character or USD budget is exhausted", async () => {
     const chars = await startNarrationApp({ NARRATION_DAILY_CHARS_PER_USER: "10" });
     const charsProject = await createProject(chars.app);

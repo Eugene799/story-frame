@@ -29,6 +29,7 @@ const MIGRATIONS = [
   "20261125230000_create_narration_tracks.sql",
   "20261125240000_create_narration_usage.sql",
   "20261125250000_atomic_narration_usage_reservation.sql",
+  "20261125260000_preserve_narration_usage_on_project_delete.sql",
 ];
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "supabase", "migrations");
 
@@ -571,12 +572,14 @@ check("a second profile for the same user is rejected (23505)",
   (await errorCode(() => as("service_role", null,
     `insert into public.profiles (owner_id, workspace_name) values ($1, 'second')`, [USER_A]))) === "23505");
 
-// 10. Deleting a project cascades revisions and every child row.
+// 10. Deleting a project cascades revisions and child rows, but preserves the
+// Deepgram ledger so deleting a project cannot reset the spending guard.
 await as("service_role", null, "delete from public.projects where id = $1 and owner_id = $2", [PROJECT_A, USER_A]);
 check("deleting the project removed its narration tracks",
   (await count("narration_tracks", "project_id = $1", [PROJECT_A])) === 0);
-check("deleting the project removed its narration usage rows",
-  (await count("narration_usage", "project_id = $1", [PROJECT_A])) === 0);
+check("deleting the project preserved its narration usage rows and cleared the project reference",
+  (await count("narration_usage", "owner_id = $1", [USER_A])) === 2 &&
+    (await count("narration_usage", "owner_id = $1 and project_id is null", [USER_A])) === 2);
 check("deleting the project removed its revisions",
   (await count("project_revisions", "project_id = $1", [PROJECT_A])) === 0);
 for (const child of CHILD_ROWS) {
@@ -597,6 +600,11 @@ for (const child of CHILD_ROWS) {
 }
 await as("service_role", null,
   `insert into public.profiles (owner_id, workspace_name) values ($1, 'B workspace')`, [USER_B]);
+await as("service_role", null,
+  `insert into public.narration_usage
+     (owner_id, project_id, kind, status, characters, cost_usd, rate_version)
+   values ($1, $2, 'preview', 'succeeded', 10, 0.0003, 'rate-v1')`,
+  [USER_B, PROJECT_B]);
 await db.exec(`delete from auth.users where id = '${USER_B}'`);
 check("deleting the auth user removed their projects",
   (await count("projects", "owner_id = $1", [USER_B])) === 0);
@@ -606,6 +614,8 @@ for (const child of CHILD_ROWS) {
   check(`deleting the auth user removed their ${child.table} rows`,
     (await count(child.table, "owner_id = $1", [USER_B])) === 0);
 }
+check("deleting the auth user removed their narration usage rows",
+  (await count("narration_usage", "owner_id = $1", [USER_B])) === 0);
 check("deleting the auth user removed their profile",
   (await count("profiles", "owner_id = $1", [USER_B])) === 0);
 

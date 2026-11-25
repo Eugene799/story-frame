@@ -462,8 +462,14 @@ async function main(): Promise<number> {
     check("cleanup removes the project", removedProject.status === 200);
     const remaining = await serviceRows(`narration_tracks?select=id&project_id=eq.${projectId}`);
     check("cleanup leaves no narration rows", remaining.length === 0);
-    const remainingUsage = await serviceRows(`narration_usage?select=id&project_id=eq.${projectId}`);
-    check("cleanup leaves no narration usage rows", remainingUsage.length === 0);
+    const remainingUsage = await serviceRows(
+      `narration_usage?select=id,project_id&owner_id=eq.${user.id}`,
+    );
+    check(
+      "project cleanup preserves the usage ledger and clears its project reference",
+      remainingUsage.length === 2 && remainingUsage.every((row) => row.project_id === null),
+      JSON.stringify(remainingUsage.map((row) => [row.id, row.project_id])),
+    );
   } finally {
     if (projectId) await api(user?.token ?? null, "DELETE", `/api/projects/${projectId}`).catch(() => undefined);
     if (user) {
