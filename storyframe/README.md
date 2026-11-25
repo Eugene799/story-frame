@@ -477,7 +477,8 @@ returned `403` with no allow-origin header, and a presigned `GET` carried the al
 Every live check that uploads (`verify:r2-live`, `verify:media-live`, `verify:narration-live`) now preflights a real
 presigned upload from the origin in `cors.json`, so a bucket rule left on an old hostname fails the run instead of only
 surfacing as a 403 in the browser. Measured with a stale origin: `403`, no allow-origin, and the suites dropped to
-`7/8`, `37/38`, and `34/35`.
+`7/8`, `37/38`, and `34/35`. `verify:image-live` and `verify:stock-routes-live` are deliberately left out: their bytes
+reach R2 from the server (provider image generation and stock import), so there is no browser upload to preflight.
 
 ### Deletion, references, and retention
 
@@ -768,6 +769,7 @@ controlled import with provenance, credited exports, and live acceptance runs fo
 Phase 7 (Cloudflare Workers AI and Leonardo image generation) is implemented with a Generate tab, persisted cost capture,
 and recoverable pending jobs. Phase 8 (Deepgram narration and uploaded audio) is implemented with a Narration tab,
 persisted private audio, script-staleness fingerprints, measured duration warnings, and uploaded narration/music controls.
+Phase 8 is closed; Phase 9 (video export) has not been started.
 
 ### Phase 6 verification (2026-11-25)
 
@@ -938,6 +940,15 @@ owner still cascades the ledger with the account.
 The `<audio>` element only receives short-lived private R2 playback URLs. Generated and uploaded project audio is
 referenced as `document` media, so retention cannot remove a track that is still active; replaced/removed tracks release
 that reference. Deepgram transcription for Mode C is a separate capability and is not part of this phase.
+
+**Status (closed 2026-11-25).** Every Phase 8 contract item above is implemented and exercised: real Deepgram narration
+from an approved script, the account-wide rolling spending guard with reservations written before the provider call,
+the four hosted migrations, uploaded narration and music with byte-detected containers and measured durations, stale
+narration after a script edit, the Narration tab, and live evidence of 35/35 for `verify:narration-live`, 113/113 for
+`verify:sql`, and a real-browser walkthrough on a disposable account. Two limits are stated rather than implemented: no
+word-level subtitle timings are requested or inferred, and only the documented Aura-2 voices are offered. The one
+deferred Phase 8 concern is JSON2Video's temporary input access, which is Phase 9's first task; the presign TTL rule in
+[Private media](#private-media-phase-3) is its design constraint.
 
 ### Phase 3 verification (2026-11-24)
 

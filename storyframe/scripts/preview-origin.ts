@@ -5,6 +5,10 @@ import { readFileSync } from "node:fs";
  * whatever the bucket happens to allow. The live checks preflight a real
  * presigned upload from it, so a bucket rule left on an old preview hostname
  * fails the run instead of only showing up as a 403 in the browser.
+ *
+ * Only checks whose fixture travels through a presigned browser upload use this.
+ * Image generation and stock import write to the bucket from the server, so they
+ * have no browser preflight to make.
  */
 const PREVIEW_ORIGIN: string | undefined = (
   JSON.parse(readFileSync(new URL("../cors.json", import.meta.url), "utf8")) as {
