@@ -30,6 +30,8 @@ const MIGRATIONS = [
   "20261125240000_create_narration_usage.sql",
   "20261125250000_atomic_narration_usage_reservation.sql",
   "20261125260000_preserve_narration_usage_on_project_delete.sql",
+  "20261126090000_add_video_render_jobs.sql",
+  "20261126100000_create_video_usage.sql",
 ];
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "supabase", "migrations");
 
@@ -557,6 +559,99 @@ check("render_snapshots rejects a revision that does not exist (23503)",
     `insert into public.render_snapshots (project_id, owner_id, project_revision)
      values ($1, $2, 99)`, [PROJECT_A, USER_A]))) === "23503");
 
+// 8d. Phase 9: exports are marked by kind, so their one-live indexes never
+// constrain the generic snapshot/job rows, and the credit guard refuses an
+// over-budget render without inserting anything.
+const exportRender = `insert into public.render_snapshots
+    (project_id, owner_id, project_revision, status, kind, credits_estimate, idempotency_key)
+  values ($1, $2, 1, 'pending', 'video-export', 12, $3)`;
+await as("service_role", null, exportRender, [PROJECT_A, USER_A, "export-key-1"]);
+check("render_snapshots: a second pending video export is rejected (23505)",
+  (await errorCode(() => as("service_role", null, exportRender, [PROJECT_A, USER_A, "export-key-2"]))) === "23505");
+await as("service_role", null,
+  `insert into public.render_snapshots (project_id, owner_id, project_revision, status)
+   values ($1, $2, 1, 'pending')`, [PROJECT_A, USER_A]);
+check("render_snapshots: a second pending generic snapshot still inserts",
+  (await count("render_snapshots", "project_id = $1 and kind = 'snapshot' and status = 'pending'", [PROJECT_A])) === 2);
+
+await as("service_role", null,
+  "update public.render_snapshots set status = 'ready' where idempotency_key = $1", ["export-key-1"]);
+check("render_snapshots: a reused idempotency key is rejected once the first export left pending (23505)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.render_snapshots
+       (project_id, owner_id, project_revision, status, kind, credits_estimate, idempotency_key)
+     values ($1, $2, 1, 'ready', 'video-export', 12, 'export-key-1')`,
+    [PROJECT_A, USER_A]))) === "23505");
+check("render_snapshots: rows without an idempotency key are not constrained",
+  (await count("render_snapshots", "project_id = $1 and idempotency_key is null", [PROJECT_A])) === 2);
+check("render_snapshots: an unknown status is still rejected (23514)",
+  (await errorCode(() => as("service_role", null,
+    "update public.render_snapshots set status = 'done' where idempotency_key = $1", ["export-key-1"]))) === "23514");
+check("render_snapshots: an unknown provider status is rejected (23514)",
+  (await errorCode(() => as("service_role", null,
+    "update public.render_snapshots set provider_status = 'finished' where idempotency_key = $1", ["export-key-1"]))) === "23514");
+check("render_snapshots: a negative credit estimate is rejected (23514)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.render_snapshots
+       (project_id, owner_id, project_revision, status, kind, credits_estimate)
+     values ($1, $2, 1, 'ready', 'video-export', -1)`, [PROJECT_A, USER_A]))) === "23514");
+
+const exportJob = `insert into public.provider_jobs (project_id, owner_id, provider, status, kind)
+  values ($1, $2, 'json2video', 'queued', 'video-export')`;
+await as("service_role", null, exportJob, [PROJECT_A, USER_A]);
+check("provider_jobs: a second live video export job is rejected (23505)",
+  (await errorCode(() => as("service_role", null, exportJob, [PROJECT_A, USER_A]))) === "23505");
+await as("service_role", null,
+  `insert into public.provider_jobs (project_id, owner_id, provider, status)
+   values ($1, $2, 'json2video', 'queued')`, [PROJECT_A, USER_A]);
+check("provider_jobs: a second queued generic job still inserts",
+  (await count("provider_jobs", "project_id = $1 and kind = 'generic' and status = 'queued'", [PROJECT_A])) === 2);
+
+const grantedCredits = await as<{ usage_id: string; allowed: boolean; credits_used: number }>(
+  "service_role",
+  null,
+  `select * from public.reserve_video_usage($1, $2, null, 120, 'json2video-2026-11-25', 200, 86400)`,
+  [USER_A, PROJECT_A],
+);
+check("video_usage: an allowed reservation inserts a pending row and reports the new total",
+  grantedCredits[0]?.allowed === true &&
+    typeof grantedCredits[0]?.usage_id === "string" &&
+    Number(grantedCredits[0]?.credits_used) === 120);
+check("video_usage: the pending row counts its estimate in the window",
+  (await count("video_usage", "owner_id = $1 and status = 'pending' and credits_counted = 120", [USER_A])) === 1);
+
+const refusedCredits = await as<{ allowed: boolean; credits_used: number }>(
+  "service_role",
+  null,
+  `select * from public.reserve_video_usage($1, $2, null, 100, 'json2video-2026-11-25', 200, 86400)`,
+  [USER_A, PROJECT_A],
+);
+check("video_usage: an over-budget reservation is refused and adds no row",
+  refusedCredits[0]?.allowed === false &&
+    Number(refusedCredits[0]?.credits_used) === 120 &&
+    (await count("video_usage", "owner_id = $1", [USER_A])) === 1);
+check("video_usage: the owner reads their own row",
+  (await count("video_usage", "owner_id = $1", [USER_A], "authenticated", USER_A)) === 1);
+check("video_usage: another account reads nothing",
+  (await count("video_usage", "owner_id = $1", [USER_A], "authenticated", USER_B)) === 0);
+check("video_usage: authenticated write is refused (42501)",
+  (await errorCode(() => as("authenticated", USER_A,
+    `insert into public.video_usage
+       (owner_id, project_id, status, credits_estimate, credits_counted, rate_version)
+     values ($1, $2, 'pending', 1, 1, 'rate-v1')`, [USER_A, PROJECT_A]))) === "42501");
+check("video_usage: authenticated execute is refused (42501)",
+  (await errorCode(() => as("authenticated", USER_A,
+    `select * from public.reserve_video_usage($1, $2, null, 1, 'rate-v1', 10, 86400)`,
+    [USER_A, PROJECT_A]))) === "42501");
+check("video_usage: a negative credit estimate is rejected (23514)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.video_usage (owner_id, status, credits_estimate, rate_version)
+     values ($1, 'pending', -1, 'rate-v1')`, [USER_A]))) === "23514");
+check("video_usage: an unknown status is rejected (23514)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.video_usage (owner_id, status, credits_estimate, rate_version)
+     values ($1, 'done', 1, 'rate-v1')`, [USER_A]))) === "23514");
+
 // 9. Profiles are one workspace per user, with the same owner pattern.
 await as("service_role", null,
   `insert into public.profiles (owner_id, display_name, workspace_name)
@@ -580,6 +675,9 @@ check("deleting the project removed its narration tracks",
 check("deleting the project preserved its narration usage rows and cleared the project reference",
   (await count("narration_usage", "owner_id = $1", [USER_A])) === 2 &&
     (await count("narration_usage", "owner_id = $1 and project_id is null", [USER_A])) === 2);
+check("deleting the project preserved its video usage row and cleared the project reference",
+  (await count("video_usage", "owner_id = $1", [USER_A])) === 1 &&
+    (await count("video_usage", "owner_id = $1 and project_id is null", [USER_A])) === 1);
 check("deleting the project removed its revisions",
   (await count("project_revisions", "project_id = $1", [PROJECT_A])) === 0);
 for (const child of CHILD_ROWS) {
@@ -605,6 +703,11 @@ await as("service_role", null,
      (owner_id, project_id, kind, status, characters, cost_usd, rate_version)
    values ($1, $2, 'preview', 'succeeded', 10, 0.0003, 'rate-v1')`,
   [USER_B, PROJECT_B]);
+await as("service_role", null,
+  `insert into public.video_usage
+     (owner_id, project_id, status, credits_estimate, credits_counted, rate_version)
+   values ($1, $2, 'succeeded', 6, 6, 'json2video-2026-11-25')`,
+  [USER_B, PROJECT_B]);
 await db.exec(`delete from auth.users where id = '${USER_B}'`);
 check("deleting the auth user removed their projects",
   (await count("projects", "owner_id = $1", [USER_B])) === 0);
@@ -616,6 +719,8 @@ for (const child of CHILD_ROWS) {
 }
 check("deleting the auth user removed their narration usage rows",
   (await count("narration_usage", "owner_id = $1", [USER_B])) === 0);
+check("deleting the auth user removed their video usage rows",
+  (await count("video_usage", "owner_id = $1", [USER_B])) === 0);
 check("deleting the auth user removed their profile",
   (await count("profiles", "owner_id = $1", [USER_B])) === 0);
 

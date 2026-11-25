@@ -114,6 +114,8 @@ these tables. Apply them in filename order:
 15. `20261125240000_create_narration_usage.sql` (Phase 8: Deepgram preview/generation spending ledger)
 16. `20261125250000_atomic_narration_usage_reservation.sql` (Phase 8: atomic per-account reservation function)
 17. `20261125260000_preserve_narration_usage_on_project_delete.sql` (Phase 8: keep the Deepgram ledger when a project is deleted)
+18. `20261126090000_add_video_render_jobs.sql` (Phase 9: export-scoped render/job kinds and their unique indexes)
+19. `20261126100000_create_video_usage.sql` (Phase 9: credits ledger and atomic per-account reservation)
 
 Run the compatibility check first. It must return no rows:
 
@@ -124,7 +126,8 @@ where table_schema = 'public'
   and table_name in (
     'ai_usage', 'projects', 'project_revisions', 'scenes', 'media_metadata',
     'media_references', 'sources', 'claims', 'generation_proposals',
-    'provider_jobs', 'render_snapshots', 'profiles', 'model_health', 'stock_search_cache'
+    'provider_jobs', 'render_snapshots', 'profiles', 'model_health', 'stock_search_cache',
+    'video_usage'
   );
 ```
 
@@ -145,8 +148,9 @@ Afterwards, check the running server rather than assuming the schema is ready:
 3. Set `SMOKE_SUPABASE_ACCESS_TOKEN` to a session token and run `npm run smoke:live` (five
    billable calls, described under Tests).
 
-**All seventeen migrations through Phase 8 are applied to the configured project (`myrohtkfsuppcabedwmn`): the sixth on
-2026-11-24, the seventh and eighth (Phase 5) on 2026-11-25, and the ninth through seventeenth (Phases 6–8) on 2026-11-25.** The Phase 6 catalog was
+**The seventeen migrations through Phase 8 are applied to the configured project (`myrohtkfsuppcabedwmn`): the sixth on
+2026-11-24, the seventh and eighth (Phase 5) on 2026-11-25, and the ninth through seventeenth (Phases 6–8) on 2026-11-25.
+The two Phase 9 migrations are not applied to the hosted project yet; `npm run verify:sql` proves them locally first.** The Phase 6 catalog was
 checked directly after applying it: `media_metadata.provenance` and its object constraint exist,
 `media_metadata_ready_stock_import_key` is a partial unique index on the owner, project, provider, asset id, and
 rendition where `status = 'ready'`, and `stock_search_cache` exists with RLS enabled, no `authenticated` grants, and
