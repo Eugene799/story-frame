@@ -407,6 +407,47 @@ describe("usage ledger", () => {
     }
   });
 
+  it("returns project_busy when a second key races the project's pending row", async () => {
+    const supabase = await startFakeSupabase();
+    const ledger = createSupabaseUsageLedger({
+      url: supabase.url,
+      serviceRoleKey: SERVICE_ROLE_KEY,
+      timeoutMs: 1_000,
+    });
+    const projectId = "77777777-7777-4777-8777-777777777777";
+    const reservation = {
+      userId: USER_A.id,
+      projectId,
+      modelId: "gemma",
+      configuredModel: "gemma4:31b",
+    };
+
+    try {
+      const first = await ledger.reserve({
+        ...reservation,
+        idempotencyKey: "race-first-key-12345678",
+        requestHash: "race-first-hash",
+      });
+      expect(first).toEqual({ state: "reserved", id: expect.any(String) });
+
+      // Bypasses the route preflight entirely: the unique index is the backstop.
+      const second = await ledger.reserve({
+        ...reservation,
+        idempotencyKey: "race-second-key-12345678",
+        requestHash: "race-second-hash",
+      });
+      expect(second).toEqual({ state: "project_busy" });
+      expect(supabase.usage).toHaveLength(1);
+      expect(supabase.usage[0]).toMatchObject({
+        idempotency_key: "race-first-key-12345678",
+        project_id: projectId,
+        status: "pending",
+      });
+    } finally {
+      await supabase.close();
+    }
+  });
+
   it("reports a ledger read failure without contacting the provider", async () => {
     const fetchImpl = vi.fn<typeof fetch>();
     const app = await startTestServer({ fetchImpl, supabase: { failure: "reads" } });

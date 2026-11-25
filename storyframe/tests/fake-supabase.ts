@@ -103,6 +103,8 @@ export interface FakeSupabaseOptions {
   loseConditionalUpdate?: boolean;
   /** Simulate the schema before the planning preflight migration. */
   missingProjectIdColumn?: boolean;
+  /** Answer the next project-pending read as empty, to simulate a preflight/insert race. */
+  hideNextPendingProjectAttempt?: boolean;
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
@@ -134,6 +136,7 @@ export async function startFakeSupabase(
   options: FakeSupabaseOptions = {},
 ): Promise<FakeSupabase> {
   const usage: FakeUsageRow[] = [];
+  let hideNextPendingRead = options.hideNextPendingProjectAttempt === true;
   const projects: FakeProjectRow[] = [];
   const revisions: FakeRevisionRow[] = [];
   const profiles: FakeProfileRow[] = [];
@@ -342,6 +345,11 @@ export async function startFakeSupabase(
           if (projectId) rows = rows.filter((row) => row.project_id === projectId);
 
           const statusFilter = url.searchParams.get("status");
+          if (hideNextPendingRead && projectId && statusFilter === "eq.pending") {
+            hideNextPendingRead = false;
+            sendJson(response, 200, []);
+            return;
+          }
           if (statusFilter?.startsWith("eq.")) {
             const status = statusFilter.slice(3);
             rows = rows.filter((row) => row.status === status);

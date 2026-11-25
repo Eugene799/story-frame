@@ -700,6 +700,46 @@ describe("Phase 5 planning", () => {
     }
   });
 
+  it("maps a preflight-bypassing reservation race to the in-flight 409", async () => {
+    const provider = stubProvider([scriptReply("Should not run.")]);
+    const app = await startTestServer({
+      fetchImpl: provider.impl,
+      supabase: { hideNextPendingProjectAttempt: true },
+    });
+    try {
+      const projectId = await createProject(app.url);
+      app.supabase.usage.push(
+        pendingUsageRow({
+          userId: USER_A.id,
+          projectId,
+          idempotencyKey: "race-winner-key-12345678",
+          requestHash: "race-winner-hash",
+          createdAt: new Date().toISOString(),
+        }),
+      );
+
+      // The first pending read (the preflight) is hidden, so only the unique
+      // index rejects this second key; the route must still map it to the 409.
+      const blocked = await generate(
+        app.url,
+        projectId,
+        { route: "script", baseVersion: 1 },
+        USER_A.token,
+        "race-loser-key-12345678",
+      );
+      expect(blocked.status).toBe(409);
+      expect(await blocked.json()).toMatchObject({
+        ok: false,
+        error: { code: "PLANNING_ATTEMPT_IN_FLIGHT" },
+      });
+      expect(provider.calls).toHaveLength(0);
+      expect(app.supabase.usage).toHaveLength(1);
+      expect(app.supabase.usage[0].idempotency_key).toBe("race-winner-key-12345678");
+    } finally {
+      await app.close();
+    }
+  });
+
   it("settles a stale project attempt before reserving a new key", async () => {
     const provider = stubProvider([scriptReply("After the stale attempt.")]);
     const app = await startTestServer({ fetchImpl: provider.impl });
