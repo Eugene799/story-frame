@@ -454,7 +454,7 @@ describe("lipsync sweep", () => {
     expect(store.rows[0]?.status).toBe("pending");
   });
 
-  it("fails a row whose task id never arrived once the submit window has passed", async () => {
+  it("settles the reserved ceiling when a task id never arrived after the submit window", async () => {
     const store = memoryStore([
       row({ providerTaskId: null, createdAt: new Date(NOW - LIPSYNC_TASK_ID_GRACE_MS - 1_000).toISOString() }),
     ]);
@@ -463,7 +463,10 @@ describe("lipsync sweep", () => {
 
     expect(store.rows[0]?.status).toBe("failed");
     expect(store.rows[0]?.failureCode).toBe("LIPSYNC_PROVIDER_FAILED");
-    expect(store.settled.at(-1)).toEqual({ exportId: store.rows[0]?.id, status: "failed", seconds: 0 });
+    // The provider may have accepted and billed the request, so the reservation
+    // is what the ledger keeps rather than a free zero.
+    expect(store.settled.at(-1)).toEqual({ exportId: store.rows[0]?.id, status: "succeeded", seconds: 20 });
+    expect(store.rows[0]?.secondsCounted).toBe(20);
   });
 
   it("refuses a result on a host outside the allowlist", async () => {

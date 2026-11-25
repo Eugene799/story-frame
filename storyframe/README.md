@@ -986,7 +986,7 @@ deferred Phase 8 concern is JSON2Video's temporary input access, which is Phase 
 | Two-account isolation on the hosted project | **PASS** | Same check: RLS reads, refused browser write, and `404` for foreign routes |
 | Bucket CORS | **PASS** | Rule applied and probed (allowed preflight `204`, foreign origin `403`, presigned `GET` header); `verify:r2-live`, `verify:media-live`, and `verify:narration-live` now fail when the bucket does not echo the `cors.json` preview origin |
 | Upload from the UI in a browser | **UNVERIFIED** | There is still no media UI; the flow is API-only until the workspace is built |
-| JSON2Video temporary input access | **DEFERRED** | Phase 9; the presign TTL policy above is the design constraint |
+| JSON2Video temporary input access | **RESOLVED** | Closed in Phase 9: every render input is presigned with `VIDEO_INPUT_URL_SECONDS` (7 200 by default), which must outlive queueing plus the render window; the live render consumed those URLs successfully |
 
 ### Phase 9: video export through JSON2Video (2026-11-25) — complete
 
@@ -1063,7 +1063,7 @@ unsaved changes, no scenes exist, or an export is already running. A refusal fro
 (retries and the `…/refresh` endpoint are deferred); no renders-per-day cap; the provider copy is deleted best-effort
 after our own copy exists; no cancel; no subtitle or word-timing claim; no USD estimate.
 
-### Lip sync through Everypixel Labs (2026-11-26) — complete, no live call yet
+### Lip sync through Everypixel Labs (2026-11-26) — complete and live-verified
 
 One source (a talking clip or a still portrait) plus one audio track becomes a new MP4 whose mouth
 matches the audio. Routes are `GET|POST /api/projects/:id/exports/lipsync` and
@@ -1106,7 +1106,8 @@ tests only.
 
 That run also found a sweep race: a pending row exists before the task-id write, so a sweep landing in that window
 failed a request the provider had already been paid for. Rows younger than `LIPSYNC_TASK_ID_GRACE_MS` (5 minutes) are
-now skipped instead of failed; older rows without a task id still fail as lost.
+now skipped instead of failed. An older row without a task id fails as lost and keeps the reserved ceiling, because the
+submit may already have been accepted and billed.
 
 #### Earlier slice (2026-11-25)
 
@@ -1121,13 +1122,13 @@ than fetching provider URLs; the source's own content type picks the endpoint. A
 the same value). Provider bodies are never surfaced: a rejection becomes a stable code plus its HTTP status, so an
 echoed key cannot reach a client.
 - The output URL is returned whole, signature query included, because provider output links are usually signed. Its host
-is **not** yet allowlisted the way `OUTPUT_HOSTS` guards the JSON2Video copy, so a download path must not ship until a
-real render shows which host serves the file. A signed-out or unconfigured server answers `LIPSYNC_PROVIDER_DISABLED`.
+is allowlisted the way `OUTPUT_HOSTS` guards the JSON2Video copy, and a live render confirmed `s.api.everypixel.com`
+needs no extra entry. A signed-out or unconfigured server answers `LIPSYNC_PROVIDER_DISABLED`.
 - `tests/everypixel.test.ts` covers both endpoints, basic auth, the data URIs, every refusal (source kind, audio kind,
 length, size, resolution), unreachable and rejecting providers, an unknown task status, success without a usable URL and
 `FAILURE`/`REVOKED`. No paid call was made.
-- Still missing before this is usable: the job table and spend guard, `POST/GET/DELETE /api/projects/:id/exports/lipsync`,
-copying the finished MP4 into R2 through a host-checked download, and a Preview-tab panel.
+- All four items this slice listed as missing — the job table and spend guard, the three export routes, the host-checked
+copy into R2, and the Preview-tab panel — shipped on 2026-11-26, as described in the section above.
 
 ## Model catalog (verified 2026-11-24)
 

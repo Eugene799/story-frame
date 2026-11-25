@@ -625,7 +625,15 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
       // provider has already been paid for; only a row older than the submit
       // window is genuinely lost.
       if (now() - Date.parse(row.createdAt) < LIPSYNC_TASK_ID_GRACE_MS) return;
-      await fail(row, "LIPSYNC_PROVIDER_FAILED", "The provider task id was lost, so this lip sync cannot be followed.", 0);
+      // The submit may have been accepted before the task id was stored, so this
+      // cannot be followed but may still be billed: the ceiling stands rather
+      // than reporting a request the provider ran as free.
+      await fail(
+        row,
+        "LIPSYNC_PROVIDER_FAILED",
+        "The provider task id was lost, so this lip sync cannot be followed.",
+        row.secondsEstimate,
+      );
       return;
     }
 
