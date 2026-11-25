@@ -555,7 +555,7 @@ license: the JSON includes a deduplicated credit list and the per-scene render p
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 253/253; `verify:sql` 89/89; `verify:stock-live` 8/8; `verify:stock-routes-live` 23/23; `verify:live-routes` 51/51; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 261/261; `verify:sql` 89/89; `verify:stock-live` 8/8; `verify:stock-routes-live` 23/23; `verify:live-routes` 51/51; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -764,6 +764,29 @@ its own credentials and is not started in this change.
 | Real provider searches | **PASS** | `npm run verify:stock-live` on 2026-11-25: image "rainy city street" merged 40 results (Pexels 20 + Pixabay 20) and video "ocean waves" merged 40, all with credit, source page, selected rendition, and no playlist renditions; 8/8 checks |
 | Import into a hosted project | **PASS** | `npm run verify:stock-routes-live` on 2026-11-25 against hosted Supabase and the real `story-frame` bucket: a selected image imported `201` with `ready` media and provenance, a repeat import returned the same media (`200`, `reused: true`) without a second object, it appeared in the media list with that provenance, a draft referencing it exported with the stored creator, provider, source page, and license in `credits` and the per-scene render payload, it returned a presigned playback URL, deleted `200` with its object, and the deleted row stopped being ready; 23/23 checks, including cache rows and cleanup |
 | Hosted schema | **PASS** | `20261125160000_add_stock_media.sql` applied through the Supabase management API on 2026-11-25; the catalog reports `media_metadata.provenance` plus its object constraint, `stock_search_cache` with RLS on, `service_role` grants, and zero `authenticated` grants; `media_metadata_ready_stock_import_key` was applied on 2026-11-25 after confirming the hosted data had no duplicate ready groups; `verify:stock-routes-live` then wrote and read both through the routes |
+
+### Phase 7: image generation scaffold (2026-11-25)
+
+`server/image-providers.ts` contains separate Cloudflare Workers AI and Leonardo adapters with a small verified model
+catalog. They are **not routed and not enabled**: there is no generation route, prompt UI, cost estimate, or R2
+persistence yet, and no live generation was attempted. An adapter refuses with `503 IMAGE_PROVIDER_DISABLED` unless its
+own credentials are set (`CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_AI_API_TOKEN`, or `LEONARDO_API_KEY`), so an absent
+provider stays clearly disabled rather than silently switching to the other.
+
+| Provider | Verified model and request | Limits | Billing |
+| --- | --- | --- | --- |
+| Cloudflare Workers AI | `@cf/black-forest-labs/flux-1-schnell`, 1024×1024 output, 1–8 steps (default 4), prompt ≤ 2048 chars; base64 image in `result.image`, validated as a real image before use | Text-to-image 720 requests/min; 10,000 free neurons/day, then Workers Paid | 4.80 neurons per 512×512 tile plus 9.60 per step; $0.011 per 1,000 neurons. Free allowance is account-level and finite |
+| Leonardo | Phoenix 1.0, model id `de7d3faf-762f-48e0-b3b7-9d0ac3a3fcf3`, v1 create/poll endpoints, prompt ≤ 2000 chars, 32–2048 px in multiples of 8, one image per request | Defaults: 10 concurrent image jobs, 100 create requests/min, 2,000 requests/min overall, 200 queued jobs | API credit priced per model and parameters in Leonardo's API pricing calculator; **no per-image USD rate is published**, so the catalog stores none and the $3/1000 images planning figure remains unverified |
+
+Sources: Cloudflare's pricing and limits pages plus the `flux-1-schnell` model page, and Leonardo's common API values,
+Phoenix guide, and limits reference, all read on 2026-11-25. Cloudflare's SDXL model was deliberately left out: its
+model page marks a planned deprecation and the pricing table no longer lists it. The Leonardo adapter uses the v1
+create/poll pair because those request and response shapes are documented; the v2 create endpoint documents only its
+response, not the poll shape.
+
+`tests/image-providers.test.ts` covers the catalog's exact ids/units/sources, both disabled paths (no network call),
+Cloudflare's request shape and image-byte validation, unknown model/step/prompt refusals, Leonardo submission and
+pending/complete/failed polling, and sanitized provider errors that never include the key.
 
 ### Phase 3 verification (2026-11-24)
 
