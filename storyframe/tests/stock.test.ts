@@ -245,6 +245,10 @@ async function startFakeProviders(): Promise<FakeProviders> {
       response.writeHead(302, { Location: "https://evil.example/photo.jpg" });
       return response.end();
     }
+    if (url.pathname === "/photo/303_web.jpg") {
+      response.writeHead(200, { "Content-Type": "image/jpeg", "Content-Length": String(PHOTO_BYTES.length) });
+      return response.end(PHOTO_BYTES);
+    }
     if (url.pathname === "/assets/photo.jpg") {
       response.writeHead(200, { "Content-Type": "image/jpeg", "Content-Length": String(PHOTO_BYTES.length) });
       return response.end(PHOTO_BYTES);
@@ -751,6 +755,29 @@ describe("stock import", () => {
     expect(listed.media[0].provenance?.provider).toBe("pexels");
     expect(listed.media[0].provenance?.attribution).toBe("Photo by Ada on Pexels");
     expect(app.supabase.media[0].provenance).toMatchObject({ source: "stock", providerId: "101" });
+  });
+
+  it("accepts Pixabay's own site host for web-format images", async () => {
+    const { app } = await startStockApp();
+    const projectId = await createProject(app.url);
+    const response = await apiRequest(app.url, `/api/projects/${projectId}/stock/import`, {
+      method: "POST",
+      body: JSON.stringify(
+        importBody({
+          provider: "pixabay",
+          providerId: "303",
+          rendition: "webformat",
+          url: "https://pixabay.com/photo/303_web.jpg",
+          sourcePage: "https://pixabay.com/photos/303/",
+          creator: "Cara",
+          attribution: "Image by Cara on Pixabay",
+          license: "Pixabay Content License",
+        }),
+      ),
+    });
+    expect(response.status).toBe(201);
+    const body = (await response.json()) as { media: MediaRecord; provenance: MediaProvenance };
+    expect(body.provenance).toMatchObject({ provider: "pixabay", providerId: "303", creator: "Cara" });
   });
 
   it("imports a video with detected type and dimensions recorded by the provider", async () => {

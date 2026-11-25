@@ -96,7 +96,9 @@ const PIXABAY_BASE = "https://pixabay.com/api";
 /** Only provider-owned asset hosts may be downloaded from. */
 const PROVIDER_ASSET_HOSTS: Record<StockProvider, readonly string[]> = {
   pexels: ["images.pexels.com", "videos.pexels.com"],
-  pixabay: ["cdn.pixabay.com"],
+  // Pixabay serves previews and videos from its CDN but web-format and original
+  // images from the site host itself.
+  pixabay: ["cdn.pixabay.com", "pixabay.com", "www.pixabay.com"],
 };
 
 /** Only provider-owned pages may be credited as the source page. */
