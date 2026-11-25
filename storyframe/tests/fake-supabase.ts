@@ -93,6 +93,8 @@ export interface FakeSupabase {
   modelHealth: Record<string, unknown>[];
   stockSearchCache: Record<string, unknown>[];
   imageGenerations: Record<string, unknown>[];
+  narrationTracks: Record<string, unknown>[];
+  narrationUsage: Record<string, unknown>[];
   close: () => Promise<void>;
 }
 
@@ -153,6 +155,8 @@ export async function startFakeSupabase(
   const modelHealth: Record<string, unknown>[] = [];
   const stockSearchCache: Record<string, unknown>[] = [];
   const imageGenerations: Record<string, unknown>[] = [];
+  const narrationTracks: Record<string, unknown>[] = [];
+  const narrationUsage: Record<string, unknown>[] = [];
   const childTables: Record<string, Record<string, unknown>[]> = {
     scenes,
     sources,
@@ -165,6 +169,8 @@ export async function startFakeSupabase(
     model_health: modelHealth,
     stock_search_cache: stockSearchCache,
     image_generations: imageGenerations,
+    narration_tracks: narrationTracks,
+    narration_usage: narrationUsage,
   };
   let failWritesRemaining = options.failWrites ?? 0;
 
@@ -854,6 +860,8 @@ export async function startFakeSupabase(
     modelHealth,
     stockSearchCache,
     imageGenerations,
+    narrationTracks,
+    narrationUsage,
     close: () =>
       new Promise<void>((resolve, reject) => {
         server.closeAllConnections();

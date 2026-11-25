@@ -19,6 +19,7 @@
     "verify:stock-routes-live": "tsx scripts/verify-stock-routes-live.ts",
     "verify:image-live": "tsx scripts/verify-image-live.ts",
     "verify:image-routes-live": "tsx scripts/verify-image-live.ts --fake-provider",
+    "verify:narration-live": "tsx scripts/verify-narration-live.ts",
     "verify:r2-live": "tsx scripts/verify-r2-live.ts",
     "verify:sql": "tsx scripts/verify-sql.ts",
     "audit:media": "tsx scripts/audit-media.ts",
@@ -26,6 +27,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.119.2",
+    "music-metadata": "^12.8.3",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },

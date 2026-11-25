@@ -26,6 +26,13 @@ import type {
   StockType,
 } from "../shared/stock-contract";
 import type {
+  AudioSettingsInput,
+  NarrationKind,
+  NarrationStateResponse,
+  NarrationTrackResponse,
+  NarrationVoiceCatalogResponse,
+} from "../shared/narration-contract";
+import type {
   ImageEstimate,
   ImageEstimateResponse,
   ImageGenerationInput,
@@ -191,6 +198,91 @@ export async function listProjectMedia(accessToken: string, projectId: string): 
 export interface MediaInitiation {
   media: MediaRecord;
   upload: MediaUploadTicket;
+}
+
+export async function listNarrationVoices(accessToken: string): Promise<NarrationVoiceCatalogResponse> {
+  return authorizedJson<NarrationVoiceCatalogResponse>("/api/narration/voices", accessToken);
+}
+
+export async function getNarrationState(
+  accessToken: string,
+  projectId: string,
+): Promise<NarrationStateResponse> {
+  return authorizedJson<NarrationStateResponse>(`/api/projects/${projectId}/narration`, accessToken);
+}
+
+export async function generateNarration(
+  accessToken: string,
+  projectId: string,
+  voiceModel: string,
+): Promise<NarrationTrackResponse> {
+  return authorizedJson<NarrationTrackResponse>(`/api/projects/${projectId}/narration`, accessToken, {
+    method: "POST",
+    body: { voiceModel },
+  });
+}
+
+export async function attachAudioTrack(
+  accessToken: string,
+  projectId: string,
+  kind: NarrationKind,
+  mediaId: string,
+): Promise<NarrationTrackResponse> {
+  const path =
+    kind === "music"
+      ? `/api/projects/${projectId}/music`
+      : `/api/projects/${projectId}/narration/upload`;
+  return authorizedJson<NarrationTrackResponse>(path, accessToken, {
+    method: "POST",
+    body: { mediaId },
+  });
+}
+
+export async function updateAudioSettings(
+  accessToken: string,
+  projectId: string,
+  kind: NarrationKind,
+  patch: AudioSettingsInput,
+): Promise<NarrationTrackResponse> {
+  return authorizedJson<NarrationTrackResponse>(`/api/projects/${projectId}/${kind}`, accessToken, {
+    method: "PATCH",
+    body: patch,
+  });
+}
+
+export async function removeAudioTrack(
+  accessToken: string,
+  projectId: string,
+  kind: NarrationKind,
+): Promise<{ ok: true; track: NarrationTrackResponse["track"] }> {
+  return authorizedJson(`/api/projects/${projectId}/${kind}`, accessToken, { method: "DELETE" });
+}
+
+/** Fetches preview audio bytes; a provider error is still JSON and becomes AiRequestError. */
+export async function previewNarrationVoice(
+  accessToken: string,
+  projectId: string,
+  voiceModel: string,
+): Promise<Blob> {
+  let response: Response;
+  try {
+    response = await fetch(`/api/projects/${projectId}/narration/preview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify({ voiceModel }),
+    });
+  } catch {
+    throw new AiRequestError("NETWORK_ERROR", "The StoryFrame development server could not be reached.", 0);
+  }
+  if (!response.ok) {
+    const parsed = (await response.json().catch(() => null)) as AiErrorResponse | null;
+    throw new AiRequestError(
+      parsed?.error?.code ?? "HTTP_ERROR",
+      parsed?.error?.message ?? `The server returned HTTP ${response.status}.`,
+      response.status,
+    );
+  }
+  return response.blob();
 }
 
 export async function initiateMediaUpload(

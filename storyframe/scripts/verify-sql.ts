@@ -26,6 +26,8 @@ const MIGRATIONS = [
   "20261125200000_create_image_generations.sql",
   "20261125210000_add_image_generation_cost_capture.sql",
   "20261125220000_one_pending_image_generation.sql",
+  "20261125230000_create_narration_tracks.sql",
+  "20261125240000_create_narration_usage.sql",
 ];
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "supabase", "migrations");
 
@@ -458,6 +460,68 @@ check("image_generations: an unknown provider is rejected (23514)",
      values (gen_random_uuid(), $1, $2, 'getty', 'x', 'rain', '{}'::jsonb, 'rate-v1')`,
     [USER_A, PROJECT_A]))) === "23514");
 
+await as("service_role", null,
+  `insert into public.narration_tracks
+     (id, owner_id, project_id, kind, source, status, script_fingerprint, script_characters,
+      duration_seconds, volume, cost_usd, cost_rate_version)
+   values (gen_random_uuid(), $1, $2, 'narration', 'deepgram', 'active', 'fingerprint', 64,
+           1.0, 1, 0.00192, 'deepgram-aura-2-2026-11-25')`,
+  [USER_A, PROJECT_A]);
+check("narration_tracks: the service role stores measured audio",
+  (await count("narration_tracks", "script_characters = 64 and duration_seconds = 1.0", [])) === 1);
+check("narration_tracks: authenticated reads are refused (42501)",
+  (await errorCode(() => as("authenticated", USER_A, "select count(*) from public.narration_tracks"))) === "42501");
+check("narration_tracks: a second active track of the same kind is rejected (23505)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.narration_tracks
+       (id, owner_id, project_id, kind, source, media_id, duration_seconds)
+     values (gen_random_uuid(), $1, $2, 'narration', 'upload', null, 2)`,
+    [USER_A, PROJECT_A]))) === "23505");
+await as("service_role", null,
+  `update public.narration_tracks set status = 'replaced'
+    where owner_id = $1 and kind = 'narration'`,
+  [USER_A]);
+check("narration_tracks: a replacement is allowed after the prior track is retired",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.narration_tracks
+       (id, owner_id, project_id, kind, source, duration_seconds)
+     values (gen_random_uuid(), $1, $2, 'music', 'upload', 2)`,
+    [USER_A, PROJECT_A]))) === "NO_ERROR");
+check("narration_tracks: an unknown kind is rejected (23514)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.narration_tracks
+       (id, owner_id, project_id, kind, source, duration_seconds)
+     values (gen_random_uuid(), $1, $2, 'voiceover', 'upload', 2)`,
+    [USER_A, PROJECT_A]))) === "23514");
+check("narration_tracks: volume outside 0..1 is rejected (23514)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.narration_tracks
+       (id, owner_id, project_id, kind, source, duration_seconds, volume)
+     values (gen_random_uuid(), $1, $2, 'music', 'upload', 2, 1.5)`,
+    [USER_A, PROJECT_A]))) === "23514");
+
+await as("service_role", null,
+  `insert into public.narration_usage
+     (owner_id, project_id, kind, status, characters, cost_usd, rate_version)
+   values ($1, $2, 'preview', 'succeeded', 82, 0.00246, 'deepgram-aura-2-2026-11-25')`,
+  [USER_A, PROJECT_A]);
+check("narration_usage: the service role records a settled preview",
+  (await count("narration_usage", "kind = 'preview' and characters = 82 and cost_usd = 0.00246", [])) === 1);
+check("narration_usage: authenticated reads are refused (42501)",
+  (await errorCode(() => as("authenticated", USER_A, "select count(*) from public.narration_usage"))) === "42501");
+check("narration_usage: an unknown kind is rejected (23514)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.narration_usage
+       (owner_id, project_id, kind, characters, cost_usd, rate_version)
+     values ($1, $2, 'transcription', 10, 0.0003, 'rate-v1')`,
+    [USER_A, PROJECT_A]))) === "23514");
+check("narration_usage: a negative charge is rejected (23514)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.narration_usage
+       (owner_id, project_id, kind, characters, cost_usd, rate_version)
+     values ($1, $2, 'generation', 10, -0.1, 'rate-v1')`,
+    [USER_A, PROJECT_A]))) === "23514");
+
 check("render_snapshots rejects a revision that does not exist (23503)",
   (await errorCode(() => as("service_role", null,
     `insert into public.render_snapshots (project_id, owner_id, project_revision)
@@ -480,6 +544,10 @@ check("a second profile for the same user is rejected (23505)",
 
 // 10. Deleting a project cascades revisions and every child row.
 await as("service_role", null, "delete from public.projects where id = $1 and owner_id = $2", [PROJECT_A, USER_A]);
+check("deleting the project removed its narration tracks",
+  (await count("narration_tracks", "project_id = $1", [PROJECT_A])) === 0);
+check("deleting the project removed its narration usage rows",
+  (await count("narration_usage", "project_id = $1", [PROJECT_A])) === 0);
 check("deleting the project removed its revisions",
   (await count("project_revisions", "project_id = $1", [PROJECT_A])) === 0);
 for (const child of CHILD_ROWS) {

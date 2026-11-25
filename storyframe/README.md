@@ -107,6 +107,11 @@ these tables. Apply them in filename order:
 8. `20261125140000_add_planning_attempt_preflight.sql` (Phase 5: `ai_usage.project_id` and one pending attempt per project)
 9. `20261125160000_add_stock_media.sql` (Phase 6: `media_metadata.provenance` and the durable `stock_search_cache` table)
 10. `20261125180000_enforce_stock_import_uniqueness.sql` (Phase 6: one ready copy per imported stock rendition per project)
+11. `20261125200000_create_image_generations.sql` (Phase 7: persisted image-generation jobs)
+12. `20261125210000_add_image_generation_cost_capture.sql` (Phase 7: provider-reported cost)
+13. `20261125220000_one_pending_image_generation.sql` (Phase 7: one pending image per account)
+14. `20261125230000_create_narration_tracks.sql` (Phase 8: narration/music rows, one active track per kind)
+15. `20261125240000_create_narration_usage.sql` (Phase 8: Deepgram preview/generation spending ledger)
 
 Run the compatibility check first. It must return no rows:
 
@@ -210,6 +215,9 @@ anon) key; never the service-role key.
 | `IMAGE_DAILY_IMAGES_PER_USER`, `IMAGE_DAILY_USD_PER_USER` | Per-account spending guard over a rolling 24 hours: recorded attempts and their estimated USD (defaults 20 images and $1.00). Either value set to `0` disables that dimension. Leonardo attempts count toward images but not USD because its rate is unpublished. |
 | `IMAGE_PENDING_ABANDON_AFTER_MS`, `IMAGE_PENDING_SWEEP_INTERVAL_MS` | A pending generation older than the abandon window (default 15 minutes, minimum 1 minute) is settled as `IMAGE_GENERATION_ABANDONED` instead of blocking new images. The background sweep runs on the interval (default 60 seconds; `0` disables it, while generation requests still settle stale rows opportunistically). |
 | `STOCK_IMPORT_TIMEOUT_MS`, `STOCK_IMPORT_REDIRECTS` | Import download timeout and redirect bound (defaults 30000 ms, 3 hops). |
+| `DEEPGRAM_API_KEY` | Deepgram Aura-2 text-to-speech key. Read only in the Node process, sent as `Authorization: Token`, and never stored in a narration row or returned to the browser. |
+| `NARRATION_TIMEOUT_MS`, `NARRATION_MAX_AUDIO_BYTES` | Deepgram request timeout and generated-audio size bound (defaults 60000 ms and 25 MiB). Deepgram accepts at most 2,000 characters per Aura-2 request. |
+| `NARRATION_DAILY_CHARS_PER_USER`, `NARRATION_DAILY_USD_PER_USER` | Per-account Deepgram spending guard over a rolling 24 hours. Every preview and generation attempt, including a failed provider call, is recorded before it is billed; the next request is refused with `429 NARRATION_SPEND_LIMIT` when it would exceed either limit (defaults 100,000 characters and $3.00). `0` disables that dimension. |
 
 `.env` is git-ignored; `.env.example` contains placeholders only. Only public Supabase auth configuration uses a
 `VITE_` name; no secret is prefixed with `VITE_`, returned by the API, logged, or placed in a URL. The Supabase client
@@ -751,8 +759,9 @@ document, unique stock credits, and a render payload with per-scene credited ass
 **Status.** Every Phase 6 contract item is implemented and exercised: one protected search endpoint with normalized
 results, per-provider pagination surfaced in the UI, the durable shared cache with Pixabay's 24-hour window, a
 controlled import with provenance, credited exports, and live acceptance runs for real image/video search and import.
-Phase 7 (Cloudflare Workers AI and Leonardo image generation) has begun: the protected estimate/generate/refresh routes,
-the `image_generations` record, and R2 persistence are in place; a generation UI is not.
+Phase 7 (Cloudflare Workers AI and Leonardo image generation) is implemented with a Generate tab, persisted cost capture,
+and recoverable pending jobs. Phase 8 (Deepgram narration and uploaded audio) is implemented with a Narration tab,
+persisted private audio, script-staleness fingerprints, measured duration warnings, and uploaded narration/music controls.
 
 ### Phase 6 verification (2026-11-25)
 
@@ -867,6 +876,54 @@ response, not the poll shape.
 `tests/image-providers.test.ts` covers the catalog's exact ids/units/sources, both disabled paths (no network call),
 Cloudflare's request shape and image-byte validation, unknown model/step/prompt refusals, Leonardo submission and
 pending/complete/failed polling, and sanitized provider errors that never include the key.
+
+### Phase 8: narration and uploaded audio (2026-11-25)
+
+Deepgram Aura-2 is adapted behind the server: `POST https://api.deepgram.com/v1/speak` with `model` and
+`encoding=mp3` on the query string, `Authorization: Token`, and only `{ text }` in the body. Aura-2 accepts up to 2,000
+characters per REST request and bills $0.030 per 1,000 characters on pay-as-you-go; the catalog records
+`deepgram-aura-2-2026-11-25`. The six featured English voices stored in the catalog are the ones documented by Deepgram
+(Thalia, Andromeda, Helena, Apollo, Arcas, Orpheus). No voice cloning or word-level timestamp claim is made.
+
+Narration is tied to the approved script. Every scene must be approved, and the SHA-256 fingerprint covers the ordered
+scene ids, script text, and approval fingerprints. Changing the script marks the existing narration stale; it is never
+regenerated silently. The real audio duration is read from the stored container with `music-metadata`, compared with the
+sum of scene durations, and a mismatch is reported. Speech is never sped up or cut; the UI points to explicit script or
+unlocked timing edits.
+
+Every billable Deepgram call passes a per-account spending guard over a rolling 24 hours. The `narration_usage` row is
+written before the provider request and settled `succeeded` or `failed` afterwards; failed attempts remain in the
+window because Deepgram may have processed them. Previews use the same budget as generations, and the response also
+refuses a second overlapping request for the account (`429 NARRATION_IN_FLIGHT`). `GET /api/projects/:id/narration`
+returns the window totals, limits, and reset time, which the Narration tab displays.
+
+| Route | Method | Behavior |
+| --- | --- | --- |
+| `/api/narration/voices` | GET | Signed-in Aura-2 voice catalog, 2,000-character bound, verified rate, and whether Deepgram is configured. |
+| `/api/projects/:id/narration` | GET | Active narration/music, current approved-script fingerprint, stale flag, measured timing warning, limits, and rolling usage. |
+| `/api/projects/:id/narration` | POST | Generates from the approved script, measures the audio, stores it in R2, and replaces the active narration. |
+| `/api/projects/:id/narration/preview` | POST | Returns a short real voice sample as audio bytes; it is not saved as project media. |
+| `/api/projects/:id/narration/upload` | POST | Attaches a ready audio asset from the project as narration, measuring its real duration. |
+| `/api/projects/:id/narration` | PATCH / DELETE | Updates volume/mute or removes the active narration. |
+| `/api/projects/:id/music` | POST / PATCH / DELETE | Attaches, adjusts, or removes uploaded music. |
+
+| Criterion | Status | Evidence |
+| --- | --- | --- |
+| Real Deepgram response becomes playable persisted narration | **PASS** | `npm run verify:narration-live` on 2026-11-25 against real Deepgram, hosted Supabase, and the `story-frame` R2 bucket: 21/21, including a real voice sample, a persisted measured track, the script fingerprint and voice settings, the verified per-character cost, private playback byte-for-byte, and cleanup |
+| Verified endpoint, auth, voice ids, output, billing, and limits | **PASS** | Deepgram docs read 2026-11-25: `/v1/speak`, `Token` auth, Aura-2 model ids, MP3 default, 2,000-character REST bound, $0.030/1k Aura-2 rate, 15 concurrent requests. `tests/deepgram.test.ts` asserts the request shape, `Token` header, audio validation, 2,000-character refusal, derived cost, and sanitized errors |
+| Script fingerprint and staleness | **PASS** | `tests/narration.test.ts`: generation records a 64-character fingerprint and per-scene approval; changing an approved scene makes GET report stale while the track id and provider call count stay unchanged, proving no silent regeneration |
+| Measured duration and explicit mismatch handling | **PASS** | The stored WAV/MP3 duration is parsed from the file; a 1-second track against 20 seconds of scene timing reports `TIMING_MISMATCH`, and the UI states that speech is not sped up or cut. `verify:narration-live` records a real Deepgram duration > 0 |
+| Spending guard and usage record for previews and generations | **PASS** | `tests/narration.test.ts`: preview and generation rows are written before the provider call, previews consume the same rolling budget, a 100-character limit refuses the next generation without another provider call, USD and character limits refuse previews, and a failed call remains a `failed` row that still counts. `verify:narration-live` reads both rows back from hosted `narration_usage` with their settled status, characters, and cost |
+| Uploaded narration, music, volume/mute, replace/remove | **PASS (live R2)** | `verify:narration-live` uploads two real audio files through initiation, presigned `PUT`, completion, and attachment; measures both from R2; exposes narration and music together; plays both back byte-for-byte from private R2; and confirms both active rows in hosted Supabase. `tests/narration.test.ts` also covers volume/mute, replace history, removal, and reference release; `tests/narration-panel.test.tsx` covers the controls |
+| Approved-script gate | **PASS** | An unapproved project is refused with `409 SCRIPT_NOT_APPROVED`, no provider call, and no track. The Narration tab disables generation and shows the reason |
+| Hosted schema | **PASS** | `20261125230000_create_narration_tracks.sql` and `20261125240000_create_narration_usage.sql` applied through the Supabase management API on 2026-11-25; `verify:sql` reports 108/108, including service-role writes, `42501` for authenticated reads, one active track per kind (`23505`), volume/kind and non-negative charge constraints (`23514`), and project/user cascades |
+| Narration UI | **PASS (DOM)** | `tests/narration-panel.test.tsx`: voice preview, approved-character estimate, Generate, measured duration/cost, rolling spend line, timing warning, stale warning, uploaded narration, mute, and remove; not exercised in a real browser here |
+| Word-level subtitle timings | **NOT PROVIDED** | This phase does not request or infer word timestamps; no estimated word timing is labelled as verified subtitles |
+| Voice cloning | **NOT IN SCOPE** | Only the documented Aura-2 voices are offered |
+
+The `<audio>` element only receives short-lived private R2 playback URLs. Generated and uploaded project audio is
+referenced as `document` media, so retention cannot remove a track that is still active; replaced/removed tracks release
+that reference. Deepgram transcription for Mode C is a separate capability and is not part of this phase.
 
 ### Phase 3 verification (2026-11-24)
 

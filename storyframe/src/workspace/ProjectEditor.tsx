@@ -4,6 +4,7 @@ import { AiRequestError, getProject, updateProject } from "../api";
 import { BriefPanel } from "./BriefPanel";
 import { GeneratePanel } from "./GeneratePanel";
 import { MediaPanel } from "./MediaPanel";
+import { NarrationPanel } from "./NarrationPanel";
 import { PlanningPanel } from "./PlanningPanel";
 import { SourcesPanel } from "./SourcesPanel";
 import { PreviewPanel } from "./PreviewPanel";
@@ -17,6 +18,7 @@ type EditorTab =
   | "plan"
   | "script"
   | "storyboard"
+  | "narration"
   | "generate"
   | "media"
   | "preview"
@@ -28,6 +30,7 @@ const TABS: { id: EditorTab; label: string }[] = [
   { id: "plan", label: "Plan" },
   { id: "script", label: "Script" },
   { id: "storyboard", label: "Storyboard" },
+  { id: "narration", label: "Narration" },
   { id: "generate", label: "Generate" },
   { id: "media", label: "Media" },
   { id: "preview", label: "Preview" },
@@ -286,6 +289,13 @@ export function ProjectEditor({
             scenes={draft.scenes}
             targetDurationSeconds={draft.brief.targetDurationSeconds}
             onChange={(scenes) => setDraft({ ...draft, scenes })}
+          />
+        )}
+        {tab === "narration" && (
+          <NarrationPanel
+            projectId={saved.id}
+            getAccessToken={getAccessToken}
+            onBusyChange={setMediaBusy}
           />
         )}
         {tab === "generate" && (

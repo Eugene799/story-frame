@@ -82,6 +82,34 @@ import {
   type MediaStore,
 } from "./media";
 import { R2Error, createR2Client, type R2Client } from "./r2";
+import { DEEPGRAM_PREVIEW_TEXT, loadDeepgramSettings, synthesizeSpeech } from "./deepgram";
+import {
+  createSupabaseNarrationUsageStore,
+  type NarrationUsageStore,
+  type NarrationUsageTotals,
+} from "./narration-usage";
+import {
+  NARRATION_VOICES,
+  buildNarrationScript,
+  createSupabaseNarrationStore,
+  findNarrationVoice,
+  measureAudioDuration,
+  parseAudioAttachInput,
+  parseAudioSettings,
+  parseNarrationGenerateInput,
+  readNarrationScript,
+  type NarrationStore,
+} from "./narration";
+import {
+  DEEPGRAM_AURA2_USD_PER_1K_CHARS,
+  DEEPGRAM_RATE_VERSION,
+  NARRATION_MAX_CHARS,
+  type NarrationKind,
+  type NarrationStateResponse,
+  type NarrationUsageSummary,
+  type NarrationTiming,
+  type NarrationTrack,
+} from "../shared/narration-contract";
 import { startMediaSweeper } from "./media-scheduler";
 import { createSupabaseModelHealthStore, type ModelHealthStore } from "./model-health";
 import {
@@ -523,6 +551,27 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
   // Credentials stay in this process; the store records only the model and job.
   const imageSettings = loadImageProviderSettings(options.env ?? process.env);
 
+  const narrationStore: NarrationStore | null =
+    config.supabaseUrl && config.supabaseServiceRoleKey
+      ? createSupabaseNarrationStore({
+          url: config.supabaseUrl,
+          serviceRoleKey: config.supabaseServiceRoleKey,
+          timeoutMs: config.authTimeoutMs,
+        })
+      : null;
+  const narrationUsageStore: NarrationUsageStore | null =
+    config.supabaseUrl && config.supabaseServiceRoleKey
+      ? createSupabaseNarrationUsageStore({
+          url: config.supabaseUrl,
+          serviceRoleKey: config.supabaseServiceRoleKey,
+          timeoutMs: config.authTimeoutMs,
+        })
+      : null;
+  const narrationSettings = loadDeepgramSettings(options.env ?? process.env);
+  // One billable narration/preview at a time per account, so two tabs and two
+  // projects cannot race the usage read and spend twice.
+  const narrationInFlight = new Set<string>();
+
   const stockCache: StockCacheStore | null =
     config.supabaseUrl && config.supabaseServiceRoleKey
       ? createSupabaseStockCache({
@@ -668,6 +717,12 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       return;
     }
 
+    if (path === "/api/narration/voices") {
+      if (method !== "GET") throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for the narration voices.");
+      await handleNarrationVoices(request, response);
+      return;
+    }
+
     if (path === "/api/projects" || path.startsWith("/api/projects/")) {
       await handleProjects(request, response, path);
       return;
@@ -792,6 +847,28 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       );
     }
     return mediaStore;
+  }
+
+  function requireNarrationUsageStore(): NarrationUsageStore {
+    if (!narrationUsageStore) {
+      throw new HttpError(
+        503,
+        "NARRATION_USAGE_UNAVAILABLE",
+        "The narration usage ledger is not configured on the server. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.",
+      );
+    }
+    return narrationUsageStore;
+  }
+
+  function requireNarrationStore(): NarrationStore {
+    if (!narrationStore) {
+      throw new HttpError(
+        503,
+        "NARRATION_STORE_UNAVAILABLE",
+        "The narration store is not configured on the server. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.",
+      );
+    }
+    return narrationStore;
   }
 
   function requireImageStore(): ImageGenerationStore {
@@ -1697,6 +1774,67 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       return;
     }
 
+    if (segments.length === 3 && segments[1] === "narration" && segments[2] === "preview") {
+      if (method !== "POST") {
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to preview a narration voice.");
+      }
+      await handleNarrationPreview(request, response, user, projectId);
+      return;
+    }
+
+    if (segments.length === 3 && (segments[2] === "upload" || segments[2] === "attach")) {
+      if (segments[1] !== "narration" && segments[1] !== "music") {
+        throw new HttpError(404, "NOT_FOUND", "Unknown endpoint.");
+      }
+      if (method !== "POST") {
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to attach an uploaded audio file.");
+      }
+      await handleAudioAttach(
+        request,
+        response,
+        user,
+        projectId,
+        segments[1] === "music" ? "music" : "narration",
+      );
+      return;
+    }
+
+    if (segments.length === 2 && segments[1] === "narration") {
+      if (method === "GET") {
+        await handleNarrationState(response, user, projectId);
+        return;
+      }
+      if (method === "POST") {
+        await handleNarrationGenerate(request, response, user, projectId);
+        return;
+      }
+      if (method === "PATCH") {
+        await handleAudioSettings(request, response, user, projectId, "narration");
+        return;
+      }
+      if (method === "DELETE") {
+        await handleAudioRemove(response, user, projectId, "narration");
+        return;
+      }
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET, POST, PATCH, or DELETE for narration.");
+    }
+
+    if (segments.length === 2 && segments[1] === "music") {
+      if (method === "POST") {
+        await handleAudioAttach(request, response, user, projectId, "music");
+        return;
+      }
+      if (method === "PATCH") {
+        await handleAudioSettings(request, response, user, projectId, "music");
+        return;
+      }
+      if (method === "DELETE") {
+        await handleAudioRemove(response, user, projectId, "music");
+        return;
+      }
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST, PATCH, or DELETE for music.");
+    }
+
     if (segments.length > 1 && segments[1] === "media") {
       await handleMedia(request, response, user, projectId, segments.slice(2));
       return;
@@ -1767,6 +1905,440 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       return;
     }
     throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET, PUT, or DELETE for this endpoint.");
+  }
+
+  function sendAudio(response: ServerResponse, bytes: Buffer, contentType: string): void {
+    response.writeHead(200, {
+      "Content-Type": contentType,
+      "Content-Length": String(bytes.length),
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    });
+    response.end(bytes);
+  }
+
+  /** Generated audio goes through the same private-media path as an upload. */
+  async function persistGeneratedAudio(
+    ownerId: string,
+    projectId: string,
+    bytes: Buffer,
+    contentType: string,
+  ): Promise<MediaRecord> {
+    const store = requireMediaStore();
+    const objects = requireMediaObjects();
+    if (bytes.length > config.media.audioBytes) {
+      throw new HttpError(413, "MEDIA_TOO_LARGE", "The narration audio exceeds the audio size limit.");
+    }
+    const mediaId = newMediaId();
+    const objectKey = mediaObjectKey(ownerId, mediaId);
+    const upload = objects.presignPut(objectKey, config.media.uploadUrlSeconds);
+    const uploadExpiresAt = new Date(
+      now() + Math.min(config.media.uploadTtlMs, config.media.uploadUrlSeconds * 1000),
+    ).toISOString();
+    await store.createPending(ownerId, projectId, {
+      id: mediaId,
+      kind: "audio",
+      contentType,
+      byteSize: bytes.length,
+      sceneKey: null,
+      objectKey,
+      uploadExpiresAt,
+      provenance: null,
+    });
+    try {
+      const put = await (fetchImpl ?? fetch)(upload.url, {
+        method: "PUT",
+        headers: { "Content-Type": contentType },
+        body: new Uint8Array(bytes),
+        signal: AbortSignal.timeout(config.narration.timeoutMs),
+      });
+      if (!put.ok) {
+        throw new HttpError(502, "MEDIA_STORAGE_UNAVAILABLE", "Private storage rejected the narration audio.");
+      }
+      const head = await requireMediaBucket(() => objects.head(objectKey));
+      if (head === null) {
+        throw new HttpError(502, "MEDIA_STORAGE_UNAVAILABLE", "The narration audio was not stored.");
+      }
+      const media = await store.markReady(ownerId, projectId, mediaId, { contentType, byteSize: head.byteSize });
+      if (!media) {
+        throw new HttpError(409, "MEDIA_STATE_CHANGED", "The narration asset changed while it was stored.");
+      }
+      return media;
+    } catch (error) {
+      await discardMedia(store, objects, ownerId, projectId, mediaId, objectKey);
+      throw error;
+    }
+  }
+
+  async function protectAudio(ownerId: string, projectId: string, mediaId: string, trackId: string): Promise<void> {
+    await requireMediaStore().addReference(ownerId, projectId, mediaId, {
+      refKind: "document",
+      refId: trackId,
+    });
+  }
+
+  /** Replaced/removed audio stops protecting its file from retention. */
+  async function releaseAudioReference(
+    ownerId: string,
+    projectId: string,
+    track: NarrationTrack,
+  ): Promise<void> {
+    if (!track.mediaId) return;
+    try {
+      const references = await requireMediaStore().listReferences(ownerId, projectId, track.mediaId);
+      const reference = references.find((item) => item.refKind === "document" && item.refId === track.id);
+      if (reference) {
+        await requireMediaStore().removeReference(ownerId, projectId, track.mediaId, reference.id);
+      }
+    } catch {
+      log.error("[narration] AUDIO_REFERENCE_RELEASE_FAILED");
+    }
+  }
+
+  function narrationTiming(track: NarrationTrack | null, targetSeconds: number): NarrationTiming | null {
+    if (!track || track.durationSeconds === null || targetSeconds <= 0) return null;
+    const differenceSeconds = Number((track.durationSeconds - targetSeconds).toFixed(3));
+    return {
+      narrationSeconds: track.durationSeconds,
+      targetSeconds,
+      differenceSeconds,
+      mismatch: Math.abs(differenceSeconds) > Math.max(1.5, targetSeconds * 0.1),
+    };
+  }
+
+  function narrationCost(characters: number): number {
+    return Number(((characters / 1000) * DEEPGRAM_AURA2_USD_PER_1K_CHARS).toFixed(6));
+  }
+
+  function narrationUsageView(totals: NarrationUsageTotals): NarrationUsageSummary {
+    const oldest = totals.oldestAt === null ? null : Date.parse(totals.oldestAt);
+    return {
+      windowHours: config.narration.usageWindowMs / (60 * 60 * 1000),
+      previews: totals.previews,
+      generations: totals.generations,
+      characters: totals.characters,
+      spentUsd: totals.spentUsd,
+      limits: {
+        characters: config.narration.dailyCharLimit > 0 ? config.narration.dailyCharLimit : null,
+        usd: config.narration.dailyUsdLimit > 0 ? config.narration.dailyUsdLimit : null,
+      },
+      resetAt:
+        oldest !== null && Number.isFinite(oldest)
+          ? new Date(oldest + config.narration.usageWindowMs).toISOString()
+          : null,
+    };
+  }
+
+  function acquireNarrationSlot(ownerId: string): () => void {
+    if (narrationInFlight.has(ownerId)) {
+      throw new HttpError(
+        429,
+        "NARRATION_IN_FLIGHT",
+        "A narration request is already running for this account. Wait for it to finish.",
+      );
+    }
+    narrationInFlight.add(ownerId);
+    return () => {
+      narrationInFlight.delete(ownerId);
+    };
+  }
+
+  /** Refuses before the provider call, then records the attempt before spending. */
+  async function beginNarrationUsage(
+    ownerId: string,
+    projectId: string,
+    kind: "preview" | "generation",
+    characters: number,
+  ): Promise<string> {
+    if (!narrationSettings.apiKey) {
+      throw new HttpError(
+        503,
+        "NARRATION_PROVIDER_DISABLED",
+        "Deepgram narration is disabled because DEEPGRAM_API_KEY is not configured.",
+      );
+    }
+    const store = requireNarrationUsageStore();
+    const since = new Date(now() - config.narration.usageWindowMs).toISOString();
+    const totals = await store.totalsSince(ownerId, since);
+    const charactersLimit = config.narration.dailyCharLimit;
+    if (charactersLimit > 0 && totals.characters + characters > charactersLimit) {
+      throw new HttpError(
+        429,
+        "NARRATION_SPEND_LIMIT",
+        `This account has ${totals.characters} narration characters in the last 24 hours; the limit is ${charactersLimit}.`,
+      );
+    }
+    const cost = narrationCost(characters);
+    const usdLimit = config.narration.dailyUsdLimit;
+    if (usdLimit > 0 && totals.spentUsd + cost > usdLimit + 1e-9) {
+      throw new HttpError(
+        429,
+        "NARRATION_SPEND_LIMIT",
+        `Narration spend for the last 24 hours is $${totals.spentUsd.toFixed(4)} of $${usdLimit.toFixed(2)}; this request would exceed the limit.`,
+      );
+    }
+    return store.create(ownerId, projectId, {
+      kind,
+      characters,
+      costUsd: cost,
+      rateVersion: DEEPGRAM_RATE_VERSION,
+    });
+  }
+
+  async function settleNarrationUsage(
+    ownerId: string,
+    usageId: string,
+    status: "succeeded" | "failed",
+  ): Promise<void> {
+    // A ledger write must not throw away audio the provider already produced.
+    await requireNarrationUsageStore()
+      .settle(ownerId, usageId, status)
+      .catch(() => log.error("[narration] NARRATION_USAGE_SETTLE_FAILED"));
+  }
+
+  async function handleNarrationVoices(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    checkOrigin(request);
+    await authenticate(request);
+    sendJson(response, 200, {
+      ok: true,
+      configured: narrationSettings.apiKey !== null,
+      provider: "deepgram",
+      modelFamily: "aura-2",
+      maxChars: NARRATION_MAX_CHARS,
+      usdPer1kChars: DEEPGRAM_AURA2_USD_PER_1K_CHARS,
+      rateVersion: DEEPGRAM_RATE_VERSION,
+      wordTimestamps: false,
+      voices: NARRATION_VOICES,
+    });
+  }
+
+  async function handleNarrationState(
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+  ): Promise<void> {
+    const project = await requireProjects().get(user.id, projectId);
+    const active = await requireNarrationStore().active(user.id, projectId);
+    const totals = await requireNarrationUsageStore().totalsSince(
+      user.id,
+      new Date(now() - config.narration.usageWindowMs).toISOString(),
+    );
+    const { script, blocked } = readNarrationScript(project.document);
+    const stale =
+      active.narration !== null &&
+      script !== null &&
+      active.narration.scriptFingerprint !== null &&
+      active.narration.scriptFingerprint !== script.fingerprint;
+    const body: NarrationStateResponse = {
+      ok: true,
+      narration: active.narration,
+      music: active.music,
+      script,
+      scriptBlocked: blocked,
+      stale,
+      timing: script ? narrationTiming(active.narration, script.targetSeconds) : null,
+      limits: {
+        maxChars: NARRATION_MAX_CHARS,
+        usdPer1kChars: DEEPGRAM_AURA2_USD_PER_1K_CHARS,
+        rateVersion: DEEPGRAM_RATE_VERSION,
+      },
+      usage: narrationUsageView(totals),
+    };
+    sendJson(response, 200, body);
+  }
+
+  async function handleNarrationPreview(
+    request: IncomingMessage,
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+  ): Promise<void> {
+    await requireProjects().get(user.id, projectId);
+    const input = parseNarrationGenerateInput(await readJsonBody(request, PROJECT_LIMITS.bodyBytes));
+    const characters = Array.from(DEEPGRAM_PREVIEW_TEXT).length;
+    const release = acquireNarrationSlot(user.id);
+    let usageId: string | null = null;
+    let providerSucceeded = false;
+    try {
+      usageId = await beginNarrationUsage(user.id, projectId, "preview", characters);
+      const speech = await synthesizeSpeech({
+        settings: narrationSettings,
+        voiceModel: input.voiceModel,
+        text: DEEPGRAM_PREVIEW_TEXT,
+        fetchImpl,
+        timeoutMs: config.narration.timeoutMs,
+        maxBytes: Math.min(config.narration.maxAudioBytes, config.media.audioBytes),
+      });
+      providerSucceeded = true;
+      await settleNarrationUsage(user.id, usageId, "succeeded");
+      sendAudio(response, speech.bytes, speech.contentType);
+    } catch (error) {
+      if (usageId && !providerSucceeded) await settleNarrationUsage(user.id, usageId, "failed");
+      throw error;
+    } finally {
+      release();
+    }
+  }
+
+  async function handleNarrationGenerate(
+    request: IncomingMessage,
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+  ): Promise<void> {
+    const input = parseNarrationGenerateInput(await readJsonBody(request, PROJECT_LIMITS.bodyBytes));
+    const project = await requireProjects().get(user.id, projectId);
+    const script = buildNarrationScript(project.document);
+    const voice = findNarrationVoice(input.voiceModel);
+    if (!voice) throw new HttpError(400, "INVALID_VOICE", "Choose one of the listed Deepgram Aura-2 voices.");
+    const release = acquireNarrationSlot(user.id);
+    let usageId: string | null = null;
+    let providerSucceeded = false;
+    try {
+      usageId = await beginNarrationUsage(user.id, projectId, "generation", script.characters);
+      const speech = await synthesizeSpeech({
+        settings: narrationSettings,
+        voiceModel: voice.model,
+        text: script.text,
+        fetchImpl,
+        timeoutMs: config.narration.timeoutMs,
+        maxBytes: Math.min(config.narration.maxAudioBytes, config.media.audioBytes),
+      });
+      providerSucceeded = true;
+      await settleNarrationUsage(user.id, usageId, "succeeded");
+      const durationSeconds = await measureAudioDuration(speech.bytes, speech.contentType);
+      if (durationSeconds === null) {
+        throw new HttpError(
+          422,
+          "NARRATION_AUDIO_UNMEASURABLE",
+          "The provider audio duration could not be measured, so this narration was not saved.",
+        );
+      }
+      const media = await persistGeneratedAudio(user.id, projectId, speech.bytes, speech.contentType);
+      const trackId = randomUUID();
+      try {
+        await protectAudio(user.id, projectId, media.id, trackId);
+        const created = await requireNarrationStore().create(user.id, projectId, {
+          id: trackId,
+          kind: "narration",
+          source: "deepgram",
+          mediaId: media.id,
+          voiceModel: voice.model,
+          voiceName: voice.name,
+          scriptFingerprint: script.fingerprint,
+          scriptCharacters: script.characters,
+          durationSeconds,
+          costUsd: speech.costUsd,
+          costRateVersion: speech.rateVersion,
+        });
+        for (const replaced of created.replaced) {
+          await releaseAudioReference(user.id, projectId, replaced);
+        }
+        sendJson(response, 201, { ok: true, track: created.track, media });
+        return;
+      } catch (error) {
+        await releaseAudioReference(user.id, projectId, {
+          id: trackId,
+          mediaId: media.id,
+        } as NarrationTrack);
+        await discardMedia(
+          requireMediaStore(),
+          requireMediaObjects(),
+          user.id,
+          projectId,
+          media.id,
+          mediaObjectKey(user.id, media.id),
+        );
+        throw error;
+      }
+    } catch (error) {
+      if (usageId && !providerSucceeded) await settleNarrationUsage(user.id, usageId, "failed");
+      throw error;
+    } finally {
+      release();
+    }
+  }
+
+  async function handleAudioAttach(
+    request: IncomingMessage,
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+    kind: NarrationKind,
+  ): Promise<void> {
+    const input = parseAudioAttachInput(await readJsonBody(request, PROJECT_LIMITS.bodyBytes));
+    const project = await requireProjects().get(user.id, projectId);
+    const script = kind === "narration" ? buildNarrationScript(project.document) : null;
+    const store = requireMediaStore();
+    const stored = await store.get(user.id, projectId, input.mediaId);
+    if (!stored || stored.media.status !== "ready" || stored.media.kind !== "audio") {
+      throw new HttpError(
+        422,
+        "AUDIO_ASSET_INVALID",
+        "Choose a ready audio file from this project for narration or music.",
+      );
+    }
+    if (stored.media.byteSize > config.media.audioBytes) {
+      throw new HttpError(413, "MEDIA_TOO_LARGE", "The selected audio exceeds the audio size limit.");
+    }
+    const bytes = await requireMediaBucket(() => requireMediaObjects().get(stored.objectKey));
+    if (!bytes) throw new HttpError(503, "MEDIA_STORAGE_UNAVAILABLE", "The selected audio could not be read.");
+    const durationSeconds = await measureAudioDuration(bytes, stored.media.contentType);
+    if (durationSeconds === null) {
+      throw new HttpError(422, "NARRATION_AUDIO_UNMEASURABLE", "The selected audio duration could not be measured.");
+    }
+
+    const trackId = randomUUID();
+    try {
+      await protectAudio(user.id, projectId, input.mediaId, trackId);
+      const created = await requireNarrationStore().create(user.id, projectId, {
+        id: trackId,
+        kind,
+        source: "upload",
+        mediaId: input.mediaId,
+        voiceModel: null,
+        voiceName: null,
+        scriptFingerprint: script?.fingerprint ?? null,
+        scriptCharacters: script?.characters ?? null,
+        durationSeconds,
+        costUsd: null,
+        costRateVersion: null,
+      });
+      for (const replaced of created.replaced) {
+        await releaseAudioReference(user.id, projectId, replaced);
+      }
+      sendJson(response, 201, { ok: true, track: created.track, media: stored.media });
+    } catch (error) {
+      await releaseAudioReference(user.id, projectId, { id: trackId, mediaId: input.mediaId } as NarrationTrack);
+      throw error;
+    }
+  }
+
+  async function handleAudioSettings(
+    request: IncomingMessage,
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+    kind: NarrationKind,
+  ): Promise<void> {
+    await requireProjects().get(user.id, projectId);
+    const patch = parseAudioSettings(await readJsonBody(request, PROJECT_LIMITS.bodyBytes));
+    const track = await requireNarrationStore().updateActive(user.id, projectId, kind, patch);
+    if (!track) throw new HttpError(404, "AUDIO_TRACK_NOT_FOUND", `This project has no active ${kind} track.`);
+    sendJson(response, 200, { ok: true, track });
+  }
+
+  async function handleAudioRemove(
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+    kind: NarrationKind,
+  ): Promise<void> {
+    await requireProjects().get(user.id, projectId);
+    const track = await requireNarrationStore().removeActive(user.id, projectId, kind);
+    if (!track) throw new HttpError(404, "AUDIO_TRACK_NOT_FOUND", `This project has no active ${kind} track.`);
+    await releaseAudioReference(user.id, projectId, track);
+    sendJson(response, 200, { ok: true, track });
   }
 
   async function handleMedia(

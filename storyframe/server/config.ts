@@ -40,6 +40,14 @@ export interface AppConfig {
     pendingAbandonAfterMs: number;
     pendingSweepIntervalMs: number;
   };
+  /** Phase 8 narration bounds. Credentials are loaded separately. */
+  narration: {
+    timeoutMs: number;
+    maxAudioBytes: number;
+    dailyCharLimit: number;
+    dailyUsdLimit: number;
+    usageWindowMs: number;
+  };
   /** One configured model per planning route; see Phase 5 in the README. */
   planning: { routes: ResolvedPlanningRoute[] };
 }
@@ -174,6 +182,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       // block the account forever.
       pendingAbandonAfterMs: intEnv(env, "IMAGE_PENDING_ABANDON_AFTER_MS", 15 * 60 * 1000, 60_000, 24 * 60 * 60 * 1000),
       pendingSweepIntervalMs: intEnv(env, "IMAGE_PENDING_SWEEP_INTERVAL_MS", 60_000, 0, 60 * 60 * 1000),
+    },
+    narration: {
+      timeoutMs: intEnv(env, "NARRATION_TIMEOUT_MS", 60_000, 1_000, 180_000),
+      maxAudioBytes: intEnv(env, "NARRATION_MAX_AUDIO_BYTES", 25 * 1024 * 1024, 1024, 100 * 1024 * 1024),
+      // Rolling 24-hour guard. Zero disables that dimension. Previews count too.
+      dailyCharLimit: intEnv(env, "NARRATION_DAILY_CHARS_PER_USER", 100_000, 0, 10_000_000),
+      dailyUsdLimit: usdEnv(env, "NARRATION_DAILY_USD_PER_USER", 3, 0, 1000),
+      usageWindowMs: 24 * 60 * 60 * 1000,
     },
     planning: { routes: planningRoutes(env) },
   };

@@ -60,6 +60,8 @@ export interface R2Client {
   head(key: string): Promise<R2ObjectInfo | null>;
   /** Reads the first bytes of an object. Null when the object does not exist. */
   readRange(key: string, byteCount: number): Promise<Buffer | null>;
+  /** Reads a whole bounded object (narration duration inspection). */
+  get(key: string): Promise<Buffer | null>;
   delete(key: string): Promise<boolean>;
   /** One page of the bucket's object list under a prefix (S3 ListObjectsV2). */
   listObjects(
@@ -211,6 +213,15 @@ export function createR2Client(config: R2Config, options: { fetchImpl?: typeof f
       }
       const bytes = Buffer.from(await response.arrayBuffer());
       return bytes.subarray(0, byteCount);
+    },
+
+    async get(key) {
+      const response = await signedRequest("GET", key);
+      if (response.status === 404) return null;
+      if (!response.ok) {
+        throw new R2Error("R2_UNAVAILABLE", `The media bucket rejected the object read (HTTP ${response.status}).`);
+      }
+      return Buffer.from(await response.arrayBuffer());
     },
 
     async delete(key) {
