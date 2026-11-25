@@ -55,7 +55,7 @@ function providerFetch(state: ProviderState = {}): typeof fetch {
     if (url === "https://cloud.leonardo.ai/api/rest/v1/generations" && init?.method === "POST") {
       return jsonResponse({ sdGenerationJob: { generationId: jobId } });
     }
-    if (url.startsWith(`https://cloud.leonardo.ai/api/rest/v1/generations/${jobId}`)) {
+    if (url.startsWith("https://cloud.leonardo.ai/api/rest/v1/generations/")) {
       return jsonResponse({
         generations_by_pk: state.leonardoPending
           ? { status: "PENDING" }
@@ -445,6 +445,134 @@ describe("image generation", () => {
     expect(app.r2.puts).toBe(0);
   });
 
+  it("names the blocking job from another project and refreshes it there", async () => {
+    const state: ProviderState = { leonardoPending: true };
+    const app = await startImageApp(state);
+    const currentProject = await createProject(app);
+    const otherProject = await createProject(app);
+    seedGeneration(app, {
+      project_id: otherProject,
+      provider: "leonardo",
+      model_key: "leonardo:phoenix-1.0",
+      status: "pending",
+      job_id: "job-other",
+      media_id: null,
+      estimated_usd: null,
+      estimated_neurons: null,
+    });
+    const pendingId = app.supabase.imageGenerations[0].id as string;
+
+    const blocked = await api(app, USER_A.token, "POST", `/api/projects/${currentProject}/image-generations`, {
+      modelKey: "cloudflare:flux-1-schnell",
+      prompt: "another",
+    });
+
+    expect(blocked.status).toBe(429);
+    expect(blocked.body.error.code).toBe("IMAGE_GENERATION_IN_FLIGHT");
+    expect(blocked.body.error.details.pending).toMatchObject({
+      generationId: pendingId,
+      projectId: otherProject,
+      jobId: "job-other",
+      provider: "leonardo",
+      modelKey: "leonardo:phoenix-1.0",
+    });
+
+    // The client can finish the job through the project that owns it.
+    state.leonardoPending = false;
+    const refreshed = await api(
+      app,
+      USER_A.token,
+      "POST",
+      `/api/projects/${otherProject}/image-generations/${pendingId}/refresh`,
+    );
+    expect(refreshed.status).toBe(200);
+    expect(refreshed.body.generation.status).toBe("succeeded");
+    expect(refreshed.body.media.status).toBe("ready");
+
+    const created = await api(app, USER_A.token, "POST", `/api/projects/${currentProject}/image-generations`, {
+      modelKey: "cloudflare:flux-1-schnell",
+      prompt: "another",
+    });
+    expect(created.status).toBe(201);
+  });
+
+  it("settles the named pending job and unblocks generation", async () => {
+    const app = await startImageApp();
+    const currentProject = await createProject(app);
+    const otherProject = await createProject(app);
+    seedGeneration(app, { project_id: otherProject, status: "pending", job_id: "job-held", media_id: null });
+    const pendingId = app.supabase.imageGenerations[0].id as string;
+
+    const settled = await api(
+      app,
+      USER_A.token,
+      "POST",
+      `/api/projects/${otherProject}/image-generations/${pendingId}/settle`,
+    );
+    expect(settled.status).toBe(200);
+    expect(settled.body.generation).toMatchObject({
+      status: "failed",
+      errorCode: "IMAGE_GENERATION_ABANDONED",
+    });
+
+    // Settling an already settled job reports its state instead of failing.
+    const again = await api(
+      app,
+      USER_A.token,
+      "POST",
+      `/api/projects/${otherProject}/image-generations/${pendingId}/settle`,
+    );
+    expect(again.status).toBe(200);
+    expect(again.body.generation.status).toBe("failed");
+
+    const created = await api(app, USER_A.token, "POST", `/api/projects/${currentProject}/image-generations`, {
+      modelKey: "cloudflare:flux-1-schnell",
+      prompt: "after settle",
+    });
+    expect(created.status).toBe(201);
+  });
+
+  it("settles a pending job automatically after the abandon deadline", async () => {
+    const app = await startImageApp({}, { ...PROVIDER_ENV, IMAGE_PENDING_ABANDON_AFTER_MS: "60000" });
+    const projectId = await createProject(app);
+    seedGeneration(app, {
+      status: "pending",
+      media_id: null,
+      job_id: "job-abandoned",
+      created_at: new Date(Date.now() - 2 * 60 * 1000).toISOString(),
+    });
+
+    const created = await api(app, USER_A.token, "POST", `/api/projects/${projectId}/image-generations`, {
+      modelKey: "cloudflare:flux-1-schnell",
+      prompt: "after deadline",
+    });
+
+    expect(created.status).toBe(201);
+    expect(app.supabase.imageGenerations[0]).toMatchObject({
+      status: "failed",
+      error_code: "IMAGE_GENERATION_ABANDONED",
+    });
+    expect(app.supabase.imageGenerations).toHaveLength(2);
+  });
+
+  it("sweeps abandoned pending rows on the timer without a request", async () => {
+    const app = await startImageApp({}, {
+      ...PROVIDER_ENV,
+      IMAGE_PENDING_ABANDON_AFTER_MS: "60000",
+      IMAGE_PENDING_SWEEP_INTERVAL_MS: "50",
+    });
+    seedGeneration(app, {
+      status: "pending",
+      media_id: null,
+      created_at: new Date(Date.now() - 2 * 60 * 1000).toISOString(),
+    });
+
+    await eventually(() => app.supabase.imageGenerations[0].status === "failed");
+    expect(app.supabase.imageGenerations[0]).toMatchObject({
+      error_code: "IMAGE_GENERATION_ABANDONED",
+    });
+  });
+
   it("refuses a second generation while the first is still in flight", async () => {
     let releaseGate: () => void = () => undefined;
     const gate = new Promise<void>((resolve) => {
@@ -509,6 +637,37 @@ describe("image generation", () => {
     expect(typeof response.body.usage.resetAt).toBe("string");
     const anonymous = await fetch(`${app.url}/api/image-usage`);
     expect(anonymous.status).toBe(401);
+  });
+
+  it("reports the pending job with the usage ledger and clears an expired one", async () => {
+    const app = await startImageApp();
+    seedGeneration(app, { status: "pending", media_id: null, job_id: "job-usage" });
+    const pendingId = app.supabase.imageGenerations[0].id as string;
+
+    const usage = await api(app, USER_A.token, "GET", "/api/image-usage");
+    expect(usage.status).toBe(200);
+    expect(usage.body.pending).toMatchObject({
+      generationId: pendingId,
+      jobId: "job-usage",
+      provider: "cloudflare",
+    });
+
+    const stale = await startImageApp({}, {
+      ...PROVIDER_ENV,
+      IMAGE_PENDING_ABANDON_AFTER_MS: "60000",
+    });
+    seedGeneration(stale, {
+      status: "pending",
+      media_id: null,
+      created_at: new Date(Date.now() - 2 * 60 * 1000).toISOString(),
+    });
+    const expired = await api(stale, USER_A.token, "GET", "/api/image-usage");
+    expect(expired.status).toBe(200);
+    expect(expired.body.pending).toBeNull();
+    expect(stale.supabase.imageGenerations[0]).toMatchObject({
+      status: "failed",
+      error_code: "IMAGE_GENERATION_ABANDONED",
+    });
   });
 
   it("refuses another account's project", async () => {

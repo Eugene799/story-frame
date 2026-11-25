@@ -53,13 +53,22 @@ export class AiRequestError extends Error {
   readonly code: string;
   readonly status: number;
   readonly upstreamStatus?: number;
+  /** Structured recovery data, such as the job blocking a new generation. */
+  readonly details?: unknown;
 
-  constructor(code: string, message: string, status: number, upstreamStatus?: number) {
+  constructor(
+    code: string,
+    message: string,
+    status: number,
+    upstreamStatus?: number,
+    details?: unknown,
+  ) {
     super(message);
     this.name = "AiRequestError";
     this.code = code;
     this.status = status;
     this.upstreamStatus = upstreamStatus;
+    this.details = details;
   }
 }
 
@@ -95,6 +104,7 @@ async function requestJson<T>(
       parsed?.error?.message ?? `The server returned HTTP ${response.status}.`,
       response.status,
       parsed?.error?.upstreamStatus,
+      parsed?.error?.details,
     );
   }
 
@@ -300,8 +310,8 @@ export async function listImageModels(accessToken: string): Promise<ImageModelVi
   return (await authorizedJson<ImageModelsResponse>("/api/image-models", accessToken)).models;
 }
 
-export async function getImageUsage(accessToken: string): Promise<ImageUsageSummary> {
-  return (await authorizedJson<ImageUsageResponse>("/api/image-usage", accessToken)).usage;
+export async function getImageUsage(accessToken: string): Promise<ImageUsageResponse> {
+  return authorizedJson<ImageUsageResponse>("/api/image-usage", accessToken);
 }
 
 export async function estimateImageGeneration(
@@ -327,6 +337,18 @@ export async function createImageGeneration(
     method: "POST",
     body: input,
   });
+}
+
+export async function settleImageGeneration(
+  accessToken: string,
+  projectId: string,
+  generationId: string,
+): Promise<ImageGenerationResponse> {
+  return authorizedJson<ImageGenerationResponse>(
+    `/api/projects/${projectId}/image-generations/${generationId}/settle`,
+    accessToken,
+    { method: "POST", body: {} },
+  );
 }
 
 export async function refreshImageGeneration(

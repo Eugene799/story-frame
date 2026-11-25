@@ -9,6 +9,8 @@ import type { ProjectScene } from "../shared/project-contract";
 import { GeneratePanel } from "../src/workspace/GeneratePanel";
 
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111";
+const OTHER_PROJECT_ID = "22222222-2222-4222-8222-222222222222";
+const OTHER_GENERATION_ID = "88888888-8888-4888-8888-888888888888";
 const MEDIA_ID = "99999999-9999-4999-8999-999999999999";
 const GENERATION_ID = "77777777-7777-4777-8777-777777777777";
 const REFERENCE_ID = "55555555-5555-4555-8555-555555555555";
@@ -94,10 +96,13 @@ function jsonResponse(payload: unknown, status = 200): Response {
 interface BackendOptions {
   generationStatus?: "succeeded" | "pending";
   generationError?: { code: string; message: string };
+  blockedBy?: { projectId: string; generationId: string; jobId: string };
+  /** Reports the blocking job from the usage call made when the panel opens. */
+  pendingOnOpen?: boolean;
 }
 
 function installBackend(options: BackendOptions = {}) {
-  const { generationStatus = "succeeded", generationError } = options;
+  const { generationStatus = "succeeded", generationError, blockedBy, pendingOnOpen = false } = options;
   const requests: { method: string; path: string; body: any }[] = [];
   let polled = false;
 
@@ -143,6 +148,17 @@ function installBackend(options: BackendOptions = {}) {
             limits: { images: 20, usd: 1 },
             resetAt: null,
           },
+          pending:
+            pendingOnOpen && blockedBy
+              ? {
+                  generationId: blockedBy.generationId,
+                  projectId: blockedBy.projectId,
+                  jobId: blockedBy.jobId,
+                  provider: "leonardo",
+                  modelKey: "leonardo:phoenix-1.0",
+                  createdAt: NOW,
+                }
+              : null,
         });
       }
       if (url.pathname === `/api/projects/${PROJECT_ID}/image-generations/estimate` && method === "POST") {
@@ -162,6 +178,28 @@ function installBackend(options: BackendOptions = {}) {
         });
       }
       if (url.pathname === `/api/projects/${PROJECT_ID}/image-generations` && method === "POST") {
+        if (blockedBy) {
+          return jsonResponse(
+            {
+              ok: false,
+              error: {
+                code: "IMAGE_GENERATION_IN_FLIGHT",
+                message: `A generation is still pending in project ${blockedBy.projectId} (job ${blockedBy.jobId}).`,
+                details: {
+                  pending: {
+                    generationId: blockedBy.generationId,
+                    projectId: blockedBy.projectId,
+                    jobId: blockedBy.jobId,
+                    provider: "leonardo",
+                    modelKey: "leonardo:phoenix-1.0",
+                    createdAt: NOW,
+                  },
+                },
+              },
+            },
+            429,
+          );
+        }
         if (generationError) {
           return jsonResponse({ ok: false, error: generationError }, 502);
         }
@@ -183,6 +221,26 @@ function installBackend(options: BackendOptions = {}) {
           ok: true,
           generation: generationRecord("succeeded", MEDIA_ID),
           media: MEDIA,
+        });
+      }
+      if (
+        blockedBy &&
+        url.pathname ===
+          `/api/projects/${blockedBy.projectId}/image-generations/${blockedBy.generationId}/settle` &&
+        method === "POST"
+      ) {
+        return jsonResponse({
+          ok: true,
+          generation: {
+            ...generationRecord("pending", null),
+            id: blockedBy.generationId,
+            projectId: blockedBy.projectId,
+            provider: "leonardo",
+            modelKey: "leonardo:phoenix-1.0",
+            status: "failed",
+            errorCode: "IMAGE_GENERATION_ABANDONED",
+          },
+          media: null,
         });
       }
       if (url.pathname === `/api/projects/${PROJECT_ID}/media/${MEDIA_ID}/url` && method === "GET") {
@@ -342,6 +400,58 @@ describe("GeneratePanel", () => {
     expect(await screen.findByRole("img", { name: /Generated image: a lighthouse/ })).toBeTruthy();
     expect(backend.polled()).toBe(true);
     expect(screen.queryByRole("button", { name: "Refresh job" })).toBeNull();
+  });
+
+  it("surfaces an existing pending job as soon as the panel opens", async () => {
+    const backend = installBackend({
+      blockedBy: { projectId: OTHER_PROJECT_ID, generationId: OTHER_GENERATION_ID, jobId: "job-other" },
+      pendingOnOpen: true,
+    });
+    renderPanel();
+
+    const alert = await screen.findByRole("alert", { name: "Pending image job" });
+    expect(within(alert).getByText(/project 22222222/)).toBeTruthy();
+    expect(
+      backend.requests.some(
+        (request) => request.method === "POST" && request.path.endsWith("/image-generations"),
+      ),
+    ).toBe(false);
+
+    fireEvent.click(within(alert).getByRole("button", { name: "Settle and unblock" }));
+    expect(
+      await screen.findByText("The pending job was settled; you can generate here now."),
+    ).toBeTruthy();
+  });
+
+  it("names a pending job in another project and settles it to unblock", async () => {
+    const backend = installBackend({
+      blockedBy: { projectId: OTHER_PROJECT_ID, generationId: OTHER_GENERATION_ID, jobId: "job-other" },
+    });
+    renderPanel();
+
+    fireEvent.change(await screen.findByLabelText("Prompt"), { target: { value: "a lighthouse" } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate image" }));
+
+    const alert = await screen.findByRole("alert", { name: "Pending image job" });
+    expect(within(alert).getByText("IMAGE_GENERATION_IN_FLIGHT")).toBeTruthy();
+    expect(within(alert).getByText(/project 22222222/)).toBeTruthy();
+    expect(within(alert).getByText(/job job-othe/)).toBeTruthy();
+    expect(within(alert).getByText(/leonardo · leonardo:phoenix-1\.0/)).toBeTruthy();
+    expect(within(alert).getByRole("button", { name: "Refresh pending job" })).toBeTruthy();
+
+    fireEvent.click(within(alert).getByRole("button", { name: "Settle and unblock" }));
+
+    expect(
+      await screen.findByText("The pending job was settled; you can generate here now."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("alert", { name: "Pending image job" })).toBeNull();
+    expect(
+      backend.requests.find(
+        (request) =>
+          request.path ===
+          `/api/projects/${OTHER_PROJECT_ID}/image-generations/${OTHER_GENERATION_ID}/settle`,
+      )?.method,
+    ).toBe("POST");
   });
 
   it("surfaces a sanitized provider failure without a preview", async () => {

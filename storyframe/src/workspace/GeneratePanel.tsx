@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import type {
   ImageEstimate,
+  ImageGenerationInFlightDetails,
   ImageGenerationRecord,
   ImageModelView,
+  ImagePendingJob,
   ImageUsageSummary,
 } from "../../shared/image-generation-contract";
 import type { MediaPlayback, MediaRecord } from "../../shared/media-contract";
@@ -16,6 +18,7 @@ import {
   getMediaPlaybackUrl,
   listImageModels,
   refreshImageGeneration,
+  settleImageGeneration,
 } from "../api";
 import { formatBytes } from "./model";
 
@@ -61,6 +64,9 @@ export function GeneratePanel({
   const [attaching, setAttaching] = useState(false);
   const [error, setError] = useState<AiRequestError | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [blockedBy, setBlockedBy] = useState<ImagePendingJob | null>(null);
+  const [pendingAction, setPendingAction] = useState(false);
+  const [pendingNotice, setPendingNotice] = useState<string | null>(null);
 
   const selectedModel = models?.find((model) => model.key === modelKey) ?? null;
   const canGenerate =
@@ -74,16 +80,19 @@ export function GeneratePanel({
         .join(". ")
     : "";
 
-  async function refreshUsage(): Promise<void> {
+  async function refreshUsage(includePending = false): Promise<void> {
     try {
-      setUsage(await getImageUsage(await getAccessToken()));
+      const next = await getImageUsage(await getAccessToken());
+      setUsage(next.usage);
+      // On open, the ledger also tells us about a job left pending elsewhere.
+      if (includePending) setBlockedBy(next.pending);
     } catch {
       // The spend line is informational; the guard still enforces the limit.
     }
   }
 
   useEffect(() => {
-    void refreshUsage();
+    void refreshUsage(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -176,6 +185,7 @@ export function GeneratePanel({
     setGeneration(next);
     setMedia(nextMedia);
     setError(null);
+    setBlockedBy(null);
     void refreshUsage();
     if (next.status === "succeeded" && nextMedia) {
       setNotice("Image generated and stored in private media.");
@@ -203,10 +213,64 @@ export function GeneratePanel({
       });
       applyResult(result.generation, result.media);
     } catch (cause) {
-      setError(toRequestError(cause));
+      const requestError = toRequestError(cause);
+      setError(requestError);
+      const details = requestError.details as Partial<ImageGenerationInFlightDetails> | undefined;
+      if (requestError.code === "IMAGE_GENERATION_IN_FLIGHT" && details?.pending) {
+        setBlockedBy(details.pending);
+        setPendingNotice(null);
+      }
     } finally {
       setGenerating(false);
       onBusyChange?.(false);
+    }
+  }
+
+  /** Poll the blocking job through its own project, whichever project that is. */
+  async function refreshBlockingJob(): Promise<void> {
+    if (!blockedBy || pendingAction) return;
+    setPendingAction(true);
+    setPendingNotice(null);
+    try {
+      const result = await refreshImageGeneration(
+        await getAccessToken(),
+        blockedBy.projectId,
+        blockedBy.generationId,
+      );
+      if (result.generation.status === "pending") {
+        setPendingNotice("The job is still running; it will settle automatically after the deadline.");
+      } else {
+        setBlockedBy(null);
+        setPendingNotice(null);
+        setNotice(
+          result.generation.status === "succeeded"
+            ? "The job finished in its own project. You can generate here now."
+            : "The job ended without an image. You can generate here now.",
+        );
+        void refreshUsage();
+      }
+    } catch (cause) {
+      setPendingNotice(toRequestError(cause).message);
+    } finally {
+      setPendingAction(false);
+    }
+  }
+
+  async function settleBlockingJob(): Promise<void> {
+    if (!blockedBy || pendingAction) return;
+    setPendingAction(true);
+    setPendingNotice(null);
+    try {
+      await settleImageGeneration(await getAccessToken(), blockedBy.projectId, blockedBy.generationId);
+      setBlockedBy(null);
+      setError(null);
+      setPendingNotice(null);
+      setNotice("The pending job was settled; you can generate here now.");
+      void refreshUsage();
+    } catch (cause) {
+      setPendingNotice(toRequestError(cause).message);
+    } finally {
+      setPendingAction(false);
     }
   }
 
@@ -398,6 +462,39 @@ export function GeneratePanel({
         </p>
       )}
 
+      {blockedBy && (
+        <div className="alert" role="alert" aria-label="Pending image job">
+          <strong>IMAGE_GENERATION_IN_FLIGHT</strong>
+          <p>
+            A generation is still pending in project {blockedBy.projectId.slice(0, 8)}
+            {blockedBy.jobId ? ` (job ${blockedBy.jobId.slice(0, 8)})` : ""}. It blocks new images for this
+            account until it finishes or expires.
+          </p>
+          <p className="hint">
+            Started {new Date(blockedBy.createdAt).toLocaleString()} · {blockedBy.provider} · {blockedBy.modelKey}
+          </p>
+          <div className="button-row">
+            <button
+              type="button"
+              className="button-secondary button-small"
+              onClick={() => void refreshBlockingJob()}
+              disabled={pendingAction}
+            >
+              {pendingAction ? "Checking..." : "Refresh pending job"}
+            </button>
+            <button
+              type="button"
+              className="button-secondary button-small"
+              onClick={() => void settleBlockingJob()}
+              disabled={pendingAction}
+            >
+              Settle and unblock
+            </button>
+          </div>
+          {pendingNotice && <p className="hint">{pendingNotice}</p>}
+        </div>
+      )}
+
       {generation?.status === "pending" && (
         <div className="generation-pending">
           <p className="notice" role="status">
@@ -481,7 +578,7 @@ export function GeneratePanel({
           {notice}
         </p>
       )}
-      {error && (
+      {error && !blockedBy && (
         <div className="alert" role="alert">
           <strong>{error.code}</strong>
           <p>{error.message}</p>

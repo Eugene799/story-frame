@@ -98,5 +98,7 @@ export interface AiErrorResponse {
     code: string;
     message: string;
     upstreamStatus?: number;
+    /** Structured recovery data for codes that have one, such as a pending job. */
+    details?: unknown;
   };
 }

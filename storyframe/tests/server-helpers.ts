@@ -58,6 +58,7 @@ export async function startTestServer(
       R2_ACCESS_KEY_ID: "test-access-key-id",
       R2_SECRET_ACCESS_KEY: "test-secret-access-key",
       MEDIA_SWEEP_INTERVAL_MS: "0",
+      IMAGE_PENDING_SWEEP_INTERVAL_MS: "0",
       ...serverOptions.env,
     },
   });

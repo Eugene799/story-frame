@@ -107,4 +107,20 @@ export interface ImageUsageSummary {
 export interface ImageUsageResponse {
   ok: true;
   usage: ImageUsageSummary;
+  /** The job that would block a new generation, if one exists right now. */
+  pending: ImagePendingJob | null;
+}
+
+/** The job blocking a new generation, wherever its project lives. */
+export interface ImagePendingJob {
+  generationId: string;
+  projectId: string;
+  jobId: string | null;
+  provider: ImageProviderId;
+  modelKey: string;
+  createdAt: string;
+}
+
+export interface ImageGenerationInFlightDetails {
+  pending: ImagePendingJob;
 }

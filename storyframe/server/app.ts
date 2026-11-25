@@ -44,7 +44,12 @@ import {
 import { ApiError } from "./api-error";
 import type { MediaRecord } from "../shared/media-contract";
 import { buildProjectExport } from "../shared/project-export";
-import type { ImageBillingView, ImageEstimate } from "../shared/image-generation-contract";
+import type {
+  ImageBillingView,
+  ImageEstimate,
+  ImageGenerationRecord,
+  ImagePendingJob,
+} from "../shared/image-generation-contract";
 import {
   IMAGE_MODELS,
   fetchLeonardoGeneration,
@@ -154,12 +159,15 @@ export interface ServerOptions {
 class HttpError extends Error {
   readonly status: number;
   readonly code: string;
+  /** Structured recovery data carried to the client, when a code has one. */
+  readonly details?: unknown;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, details?: unknown) {
     super(message);
     this.name = "HttpError";
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -241,10 +249,20 @@ function buildStatus(config: AppConfig, ledgerReady: boolean, planning: Planning
   };
 }
 
-function failure(code: string, message: string, upstreamStatus?: number): AiErrorResponse {
+function failure(
+  code: string,
+  message: string,
+  upstreamStatus?: number,
+  details?: unknown,
+): AiErrorResponse {
   return {
     ok: false,
-    error: { code, message, ...(upstreamStatus !== undefined ? { upstreamStatus } : {}) },
+    error: {
+      code,
+      message,
+      ...(upstreamStatus !== undefined ? { upstreamStatus } : {}),
+      ...(details !== undefined ? { details } : {}),
+    },
   };
 }
 
@@ -259,7 +277,10 @@ function requireMediaBucket<T>(action: () => Promise<T>): Promise<T> {
 
 function toErrorResponse(error: unknown): { status: number; body: AiErrorResponse } {
   if (error instanceof HttpError) {
-    return { status: error.status, body: failure(error.code, error.message) };
+    return {
+      status: error.status,
+      body: failure(error.code, error.message, undefined, error.details),
+    };
   }
   // Provider errors are already sanitized; route them through the same path.
   if (error instanceof ProviderError) {
@@ -551,6 +572,26 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     return mediaSweep;
   }
 
+  let imageSweep: Promise<void> | null = null;
+
+  /** Settles pending rows whose provider can no longer be waited on. */
+  function runImageSweep(): Promise<void> {
+    const store = imageStore;
+    if (!store) return Promise.resolve();
+    if (imageSweep) return imageSweep;
+    imageSweep = (async () => {
+      try {
+        const cutoff = new Date(now() - config.image.pendingAbandonAfterMs).toISOString();
+        await store.abandonStale(cutoff);
+      } catch {
+        log.error("[image] IMAGE_SWEEP_FAILED");
+      } finally {
+        imageSweep = null;
+      }
+    })();
+    return imageSweep;
+  }
+
   const server = createHttpServer((request, response) => {
     void handleRequest(request, response).catch((error: unknown) => {
       const { status, body } = toErrorResponse(error);
@@ -568,6 +609,16 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     logger: log,
   });
   if (mediaSweeper) server.on("close", () => mediaSweeper.stop());
+
+  // Pending image jobs expire even if no request ever asks about them again.
+  const imageSweeper =
+    config.image.pendingSweepIntervalMs > 0
+      ? setInterval(() => {
+          void runImageSweep();
+        }, config.image.pendingSweepIntervalMs)
+      : null;
+  imageSweeper?.unref?.();
+  if (imageSweeper) server.on("close", () => clearInterval(imageSweeper));
 
   async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const method = request.method ?? "GET";
@@ -856,7 +907,9 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
   async function handleImageUsage(request: IncomingMessage, response: ServerResponse): Promise<void> {
     checkOrigin(request);
     const user = await authenticate(request);
-    const spend = await requireImageStore().usageSince(
+    const store = requireImageStore();
+    const pending = await currentPending(store, user.id);
+    const spend = await store.usageSince(
       user.id,
       new Date(now() - config.image.spendWindowMs).toISOString(),
     );
@@ -879,6 +932,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
             ? new Date(oldest + config.image.spendWindowMs).toISOString()
             : null,
       },
+      pending: pending ? pendingJobView(pending) : null,
     });
   }
 
@@ -1105,11 +1159,13 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     ownerId: string,
     estimate: ImageEstimate,
   ): Promise<void> {
-    if (await store.hasPending(ownerId)) {
+    const pending = await currentPending(store, ownerId);
+    if (pending) {
       throw new HttpError(
         429,
         "IMAGE_GENERATION_IN_FLIGHT",
-        "An image generation is already pending for this account. Refresh or settle it before starting another.",
+        `A generation is still pending in project ${pending.projectId}${pending.jobId ? ` (job ${pending.jobId})` : ""}. Refresh or settle it, or wait for it to expire.`,
+        { pending: pendingJobView(pending) },
       );
     }
 
@@ -1137,6 +1193,41 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         `Image spend for the last 24 hours is $${spend.spentUsd.toFixed(4)} of $${usdLimit.toFixed(2)}; this image would exceed the limit.`,
       );
     }
+  }
+
+  function pendingJobView(pending: ImageGenerationRecord): ImagePendingJob {
+    return {
+      generationId: pending.id,
+      projectId: pending.projectId,
+      jobId: pending.jobId,
+      provider: pending.provider,
+      modelKey: pending.modelKey,
+      createdAt: pending.createdAt,
+    };
+  }
+
+  /**
+   * A pending job blocks the account only until its deadline. An expired job is
+   * settled here so a crashed provider poll cannot lock image generation.
+   */
+  async function currentPending(
+    store: ImageGenerationStore,
+    ownerId: string,
+  ): Promise<ImageGenerationRecord | null> {
+    const pending = await store.findPending(ownerId);
+    if (!pending) return null;
+    const age = now() - Date.parse(pending.createdAt);
+    if (!Number.isFinite(age) || age < config.image.pendingAbandonAfterMs) return pending;
+    const settled = await store.settlePending(
+      ownerId,
+      pending.projectId,
+      pending.id,
+      "IMAGE_GENERATION_ABANDONED",
+    );
+    // The stale row is released; a second legacy pending row still blocks.
+    if (settled) return store.findPending(ownerId);
+    // Another request settled it first; only refuse if a newer pending row exists.
+    return store.findPending(ownerId);
   }
 
   async function runImageGeneration(
@@ -1249,6 +1340,34 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     } catch (error) {
       return fail(error);
     }
+  }
+
+  /** Explicitly releases a pending job the caller no longer wants to wait for. */
+  async function handleImageSettle(
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+    generationId: string,
+  ): Promise<void> {
+    const store = requireImageStore();
+    await requireProjects().get(user.id, projectId);
+    const generation = await store.get(user.id, projectId, generationId);
+    if (!generation) {
+      throw new HttpError(404, "IMAGE_GENERATION_NOT_FOUND", "No generation with that id is in this project.");
+    }
+    if (generation.status !== "pending") {
+      // Already settled: settling again is harmless and reports the real state.
+      sendJson(response, 200, { ok: true, generation, media: null });
+      return;
+    }
+    const settled = await store.settlePending(
+      user.id,
+      projectId,
+      generationId,
+      "IMAGE_GENERATION_ABANDONED",
+    );
+    const final = settled ?? (await store.get(user.id, projectId, generationId)) ?? generation;
+    sendJson(response, 200, { ok: true, generation: final, media: null });
   }
 
   async function handleImageRefresh(
@@ -1567,6 +1686,14 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to refresh a pending generation.");
       }
       await handleImageRefresh(response, user, projectId, segments[2]);
+      return;
+    }
+
+    if (segments.length === 4 && segments[1] === "image-generations" && segments[3] === "settle") {
+      if (method !== "POST") {
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to settle a pending generation.");
+      }
+      await handleImageSettle(response, user, projectId, segments[2]);
       return;
     }
 

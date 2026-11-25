@@ -37,6 +37,8 @@ export interface AppConfig {
     dailyImageLimit: number;
     dailyUsdLimit: number;
     spendWindowMs: number;
+    pendingAbandonAfterMs: number;
+    pendingSweepIntervalMs: number;
   };
   /** One configured model per planning route; see Phase 5 in the README. */
   planning: { routes: ResolvedPlanningRoute[] };
@@ -168,6 +170,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       dailyImageLimit: intEnv(env, "IMAGE_DAILY_IMAGES_PER_USER", 20, 0, 1000),
       dailyUsdLimit: usdEnv(env, "IMAGE_DAILY_USD_PER_USER", 1, 0, 1000),
       spendWindowMs: 24 * 60 * 60 * 1000,
+      // A job whose provider no longer reports back is settled so it cannot
+      // block the account forever.
+      pendingAbandonAfterMs: intEnv(env, "IMAGE_PENDING_ABANDON_AFTER_MS", 15 * 60 * 1000, 60_000, 24 * 60 * 60 * 1000),
+      pendingSweepIntervalMs: intEnv(env, "IMAGE_PENDING_SWEEP_INTERVAL_MS", 60_000, 0, 60 * 60 * 1000),
     },
     planning: { routes: planningRoutes(env) },
   };

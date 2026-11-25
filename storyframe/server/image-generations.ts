@@ -248,8 +248,17 @@ export interface ImageSpendSnapshot {
 
 export interface ImageGenerationStore {
   create(ownerId: string, generation: ImageGenerationCreate): Promise<ImageGenerationRecord>;
-  /** True while any generation for this owner is still pending. */
-  hasPending(ownerId: string): Promise<boolean>;
+  /** The oldest generation still pending for this owner, across projects. */
+  findPending(ownerId: string): Promise<ImageGenerationRecord | null>;
+  /** Settles only a row that is still pending; null means it already settled. */
+  settlePending(
+    ownerId: string,
+    projectId: string,
+    generationId: string,
+    errorCode: string,
+  ): Promise<ImageGenerationRecord | null>;
+  /** Settles every pending row older than the cutoff, across owners. */
+  abandonStale(beforeIso: string): Promise<number>;
   /** Every recorded attempt in the window, whatever its final status, since a
    *  failed attempt may still have been billed by the provider. */
   usageSince(ownerId: string, sinceIso: string): Promise<ImageSpendSnapshot>;
@@ -351,20 +360,64 @@ export function createSupabaseImageGenerationStore(
       return toRecord(created[0]);
     },
 
-    async hasPending(ownerId) {
+    async findPending(ownerId) {
       const found = rows(
         await request(
           tableUrl({
-            select: "id",
+            select: COLUMNS,
             owner_id: `eq.${ownerId}`,
             status: "eq.pending",
+            order: "created_at.asc",
             limit: "1",
           }),
           { headers },
           "the pending generation read",
         ),
       );
-      return found.length > 0;
+      return found.length === 0 ? null : toRecord(found[0]);
+    },
+
+    async settlePending(ownerId, projectId, generationId, errorCode) {
+      const settled = rows(
+        await request(
+          tableUrl({
+            id: `eq.${generationId}`,
+            project_id: `eq.${projectId}`,
+            owner_id: `eq.${ownerId}`,
+            status: "eq.pending",
+          }),
+          {
+            method: "PATCH",
+            headers,
+            body: JSON.stringify({
+              status: "failed",
+              error_code: errorCode,
+              updated_at: new Date().toISOString(),
+            }),
+          },
+          "the pending generation settle",
+        ),
+      );
+      return settled.length === 0 ? null : toRecord(settled[0]);
+    },
+
+    async abandonStale(beforeIso) {
+      const settled = rows(
+        await request(
+          tableUrl({ status: "eq.pending", created_at: `lt.${beforeIso}` }),
+          {
+            method: "PATCH",
+            headers,
+            body: JSON.stringify({
+              status: "failed",
+              error_code: "IMAGE_GENERATION_ABANDONED",
+              updated_at: new Date().toISOString(),
+            }),
+          },
+          "the abandoned generation sweep",
+        ),
+      );
+      return settled.length;
     },
 
     async usageSince(ownerId, sinceIso) {
