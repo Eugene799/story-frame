@@ -361,6 +361,8 @@ describe("video exports", () => {
     const failed = await awaitStatus(app, project.id, accepted.export.id, ["failed", "ready"]);
     expect(failed.export.status).toBe("failed");
     expect(failed.export.failureCode).toBe("VIDEO_PROVIDER_REJECTED");
+    // A confirmed rejection is not billed by the provider.
+    expect(failed.export.creditsConsumed).toBe(0);
 
     await sleep(80);
     const settled = app.supabase.videoUsage.at(-1) as Record<string, unknown>;
@@ -377,6 +379,8 @@ describe("video exports", () => {
     const failed = await awaitStatus(app, project.id, accepted.export.id, ["failed", "ready"]);
     expect(failed.export.status).toBe("failed");
     expect(failed.export.failureCode).toBe("VIDEO_OUTPUT_COPY_FAILED");
+    // The row records what the billed attempt cost, not just the estimate.
+    expect(failed.export.creditsConsumed).toBe(10);
     expect(failed.export.mediaId).toBeNull();
     expect(failed.export.outputKey).toBeNull();
     expect(failed.media).toBeNull();
@@ -434,11 +438,13 @@ describe("video exports", () => {
 
     const listed = await apiRequest(app.url, `/api/projects/${project.id}/exports/video`);
     const body = (await listed.json()) as {
-      exports: { status: string; failureCode: string | null }[];
+      exports: { status: string; failureCode: string | null; creditsConsumed: number | null }[];
       usage: { creditsUsed: number };
     };
     expect(body.exports).toHaveLength(1);
     expect(body.exports[0]).toMatchObject({ status: "failed", failureCode: "VIDEO_PROVIDER_UNAVAILABLE" });
+    // The row and the ledger agree on the ambiguous attempt's cost.
+    expect(body.exports[0].creditsConsumed).toBe(10);
     expect(body.usage.creditsUsed).toBe(10);
   });
 

@@ -1187,6 +1187,9 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
       status: "failed",
       failureCode: code,
       failureMessage: message.slice(0, 500),
+      // The row reports what the attempt cost, so a failed render never reads
+      // as "not settled yet" while the ledger already counts its credits.
+      creditsConsumed: credits,
     });
     if (cursor.job) {
       await deps.store
@@ -1559,11 +1562,14 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
               : definite
                 ? "VIDEO_PROVIDER_REJECTED"
                 : "VIDEO_PROVIDER_UNAVAILABLE";
+          // A confirmed rejection is not billed; an ambiguous one keeps its estimate.
+          const billed = definite ? 0 : creditsEstimate;
           await deps.store.update(ownerId, exportId, {
             status: "failed",
             providerStatus: null,
             failureCode,
             failureMessage: error.message.slice(0, 500),
+            creditsConsumed: billed,
           });
           await deps.store
             .updateJob(ownerId, job.id, {
@@ -1571,8 +1577,7 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
               result: { submission: definite ? "rejected" : "ambiguous", failureCode },
             })
             .catch(() => undefined);
-          // A confirmed rejection is not billed; an ambiguous one keeps its estimate.
-          await settle(ownerId, exportId, "failed", definite ? 0 : creditsEstimate, null);
+          await settle(ownerId, exportId, "failed", billed, null);
           settled = true;
           throw error;
         }
@@ -1592,6 +1597,7 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
             await settle(ownerId, exportId, "failed", 0, null);
             await deps.store.remove(ownerId, projectId, exportId).catch(() => undefined);
           } else {
+            const billed = attempted ? creditsEstimate : 0;
             await deps.store
               .update(ownerId, exportId, {
                 status: "failed",
@@ -1600,10 +1606,11 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
                   ? error.message
                   : "The export could not be submitted."
                 ).slice(0, 500),
+                creditsConsumed: billed,
               })
               .catch(() => undefined);
             // Nothing is billed when the render never reached the provider.
-            await settle(ownerId, exportId, "failed", attempted ? creditsEstimate : 0, null);
+            await settle(ownerId, exportId, "failed", billed, null);
           }
         }
         throw error;

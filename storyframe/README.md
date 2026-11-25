@@ -224,6 +224,14 @@ anon) key; never the service-role key.
 | `DEEPGRAM_API_KEY` | Deepgram Aura-2 text-to-speech key. Read only in the Node process, sent as `Authorization: Token`, and never stored in a narration row or returned to the browser. |
 | `NARRATION_TIMEOUT_MS`, `NARRATION_MAX_AUDIO_BYTES` | Deepgram request timeout and generated-audio size bound (defaults 60000 ms and 25 MiB). Deepgram accepts at most 2,000 characters per Aura-2 request. |
 | `NARRATION_DAILY_CHARS_PER_USER`, `NARRATION_DAILY_USD_PER_USER` | Per-account Deepgram spending guard over a rolling 24 hours. Every preview and generation attempt, including a failed provider call, is recorded before it is billed; the next request is refused with `429 NARRATION_SPEND_LIMIT` when it would exceed either limit (defaults 100,000 characters and $3.00). `0` disables that dimension. |
+| `JSON2VIDEO_API_KEY` | JSON2Video key, sent only as `x-api-key` from the Node process. Without it every export is refused `503 VIDEO_PROVIDER_DISABLED` before a row or a reservation is written. |
+| `VIDEO_RESOLUTION` | Documented provider preset (default `full-hd`, 1920×1080 at 25 fps). `custom` is refused because the project document carries no canvas size. |
+| `VIDEO_TIMEOUT_MS`, `VIDEO_SWEEP_INTERVAL_MS` | Submit/poll timeout (default 30000; 5000–120000) and the sweep cadence, which is the only clock that advances a render (default 60000; 0–600000). `0` disables the timer and leaves an export to the next deploy. |
+| `VIDEO_RENDER_TIMEOUT_MS`, `VIDEO_ABANDON_AFTER_MS` | Provider render deadline (default 20 minutes, never below the provider's own 15-minute timeout) and the age at which a live row is settled `VIDEO_RENDER_ABANDONED` instead of blocking its project (default 45 minutes). |
+| `VIDEO_INPUT_URL_SECONDS` | Presigned input TTL, long enough to outlive queueing plus the render window (default 7200; 1200–604800). |
+| `VIDEO_DOWNLOAD_TIMEOUT_MS`, `VIDEO_MAX_BYTES`, `VIDEO_MAX_SECONDS` | Output download timeout (default 60000), the streamed byte cap (default 256 MiB; 1 MiB–1 GiB), and the timeline bound before a document is refused (default 600 s). |
+| `VIDEO_TIMING_TOLERANCE_SECONDS` | Rounding margin allowed when measured narration is compared with the scene timeline before `409 VIDEO_NARRATION_OVERFLOW` (default 0.5; 0–5). |
+| `VIDEO_DAILY_CREDITS_PER_USER` | Rolling 24-hour per-account credit guard (default 600 credits = ten rendered minutes). `0` disables that dimension. |
 
 `.env` is git-ignored; `.env.example` contains placeholders only. Only public Supabase auth configuration uses a
 `VITE_` name; no secret is prefixed with `VITE_`, returned by the API, logged, or placed in a URL. The Supabase client
@@ -412,6 +420,9 @@ of those policies, so no table can drift from the pattern. Six of them are reach
 | `GET`/`POST /api/projects/:id/jobs` | List provider jobs, or queue one. |
 | `PATCH /api/projects/:id/jobs/:jobId` | Move a job's status and record its result. |
 | `GET`/`POST /api/projects/:id/renders` | List render snapshots, or create one pinned to an existing revision. |
+| `GET`/`POST /api/projects/:id/exports/video` | List exports with the rolling credit window, or start one at the project's saved `projectRevision` (`202`, or `200` when the same `Idempotency-Key` is replayed). |
+| `GET`/`DELETE /api/projects/:id/exports/video/:exportId` | Read one export with its stored media record, or delete the row, its object, and the provider copy. |
+| `GET /api/projects/:id/exports/video/:exportId/url` | Short-lived private playback URL for the stored MP4; `409 VIDEO_RENDER_NOT_READY` until the copy is ours. |
 
 Every child route first resolves the project with the verified owner id, so another account's project id is
 `404 PROJECT_NOT_FOUND` and no child row is read at all. Child writes filter on `owner_id` and `project_id` as well, so
@@ -561,7 +572,8 @@ object keys never reach the browser.
 
 **Preview and export are honest.** Preview is labelled a storyboard preview, not a rendered movie, and shows exactly
 the stored script, visual direction, on-screen text, media count, timing, and approval state. Export offers the
-editable project JSON and the script as plain text; video export is not offered and is documented as Phase 9. Both
+editable project JSON and the script as plain text, and its video export block starts a JSON2Video render of the saved
+revision with its credit estimate and live status (Phase 9). Both
 downloads use the export route, so imported stock media carries its stored creator, provider, source page, and
 license: the JSON includes a deduplicated credit list and the per-scene render payload, and the script ends with a
 `CREDITS` block.
@@ -773,7 +785,9 @@ controlled import with provenance, credited exports, and live acceptance runs fo
 Phase 7 (Cloudflare Workers AI and Leonardo image generation) is implemented with a Generate tab, persisted cost capture,
 and recoverable pending jobs. Phase 8 (Deepgram narration and uploaded audio) is implemented with a Narration tab,
 persisted private audio, script-staleness fingerprints, measured duration warnings, and uploaded narration/music controls.
-Phase 8 is closed; Phase 9 (video export) has not been started.
+Phase 8 is closed. Phase 9 (video export) is implemented offline end to end — contract, adapter, schema, store, routes,
+sweep, and the Preview-tab panel — while its hosted migrations and its one live render are still pending, so the phase is
+not claimed as closed.
 
 ### Phase 6 verification (2026-11-25)
 
@@ -971,6 +985,77 @@ deferred Phase 8 concern is JSON2Video's temporary input access, which is Phase 
 | Bucket CORS | **PASS** | Rule applied and probed (allowed preflight `204`, foreign origin `403`, presigned `GET` header); `verify:r2-live`, `verify:media-live`, and `verify:narration-live` now fail when the bucket does not echo the `cors.json` preview origin |
 | Upload from the UI in a browser | **UNVERIFIED** | There is still no media UI; the flow is API-only until the workspace is built |
 | JSON2Video temporary input access | **DEFERRED** | Phase 9; the presign TTL policy above is the design constraint |
+
+### Phase 9: video export through JSON2Video (2026-11-25) — implemented offline, live render pending
+
+**Provider facts.** JSON2Video exposes `POST`, `GET`, and `DELETE https://api.json2video.com/v2/movies` with an
+`x-api-key` header; a submission answers with a 16-character `project` id, and `GET ?project=…&format=simple` reports
+`status` (`pending`/`running`/`done`/`error`/`timeout`), `url`, `duration`, dimensions, and `consumed_credits`. Billing
+is **1 credit per second of output at every documented resolution**, and no credits-to-dollars rate is published, so every
+number in this phase is credits and seconds; there is no invented USD figure. A failed render is not billed. A finished
+MP4 sits on `assets.json2video.com` for about seven days.
+
+**Why the server copies the file.** JSON2Video can only deliver to an Amazon S3 destination, and this project's bucket is
+Cloudflare R2, so the server downloads the finished MP4 itself and stores it through the existing private-media path. The
+download is `https` only, host `assets.json2video.com` only, redirects refused, bounded by `VIDEO_DOWNLOAD_TIMEOUT_MS`,
+and capped while streaming at `VIDEO_MAX_BYTES` rather than trusting `Content-Length`. The bytes must pass the existing
+magic-byte check as `video/*`, so the row is always a real MP4/WebM/MOV. Our copy is the durable one: playback streams
+from private R2 and the provider copy is deleted best-effort after a successful store.
+
+**Lifecycle.** The row (`render_snapshots`), the job (`provider_jobs`), and the spend reservation (`video_usage`) live in
+Postgres, so a restart resumes a paid render instead of orphaning it. Both tables gained a `kind` discriminator
+(`'video-export'`), and their partial unique indexes carry it, so the generic `/renders` and `/jobs` contracts keep
+working unchanged. A sweep every `VIDEO_SWEEP_INTERVAL_MS` is the only clock: `GET` never calls the provider.
+
+| Provider status | Stored outcome |
+| --- | --- |
+| `pending`, `running` | The export stays `pending` with `provider_status` recorded; the sweep keeps polling. |
+| `done` with a URL | One copy attempt: `ready` with the measured duration, size, and dimensions, or `failed VIDEO_OUTPUT_COPY_FAILED` with the provider URL kept in the job result for the deferred retry. |
+| `error` | `failed VIDEO_PROVIDER_REJECTED`, settled at zero because the provider did not bill the render. |
+| `timeout`, or older than `VIDEO_RENDER_TIMEOUT_MS` | `failed VIDEO_RENDER_TIMEOUT`; the provider copy is deleted best-effort. |
+| Provider `400 Movie … not found` | `failed VIDEO_JOB_NOT_FOUND`; polling stops because retrying cannot succeed. |
+| Live row older than `VIDEO_ABANDON_AFTER_MS` | `failed VIDEO_RENDER_ABANDONED`, so a stuck row cannot block its project forever. |
+
+A submission that the provider rejects (`400`, `401`, `403`, `404`, `409`, `413`) is never retried and costs nothing. A
+`5xx` or unreachable provider is retried at most three times, and if it still fails the export is
+`failed VIDEO_PROVIDER_UNAVAILABLE` and keeps its estimate, because the render may already exist and be billable.
+
+**Credits.** `video_usage` plus the atomic `reserve_video_usage(...)` RPC total the rolling 24-hour window under a
+per-owner advisory lock and insert a pending row **before** the provider call. The estimate is
+`ceil(sum of scene seconds)`, the limit is `VIDEO_DAILY_CREDITS_PER_USER`, and a refusal is `429 VIDEO_BUDGET_EXCEEDED`
+with no provider call and no left-over pending row. Settlement uses `consumed_credits` when the provider reports them and
+`ceil(duration)` otherwise; a confirmed rejection settles zero, while an ambiguous outcome keeps the estimate. A failed
+copy keeps the estimate too, and the export row records that cost in `credits_consumed`, so the Preview tab never says
+"not settled yet" for a render the ledger already counts. Deleting a project nulls `project_id` and keeps the ledger, and
+deleting the account cascades it.
+
+| Route | Method | Behavior |
+| --- | --- | --- |
+| `/api/projects/:id/exports/video` | GET | The project's 50 newest exports plus the rolling credit window used, limit, and reset time. |
+| `/api/projects/:id/exports/video` | POST | Starts a render at the project's saved `projectRevision` (`202`); requires `Idempotency-Key`, and a replay returns the same row (`200`) without a second paid submit. |
+| `/api/projects/:id/exports/video/:exportId` | GET | One export with its stored media record and the refreshed spend window. |
+| `/api/projects/:id/exports/video/:exportId` | DELETE | Removes the row, its stored object, and the provider copy. |
+| `/api/projects/:id/exports/video/:exportId/url` | GET | A short-lived private playback URL for the stored MP4. |
+
+**Preview-tab panel.** Credit usage is shown before the button, the estimate comes from the document's scene seconds, and
+after submitting the panel polls only while the export is pending. It shows the live status, the settled credits, the
+failure code and message, and plays the finished MP4 from private storage. The button is disabled with a readable reason
+when a scene is unapproved, the document has unsaved changes, no scenes exist, or an export is already running. A refusal
+from the server (for example `VIDEO_NARRATION_STALE` for narration made from an earlier script) is shown with its code.
+
+| Criterion | Status | Evidence |
+| --- | --- | --- |
+| Provider contract, movie builder, and credit math | **PASS (offline)** | `tests/json2video.test.ts`: request shape, `x-api-key` never echoed, every documented error class mapped (`400` validation vs bad key, `401` quota, `403` suspended, `404`, `413`, `500` retryable), status parsing, the movie JSON for image/video/text-card scenes, narration overflow refusal, and the estimate |
+| Export lifecycle, single copy, and guard | **PASS (offline, fake provider)** | `tests/video-exports.test.ts` (13 tests): submit → `running` → `done` → byte-identical copy → `ready`; one live export per project; idempotent replay; a failed copy is terminal, keeps `providerUrl`, and records its cost; an ambiguous submit failure records the estimate on both the row and the ledger; provider error and unknown job; unapproved/cross-revision/stale-narration refusals with no provider call; deletion of row, object, and provider copy |
+| Hosted schema | **NOT APPLIED** | `npm run verify:sql` proves both migrations locally (133/133), but a direct read of the hosted project on 2026-11-25 returned HTTP `400` for `render_snapshots.kind` and `404` for `video_usage`, so the hosted project does not have them yet |
+| Live render | **NOT RUN** | `JSON2VIDEO_API_KEY` is present in this workspace, but the routes need the two hosted migrations above. `npm run verify:video-live` prints a SKIP and exits 0 without the key (`1` with `--require-live`); it has not been run against a real render, so no live duration, size, or credit figure is claimed |
+| Preview-tab UI | **PASS (DOM)** | `tests/video-panel.test.tsx`: the credit window and estimate, one `POST` with the saved revision and an idempotency key, the live status, playback of the stored MP4 from a private URL, the failure reason for a failed export, and the disabled-with-reason states for unapproved scenes and unsaved changes |
+| Whole suite | **PASS** | `npm run check` clean, `npm test` 356/356, `npm run verify:sql` 133/133 on 2026-11-25 |
+| Cancel, subtitles, USD price | **NOT PROVIDED** | There is no provider cancel endpoint, no word timings are requested or inferred, and no credits-to-dollars rate is published; the UI states that a started render cannot be cancelled |
+
+**Stated limits.** One provider; the provider's documented preset resolutions at 25 fps; one copy attempt per export
+(retries and the `…/refresh` endpoint are deferred); no renders-per-day cap; the provider copy is deleted best-effort
+after our own copy exists; no cancel; no subtitle or word-timing claim; no USD estimate.
 
 ## Model catalog (verified 2026-11-24)
 
