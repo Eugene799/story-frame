@@ -652,6 +652,19 @@ export async function submitVideoExport(
   });
 }
 
+export async function deleteVideoExport(
+  accessToken: string,
+  projectId: string,
+  exportId: string,
+): Promise<string> {
+  const body = await authorizedJson<{ ok: true; deletedId: string }>(
+    `/api/projects/${projectId}/exports/video/${exportId}`,
+    accessToken,
+    { method: "DELETE" },
+  );
+  return body.deletedId;
+}
+
 /** A short-lived URL for our own stored MP4, never the provider's copy. */
 export async function getVideoExportPlayback(
   accessToken: string,

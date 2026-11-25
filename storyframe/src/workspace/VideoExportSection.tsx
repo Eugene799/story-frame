@@ -3,7 +3,13 @@ import {
   VIDEO_CREDITS_PER_SECOND,
   type VideoExportsResponse,
 } from "../../shared/video-contract";
-import { AiRequestError, getVideoExportPlayback, listVideoExports, submitVideoExport } from "../api";
+import {
+  AiRequestError,
+  deleteVideoExport,
+  getVideoExportPlayback,
+  listVideoExports,
+  submitVideoExport,
+} from "../api";
 import { formatBytes, formatDuration } from "./model";
 
 /** Seconds between status reads while the server is still rendering. */
@@ -57,6 +63,8 @@ export function VideoExportSection({
   const [error, setError] = useState<AiRequestError | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [playback, setPlayback] = useState<{ exportId: string; url: string } | null>(null);
 
   const usage = state?.usage ?? null;
@@ -154,6 +162,7 @@ export function VideoExportSection({
         exports: [result.export, ...(previous?.exports ?? []).filter((row) => row.id !== result.export.id)],
         usage: result.usage,
       }));
+      setConfirmDelete(false);
       setNotice(
         `Export queued for revision ${result.export.projectRevision}: about ${result.export.creditsEstimate} credits. ` +
           "It keeps rendering on the server.",
@@ -164,6 +173,26 @@ export function VideoExportSection({
       await refresh();
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  /** Deletes the newest export and re-reads the list, which owns the card. */
+  async function remove(): Promise<void> {
+    if (!current || deleting) return;
+    setDeleting(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await deleteVideoExport(await getAccessToken(), projectId, current.id);
+      setPlayback(null);
+      setConfirmDelete(false);
+      setNotice("The export and its stored MP4 were deleted. Its credits stay in the window above.");
+      await refresh();
+    } catch (cause) {
+      setError(toRequestError(cause));
+      setConfirmDelete(false);
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -239,7 +268,7 @@ export function VideoExportSection({
           {current.status === "pending" && (
             <p className="hint" role="status">
               JSON2Video is rendering this export ({current.providerStatus ?? "queued"}). It advances on the server even
-              if you leave this tab.
+              if you leave this tab, and a render in progress cannot be cancelled.
             </p>
           )}
 
@@ -256,6 +285,38 @@ export function VideoExportSection({
             ) : (
               <p className="hint">Requesting a private playback link...</p>
             ))}
+
+          <div className="button-row">
+            {!confirmDelete ? (
+              <button
+                type="button"
+                className="button-secondary button-small button-danger"
+                onClick={() => setConfirmDelete(true)}
+                disabled={deleting || current.status === "pending"}
+              >
+                Delete export
+              </button>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  className="button-secondary button-small button-danger"
+                  onClick={() => void remove()}
+                  disabled={deleting}
+                >
+                  {deleting ? "Deleting..." : "Confirm delete export"}
+                </button>
+                <button
+                  type="button"
+                  className="button-secondary button-small"
+                  onClick={() => setConfirmDelete(false)}
+                  disabled={deleting}
+                >
+                  Cancel
+                </button>
+              </>
+            )}
+          </div>
         </div>
       )}
 

@@ -102,6 +102,10 @@ function installBackend(options: BackendOptions = {}) {
         submitted = true;
         return jsonResponse({ ok: true, export: created, media: null, usage: USAGE }, 202);
       }
+      if (url.pathname === `/api/projects/${PROJECT_ID}/exports/video/${EXPORT_ID}` && method === "DELETE") {
+        exports = exports.filter((row) => row.id !== EXPORT_ID);
+        return jsonResponse({ ok: true, deletedId: EXPORT_ID });
+      }
       if (url.pathname === `/api/projects/${PROJECT_ID}/exports/video/${EXPORT_ID}/url`) {
         return jsonResponse({
           ok: true,
@@ -178,6 +182,56 @@ describe("video export panel", () => {
     // Polling is what advanced the row, and it never submitted a second render.
     expect(backend.requests.filter((request) => request.method === "POST")).toHaveLength(1);
     expect(backend.requests.some((request) => request.path.endsWith(`/${EXPORT_ID}/url`))).toBe(true);
+  });
+
+  it("deletes the latest export only after a confirmation and re-reads the list", async () => {
+    const backend = installBackend({
+      initial: [
+        exportRecord({
+          status: "ready",
+          providerStatus: "done",
+          mediaId: MEDIA_ID,
+          creditsConsumed: 6,
+          durationSeconds: 6,
+          byteSize: 2048,
+          width: 1920,
+          height: 1080,
+        }),
+      ],
+    });
+    render(panel());
+
+    expect(await screen.findByRole("heading", { name: "Latest export" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Delete export" }));
+
+    // Confirmation stands between the click and deleting a paid render's row.
+    expect(screen.getByRole("button", { name: "Confirm delete export" })).toBeTruthy();
+    expect(backend.requests.filter((request) => request.method === "DELETE")).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.getByRole("button", { name: "Delete export" })).toBeTruthy();
+    expect(backend.requests.filter((request) => request.method === "DELETE")).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete export" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm delete export" }));
+
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "Latest export" })).toBeNull());
+    expect(backend.requests.filter((request) => request.method === "DELETE")).toHaveLength(1);
+    expect(screen.getByText(/The export and its stored MP4 were deleted/)).toBeTruthy();
+
+    // The card disappears because the list is re-read, not because of local state trimming.
+    const deleteIndex = backend.requests.findIndex((request) => request.method === "DELETE");
+    expect(backend.requests.slice(deleteIndex + 1).some((request) => request.method === "GET")).toBe(true);
+  });
+
+  it("cannot delete a render that is still in progress", async () => {
+    const backend = installBackend({ initial: [exportRecord()] });
+    render(panel());
+
+    expect(await screen.findByRole("heading", { name: "Latest export" })).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Delete export" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/a render in progress cannot be cancelled/)).toBeTruthy();
+    expect(backend.requests.filter((request) => request.method === "DELETE")).toHaveLength(0);
   });
 
   it("shows the failure reason of a failed export and no playback", async () => {

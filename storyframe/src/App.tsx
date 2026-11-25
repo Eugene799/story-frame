@@ -120,8 +120,8 @@ export default function App({ client = supabase, configError = supabaseConfigErr
           <p className="eyebrow">StoryFrame / Phase 4</p>
           <h1>Dashboard, brief, script, and storyboard</h1>
           <p className="lede">
-            Sign in to write a brief and script, arrange the storyboard, attach private media, and preview or export
-            the editable plan. Generation and video rendering remain later phases.
+            Sign in to write a brief and script, arrange the storyboard, attach private media, generate images and
+            narration, and render the video from the Preview tab.
           </p>
           {signedIn && session && (
             <div className="session-bar">

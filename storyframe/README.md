@@ -1043,9 +1043,11 @@ deleting the account cascades it.
 
 **Preview-tab panel.** Credit usage is shown before the button, the estimate comes from the document's scene seconds, and
 after submitting the panel polls only while the export is pending. It shows the live status, the settled credits, the
-failure code and message, and plays the finished MP4 from private storage. The button is disabled with a readable reason
-when a scene is unapproved, the document has unsaved changes, no scenes exist, or an export is already running. A refusal
-from the server (for example `VIDEO_NARRATION_STALE` for narration made from an earlier script) is shown with its code.
+failure code and message, and plays the finished MP4 from private storage. The latest export can be deleted from the card
+after a confirmation step, which re-reads the list; a render still in progress cannot be deleted, because there is no
+provider cancel. The export button is disabled with a readable reason when a scene is unapproved, the document has
+unsaved changes, no scenes exist, or an export is already running. A refusal from the server (for example
+`VIDEO_NARRATION_STALE` for narration made from an earlier script) is shown with its code.
 
 | Criterion | Status | Evidence |
 | --- | --- | --- |
@@ -1053,7 +1055,7 @@ from the server (for example `VIDEO_NARRATION_STALE` for narration made from an 
 | Export lifecycle, single copy, and guard | **PASS (offline, fake provider)** | `tests/video-exports.test.ts` (13 tests): submit → `running` → `done` → byte-identical copy → `ready`; one live export per project; idempotent replay; a failed copy is terminal, keeps `providerUrl`, and records its cost; an ambiguous submit failure records the estimate on both the row and the ledger; provider error and unknown job; unapproved/cross-revision/stale-narration refusals with no provider call; deletion of row, object, and provider copy |
 | Hosted schema | **PASS** | `20261126090000_add_video_render_jobs.sql` and `20261126100000_create_video_usage.sql` applied through the Supabase management API on 2026-11-25; a PostgREST probe then returned `200` for `render_snapshots.kind`, `render_snapshots.media_id`, and `video_usage`, where the same reads returned `400` and `404` before. `verify:sql` reports 133/133 locally |
 | Live render | **PASS** | `npm run verify:video-live` on 2026-11-25 against real JSON2Video, hosted Supabase, and the `story-frame` bucket: **18/18**. A two-scene 6-second movie rendered in about a minute: **6 s**, **34 690 bytes**, **1920×1080**, **6 credits consumed**, stored as a ready `video/mp4` asset and played back byte-for-byte from private R2, with the reservation, the ledger settlement, export deletion, and project cleanup all verified. The first run scored 12/18 and found a real bug: JSON2Video delivered from `json2video-cdn1.s3.amazonaws.com`, not the documented `assets.json2video.com`, so the host guard refused the download; it now accepts the provider's CDN buckets and nothing else, with `tests/video-exports.test.ts` covering both the accepted CDN host and a refused foreign host |
-| Preview-tab UI | **PASS (DOM)** | `tests/video-panel.test.tsx`: the credit window and estimate, one `POST` with the saved revision and an idempotency key, the live status, playback of the stored MP4 from a private URL, the failure reason for a failed export, and the disabled-with-reason states for unapproved scenes and unsaved changes |
+| Preview-tab UI | **PASS (DOM + live browser)** | `tests/video-panel.test.tsx`: the credit window and estimate, one `POST` with the saved revision and an idempotency key, the live status, playback of the stored MP4 from a private URL, the failure reason for a failed export, the disabled-with-reason states for unapproved scenes and unsaved changes, and deleting the latest export only after a confirmation that re-reads the list (a pending render cannot be deleted). A disposable hosted account was also driven through the real Preview tab on 2026-11-25: approve two scenes, submit one 6-second render, watch `PENDING · RUNNING` become `READY · DONE` (6 credits used, 0:06, 28 KiB, 1920×1080), play the stored MP4, then delete the project and account |
 | Whole suite | **PASS** | `npm run check` clean, `npm test` 358/358, `npm run verify:sql` 133/133 on 2026-11-25 |
 | Cancel, subtitles, USD price | **NOT PROVIDED** | There is no provider cancel endpoint, no word timings are requested or inferred, and no credits-to-dollars rate is published; the UI states that a started render cannot be cancelled |
 
