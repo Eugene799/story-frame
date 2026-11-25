@@ -557,6 +557,77 @@ export async function startFakeSupabase(
         }
       }
 
+      if (
+        request.method === "POST" &&
+        url.pathname === "/rest/v1/rpc/reserve_narration_usage"
+      ) {
+        if (
+          request.headers.apikey !== SERVICE_ROLE_KEY ||
+          request.headers.authorization !== `Bearer ${SERVICE_ROLE_KEY}`
+        ) {
+          sendJson(response, 401, { message: "unauthorized" });
+          return;
+        }
+        const body = (await readJson(request)) as Record<string, unknown>;
+        const ownerId = String(body.p_owner_id);
+        const characters = Number(body.p_characters);
+        const costUsd = Number(body.p_cost_usd);
+        const characterLimit = Number(body.p_character_limit);
+        const usdLimit = Number(body.p_usd_limit);
+        const windowSeconds = Number(body.p_window_seconds);
+        const cutoff = Date.now() - Math.max(0, windowSeconds) * 1000;
+        const relevant = narrationUsage.filter(
+          (row) =>
+            row.owner_id === ownerId &&
+            typeof row.created_at === "string" &&
+            Date.parse(row.created_at) >= cutoff,
+        );
+        const usedCharacters = relevant.reduce((sum, row) => sum + Number(row.characters ?? 0), 0);
+        const spentUsd = relevant.reduce((sum, row) => sum + Number(row.cost_usd ?? 0), 0);
+        const oldestAt = relevant
+          .map((row) => String(row.created_at))
+          .sort((left, right) => left.localeCompare(right))[0] ?? null;
+        const allowed =
+          (characterLimit <= 0 || usedCharacters + characters <= characterLimit) &&
+          (usdLimit <= 0 || spentUsd + costUsd <= usdLimit + 1e-9);
+        if (!allowed) {
+          sendJson(response, 200, [
+            {
+              usage_id: null,
+              allowed: false,
+              characters_used: usedCharacters,
+              spent_usd: Number(spentUsd.toFixed(6)),
+              oldest_at: oldestAt,
+            },
+          ]);
+          return;
+        }
+        const now = new Date().toISOString();
+        const row = {
+          id: randomUUID(),
+          owner_id: ownerId,
+          project_id: String(body.p_project_id),
+          kind: String(body.p_kind),
+          status: "pending",
+          characters,
+          cost_usd: Number(costUsd.toFixed(6)),
+          rate_version: String(body.p_rate_version),
+          created_at: now,
+          updated_at: now,
+        };
+        narrationUsage.push(row);
+        sendJson(response, 200, [
+          {
+            usage_id: row.id,
+            allowed: true,
+            characters_used: usedCharacters + characters,
+            spent_usd: Number((spentUsd + costUsd).toFixed(6)),
+            oldest_at: oldestAt ?? now,
+          },
+        ]);
+        return;
+      }
+
       if (url.pathname.startsWith("/rest/v1/")) {
         const table = url.pathname.slice("/rest/v1/".length);
         const data = childTables[table];

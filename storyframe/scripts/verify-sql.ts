@@ -28,6 +28,7 @@ const MIGRATIONS = [
   "20261125220000_one_pending_image_generation.sql",
   "20261125230000_create_narration_tracks.sql",
   "20261125240000_create_narration_usage.sql",
+  "20261125250000_atomic_narration_usage_reservation.sql",
 ];
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "supabase", "migrations");
 
@@ -521,6 +522,34 @@ check("narration_usage: a negative charge is rejected (23514)",
        (owner_id, project_id, kind, characters, cost_usd, rate_version)
      values ($1, $2, 'generation', 10, -0.1, 'rate-v1')`,
     [USER_A, PROJECT_A]))) === "23514");
+
+const deniedReservation = await as<{ allowed: boolean; characters_used: number }>(
+  "service_role",
+  null,
+  `select * from public.reserve_narration_usage($1, $2, 'generation', 64, 0.00192,
+     'deepgram-aura-2-2026-11-25', 100, 3, 86400)`,
+  [USER_A, PROJECT_A],
+);
+check("narration_usage: an atomic reservation refuses over-budget characters without inserting",
+  deniedReservation[0]?.allowed === false && deniedReservation[0]?.characters_used === 82);
+check("narration_usage: a refused reservation did not add a row",
+  (await count("narration_usage", "owner_id = $1", [USER_A])) === 1);
+
+const grantedReservation = await as<{ usage_id: string; allowed: boolean }>(
+  "service_role",
+  null,
+  `select * from public.reserve_narration_usage($1, $2, 'generation', 64, 0.00192,
+     'deepgram-aura-2-2026-11-25', 1000, 3, 86400)`,
+  [USER_A, PROJECT_A],
+);
+check("narration_usage: an allowed reservation inserts a pending row",
+  grantedReservation[0]?.allowed === true &&
+    typeof grantedReservation[0]?.usage_id === "string" &&
+    (await count("narration_usage", "status = 'pending'", [])) === 1);
+check("narration_usage: authenticated execute is refused (42501)",
+  (await errorCode(() => as("authenticated", USER_A,
+    `select * from public.reserve_narration_usage($1, $2, 'preview', 10, 0.0003,
+       'rate-v1', 1000, 3, 86400)`, [USER_A, PROJECT_A]))) === "42501");
 
 check("render_snapshots rejects a revision that does not exist (23503)",
   (await errorCode(() => as("service_role", null,

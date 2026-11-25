@@ -60,7 +60,7 @@ npm run dev
 - API: `http://127.0.0.1:8787`
 - Web: `http://localhost:3000` (Vite proxies `/api` to the API)
 
-Before using the ledger or any project route, apply the ten migrations in order. See
+Before using the ledger or any project route, apply the migrations in order. See
 [Applying the migrations](#applying-the-migrations) for the compatibility check that must pass
 first and the current state of the configured project.
 
@@ -112,6 +112,7 @@ these tables. Apply them in filename order:
 13. `20261125220000_one_pending_image_generation.sql` (Phase 7: one pending image per account)
 14. `20261125230000_create_narration_tracks.sql` (Phase 8: narration/music rows, one active track per kind)
 15. `20261125240000_create_narration_usage.sql` (Phase 8: Deepgram preview/generation spending ledger)
+16. `20261125250000_atomic_narration_usage_reservation.sql` (Phase 8: atomic per-account reservation function)
 
 Run the compatibility check first. It must return no rows:
 
@@ -143,8 +144,8 @@ Afterwards, check the running server rather than assuming the schema is ready:
 3. Set `SMOKE_SUPABASE_ACCESS_TOKEN` to a session token and run `npm run smoke:live` (five
    billable calls, described under Tests).
 
-**All ten migrations are applied to the configured project (`myrohtkfsuppcabedwmn`): the sixth on 2026-11-24, the
-seventh and eighth (Phase 5) on 2026-11-25, and the ninth and tenth (Phase 6) on 2026-11-25.** The Phase 6 catalog was
+**All sixteen migrations through Phase 8 are applied to the configured project (`myrohtkfsuppcabedwmn`): the sixth on
+2026-11-24, the seventh and eighth (Phase 5) on 2026-11-25, and the ninth through sixteenth (Phases 6–8) on 2026-11-25.** The Phase 6 catalog was
 checked directly after applying it: `media_metadata.provenance` and its object constraint exist,
 `media_metadata_ready_stock_import_key` is a partial unique index on the owner, project, provider, asset id, and
 rendition where `status = 'ready'`, and `stock_search_cache` exists with RLS enabled, no `authenticated` grants, and
@@ -897,6 +898,10 @@ window because Deepgram may have processed them. Previews use the same budget as
 refuses a second overlapping request for the account (`429 NARRATION_IN_FLIGHT`). `GET /api/projects/:id/narration`
 returns the window totals, limits, and reset time, which the Narration tab displays.
 
+The check-and-insert is one database transaction: `reserve_narration_usage(...)` takes an advisory lock keyed by the
+owner, totals the rolling window, and only then inserts the pending row. Two server processes cannot both pass the
+same read before either writes. The function is executable only by `service_role`; the browser never calls it.
+
 | Route | Method | Behavior |
 | --- | --- | --- |
 | `/api/narration/voices` | GET | Signed-in Aura-2 voice catalog, 2,000-character bound, verified rate, and whether Deepgram is configured. |
@@ -909,15 +914,15 @@ returns the window totals, limits, and reset time, which the Narration tab displ
 
 | Criterion | Status | Evidence |
 | --- | --- | --- |
-| Real Deepgram response becomes playable persisted narration | **PASS** | `npm run verify:narration-live` on 2026-11-25 against real Deepgram, hosted Supabase, and the `story-frame` R2 bucket: 21/21, including a real voice sample, a persisted measured track, the script fingerprint and voice settings, the verified per-character cost, private playback byte-for-byte, and cleanup |
+| Real Deepgram response becomes playable persisted narration | **PASS** | `npm run verify:narration-live` on 2026-11-25 against real Deepgram, hosted Supabase, and the `story-frame` R2 bucket: 25/25, including a real voice sample, a persisted measured track, the script fingerprint and voice settings, the verified per-character cost, private playback byte-for-byte, and cleanup |
 | Verified endpoint, auth, voice ids, output, billing, and limits | **PASS** | Deepgram docs read 2026-11-25: `/v1/speak`, `Token` auth, Aura-2 model ids, MP3 default, 2,000-character REST bound, $0.030/1k Aura-2 rate, 15 concurrent requests. `tests/deepgram.test.ts` asserts the request shape, `Token` header, audio validation, 2,000-character refusal, derived cost, and sanitized errors |
 | Script fingerprint and staleness | **PASS** | `tests/narration.test.ts`: generation records a 64-character fingerprint and per-scene approval; changing an approved scene makes GET report stale while the track id and provider call count stay unchanged, proving no silent regeneration |
 | Measured duration and explicit mismatch handling | **PASS** | The stored WAV/MP3 duration is parsed from the file; a 1-second track against 20 seconds of scene timing reports `TIMING_MISMATCH`, and the UI states that speech is not sped up or cut. `verify:narration-live` records a real Deepgram duration > 0 |
-| Spending guard and usage record for previews and generations | **PASS** | `tests/narration.test.ts`: preview and generation rows are written before the provider call, previews consume the same rolling budget, a 100-character limit refuses the next generation without another provider call, USD and character limits refuse previews, and a failed call remains a `failed` row that still counts. `verify:narration-live` reads both rows back from hosted `narration_usage` with their settled status, characters, and cost |
-| Uploaded narration, music, volume/mute, replace/remove | **PASS (live R2)** | `verify:narration-live` uploads two real audio files through initiation, presigned `PUT`, completion, and attachment; measures both from R2; exposes narration and music together; plays both back byte-for-byte from private R2; and confirms both active rows in hosted Supabase. `tests/narration.test.ts` also covers volume/mute, replace history, removal, and reference release; `tests/narration-panel.test.tsx` covers the controls |
+| Spending guard and usage record for previews and generations | **PASS** | Reservation is one database transaction under a per-owner advisory lock; `verify:sql` exercises refusals, allowed insertion, and service-role-only execution. `tests/narration.test.ts`: preview and generation rows are reserved before the provider call, previews consume the same rolling budget, a 100-character limit refuses the next generation without another provider call, USD and character limits refuse previews, and a failed call remains a `failed` row that still counts. `verify:narration-live` reads both rows back from hosted `narration_usage`, and its direct reservation call confirms an over-budget attempt is refused without a row |
+| Uploaded narration, music, volume/mute, replace/remove | **PASS (live R2)** | `verify:narration-live` uploads real MP3 narration, MP3 music, and a WAV music file through initiation, presigned `PUT`, completion, and attachment; detects WAV from its bytes, measures from R2; exposes narration and music together; plays each back byte-for-byte from private R2; and confirms both active rows in hosted Supabase. `tests/narration-panel.test.tsx` covers missing/aliased browser MIME types, empty files, the approved-script upload gate, volume/mute, replace, and remove |
 | Approved-script gate | **PASS** | An unapproved project is refused with `409 SCRIPT_NOT_APPROVED`, no provider call, and no track. The Narration tab disables generation and shows the reason |
-| Hosted schema | **PASS** | `20261125230000_create_narration_tracks.sql` and `20261125240000_create_narration_usage.sql` applied through the Supabase management API on 2026-11-25; `verify:sql` reports 108/108, including service-role writes, `42501` for authenticated reads, one active track per kind (`23505`), volume/kind and non-negative charge constraints (`23514`), and project/user cascades |
-| Narration UI | **PASS (DOM)** | `tests/narration-panel.test.tsx`: voice preview, approved-character estimate, Generate, measured duration/cost, rolling spend line, timing warning, stale warning, uploaded narration, mute, and remove; not exercised in a real browser here |
+| Hosted schema | **PASS** | `20261125230000_create_narration_tracks.sql`, `20261125240000_create_narration_usage.sql`, and `20261125250000_atomic_narration_usage_reservation.sql` applied through the Supabase management API on 2026-11-25; `verify:sql` reports 112/112, including service-role writes, `42501` for authenticated reads and function execution, one active track per kind (`23505`), volume/kind and non-negative charge constraints (`23514`), and project/user cascades |
+| Narration UI | **PASS (DOM)** | `tests/narration-panel.test.tsx`: voice preview, approved-character estimate, Generate, measured duration/cost, rolling spend line, timing warning, stale warning, uploaded narration with missing MIME normalization and empty-file refusal, narration upload gated on script approval, mute, and remove; not exercised in a real browser here |
 | Word-level subtitle timings | **NOT PROVIDED** | This phase does not request or infer word timestamps; no estimated word timing is labelled as verified subtitles |
 | Voice cloning | **NOT IN SCOPE** | Only the documented Aura-2 voices are offered |
 

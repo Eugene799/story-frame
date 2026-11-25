@@ -2058,31 +2058,43 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       );
     }
     const store = requireNarrationUsageStore();
-    const since = new Date(now() - config.narration.usageWindowMs).toISOString();
-    const totals = await store.totalsSince(ownerId, since);
     const charactersLimit = config.narration.dailyCharLimit;
-    if (charactersLimit > 0 && totals.characters + characters > charactersLimit) {
-      throw new HttpError(
-        429,
-        "NARRATION_SPEND_LIMIT",
-        `This account has ${totals.characters} narration characters in the last 24 hours; the limit is ${charactersLimit}.`,
-      );
-    }
     const cost = narrationCost(characters);
     const usdLimit = config.narration.dailyUsdLimit;
-    if (usdLimit > 0 && totals.spentUsd + cost > usdLimit + 1e-9) {
+    const reservation = await store.reserve(
+      ownerId,
+      projectId,
+      {
+        kind,
+        characters,
+        costUsd: cost,
+        rateVersion: DEEPGRAM_RATE_VERSION,
+      },
+      {
+        characters: charactersLimit,
+        usd: usdLimit,
+        windowSeconds: Math.floor(config.narration.usageWindowMs / 1000),
+      },
+    );
+    if (!reservation.allowed) {
+      const characterBlocked =
+        charactersLimit > 0 && reservation.charactersUsed + characters > charactersLimit;
       throw new HttpError(
         429,
         "NARRATION_SPEND_LIMIT",
-        `Narration spend for the last 24 hours is $${totals.spentUsd.toFixed(4)} of $${usdLimit.toFixed(2)}; this request would exceed the limit.`,
+        characterBlocked
+          ? `This account has ${reservation.charactersUsed} narration characters in the last 24 hours of ${charactersLimit}; this request needs ${characters} more.`
+          : `Narration spend for the last 24 hours is $${reservation.spentUsd.toFixed(4)} of $${usdLimit.toFixed(2)}; this request would exceed the limit.`,
       );
     }
-    return store.create(ownerId, projectId, {
-      kind,
-      characters,
-      costUsd: cost,
-      rateVersion: DEEPGRAM_RATE_VERSION,
-    });
+    if (!reservation.usageId) {
+      throw new HttpError(
+        503,
+        "NARRATION_USAGE_UNAVAILABLE",
+        "The narration usage ledger did not return the reserved row.",
+      );
+    }
+    return reservation.usageId;
   }
 
   async function settleNarrationUsage(

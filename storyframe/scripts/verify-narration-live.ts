@@ -88,6 +88,28 @@ async function createUser(): Promise<{ id: string; token: string }> {
   return { id, token: session.access_token };
 }
 
+function wavBytes(seconds = 1): Buffer {
+  const sampleRate = 8000;
+  const dataSize = sampleRate * seconds * 2;
+  const bytes = Buffer.alloc(44 + dataSize);
+  bytes.write("RIFF", 0);
+  bytes.writeUInt32LE(36 + dataSize, 4);
+  bytes.write("WAVE", 8);
+  bytes.write("fmt ", 12);
+  bytes.writeUInt32LE(16, 16);
+  bytes.writeUInt16LE(1, 20);
+  bytes.writeUInt16LE(1, 22);
+  bytes.writeUInt32LE(sampleRate, 24);
+  bytes.writeUInt32LE(sampleRate * 2, 28);
+  bytes.writeUInt16LE(2, 32);
+  bytes.writeUInt16LE(16, 34);
+  bytes.write("data", 36);
+  bytes.writeUInt32LE(dataSize, 40);
+  return bytes;
+}
+
+const LIVE_WAV = wavBytes(1);
+
 const scene = {
   id: "s1",
   heading: "Opening",
@@ -297,6 +319,32 @@ async function main(): Promise<number> {
       JSON.stringify(usageRows.map((row) => [row.kind, row.status, row.characters, row.cost_usd])),
     );
 
+    const deniedReservation = await fetch(`${base}/rest/v1/rpc/reserve_narration_usage`, {
+      method: "POST",
+      headers: { ...serviceHeaders, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        p_owner_id: user.id,
+        p_project_id: projectId,
+        p_kind: "generation",
+        p_characters: 1,
+        p_cost_usd: 0.00003,
+        p_rate_version: "deepgram-aura-2-2026-11-25",
+        p_character_limit: 1,
+        p_usd_limit: 0,
+        p_window_seconds: 86400,
+      }),
+    });
+    const deniedBody = (await deniedReservation.json().catch(() => null)) as any;
+    check(
+      "the hosted atomic reservation refuses an over-budget attempt without adding a row",
+      deniedReservation.status === 200 &&
+        Array.isArray(deniedBody) &&
+        deniedBody[0]?.allowed === false &&
+        deniedBody[0]?.usage_id === null &&
+        (await serviceRows(`narration_usage?select=id&project_id=eq.${projectId}`)).length === 2,
+      `status=${deniedReservation.status}`,
+    );
+
     const uploadedNarration = await uploadAudio(user.token, previewBytes, previewType);
     check(
       "a real narration file uploads through the private R2 media path",
@@ -368,6 +416,36 @@ async function main(): Promise<number> {
       `bytes=${musicBytes.length}`,
     );
 
+    const wavMusic = await uploadAudio(user.token, LIVE_WAV, "audio/wav");
+    check(
+      "a WAV music file uploads and is detected from its bytes",
+      wavMusic.status === "ready" &&
+        wavMusic.contentType === "audio/wav" &&
+        wavMusic.byteSize === LIVE_WAV.length,
+      `type=${wavMusic.contentType} bytes=${wavMusic.byteSize}`,
+    );
+    const attachedWav = await api(user.token, "POST", `/api/projects/${projectId}/music`, {
+      mediaId: wavMusic.id,
+    });
+    check(
+      "uploaded WAV music is measured and replaces the prior music track",
+      attachedWav.status === 201 &&
+        attachedWav.body?.track?.source === "upload" &&
+        attachedWav.body?.track?.durationSeconds > 0,
+      `status=${attachedWav.status} duration=${attachedWav.body?.track?.durationSeconds}`,
+    );
+    const wavPlayback = await api(
+      user.token,
+      "GET",
+      `/api/projects/${projectId}/media/${wavMusic.id}/url`,
+    );
+    const wavBytesBack = Buffer.from(await (await fetch(wavPlayback.body?.url)).arrayBuffer());
+    check(
+      "uploaded WAV music plays back byte-for-byte from private R2",
+      wavPlayback.status === 200 && wavBytesBack.equals(LIVE_WAV),
+      `bytes=${wavBytesBack.length}`,
+    );
+
     const activeRows = await serviceRows(
       `narration_tracks?select=kind,status,media_id,duration_seconds&project_id=eq.${projectId}&status=eq.active&order=kind`,
     );
@@ -376,7 +454,7 @@ async function main(): Promise<number> {
       activeRows.length === 2 &&
         activeRows.every((row) => row.status === "active" && row.duration_seconds > 0) &&
         activeRows.some((row) => row.kind === "narration" && row.media_id === uploadedNarration.id) &&
-        activeRows.some((row) => row.kind === "music" && row.media_id === uploadedMusic.id),
+        activeRows.some((row) => row.kind === "music" && row.media_id === wavMusic.id),
       JSON.stringify(activeRows.map((row) => [row.kind, row.status, row.duration_seconds])),
     );
 

@@ -24,6 +24,41 @@ import { formatBytes } from "./model";
 
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 
+const AUDIO_TYPES = new Set([
+  "audio/mpeg",
+  "audio/wav",
+  "audio/ogg",
+  "audio/mp4",
+  "audio/aac",
+]);
+const AUDIO_TYPE_ALIASES: Record<string, string> = {
+  "audio/mp3": "audio/mpeg",
+  "audio/x-mp3": "audio/mpeg",
+  "audio/wave": "audio/wav",
+  "audio/x-wav": "audio/wav",
+  "audio/x-m4a": "audio/mp4",
+  "audio/m4a": "audio/mp4",
+  "audio/x-aac": "audio/aac",
+  "audio/x-ogg": "audio/ogg",
+};
+const AUDIO_EXTENSION_TYPES: Record<string, string> = {
+  mp3: "audio/mpeg",
+  wav: "audio/wav",
+  ogg: "audio/ogg",
+  oga: "audio/ogg",
+  m4a: "audio/mp4",
+  aac: "audio/aac",
+};
+
+/** Browsers can omit or alias the MIME type; the server still checks the bytes. */
+function audioContentType(file: File): string | null {
+  const declared = file.type.trim().toLowerCase().split(";")[0].trim();
+  const normalized = AUDIO_TYPE_ALIASES[declared] ?? declared;
+  if (AUDIO_TYPES.has(normalized)) return normalized;
+  const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
+  return AUDIO_EXTENSION_TYPES[extension] ?? null;
+}
+
 function toRequestError(cause: unknown): AiRequestError {
   if (cause instanceof AiRequestError) return cause;
   return new AiRequestError(
@@ -192,8 +227,19 @@ export function NarrationPanel({ projectId, getAccessToken, onBusyChange }: Narr
     if (!file || uploading) return;
     setError(null);
     setNotice(null);
-    if (!file.type.startsWith("audio/")) {
-      setError(new AiRequestError("INVALID_AUDIO_TYPE", "Choose an audio file for narration or music.", 400));
+    const contentType = audioContentType(file);
+    if (!contentType) {
+      setError(
+        new AiRequestError(
+          "INVALID_AUDIO_TYPE",
+          "Choose an MP3, WAV, OGG, M4A, or AAC audio file for narration or music.",
+          400,
+        ),
+      );
+      return;
+    }
+    if (file.size <= 0) {
+      setError(new AiRequestError("INVALID_AUDIO_TYPE", "The selected audio file is empty.", 400));
       return;
     }
     if (file.size > MAX_AUDIO_BYTES) {
@@ -212,7 +258,7 @@ export function NarrationPanel({ projectId, getAccessToken, onBusyChange }: Narr
       const accessToken = await getAccessToken();
       const initiation = await initiateMediaUpload(accessToken, projectId, {
         kind: "audio",
-        contentType: file.type,
+        contentType,
         byteSize: file.size,
       });
       await uploadMediaObject(initiation.upload, file);
@@ -413,9 +459,13 @@ export function NarrationPanel({ projectId, getAccessToken, onBusyChange }: Narr
                 type="file"
                 accept="audio/*"
                 onChange={(event) => void upload(event.target.files?.[0] ?? null, "narration")}
-                disabled={uploading !== null}
+                disabled={uploading !== null || !script}
               />
-              <span className="hint">MP3, WAV, OGG, M4A, or AAC; up to 25 MiB. Duration is measured after upload.</span>
+              <span className="hint">
+                {script
+                  ? "MP3, WAV, OGG, M4A, or AAC; up to 25 MiB. Duration is measured after upload."
+                  : "Approve every scene before uploading narration."}
+              </span>
             </label>
           </div>
 

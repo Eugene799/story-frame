@@ -294,6 +294,39 @@ describe("NarrationPanel", () => {
     ).toBe(true);
   });
 
+  it("rejects an empty audio file before initiating an upload", async () => {
+    const backend = installBackend();
+    renderPanel();
+
+    const input = await screen.findByLabelText(/Narration audio/);
+    const file = new File([], "voice.mp3", { type: "audio/mpeg" });
+    fireEvent.change(input, { target: { files: [file] } });
+
+    expect(await screen.findByText("The selected audio file is empty.")).toBeTruthy();
+    expect(
+      backend.requests.some(
+        (request) =>
+          request.path === `/api/projects/${PROJECT_ID}/media` && request.method === "POST",
+      ),
+    ).toBe(false);
+  });
+
+  it("normalizes a missing browser MIME type before uploading audio", async () => {
+    const backend = installBackend();
+    renderPanel();
+
+    const input = await screen.findByLabelText(/Narration audio/);
+    const file = new File([new Uint8Array([1, 2, 3])], "voice.mp3", { type: "" });
+    fireEvent.change(input, { target: { files: [file] } });
+
+    expect(await screen.findByText(/Narration saved from the uploaded file/)).toBeTruthy();
+    const initiation = backend.requests.find(
+      (request) =>
+        request.path === `/api/projects/${PROJECT_ID}/media` && request.method === "POST",
+    );
+    expect(initiation?.body).toMatchObject({ kind: "audio", contentType: "audio/mpeg" });
+  });
+
   it("shows the blocked-script message instead of an enabled generate button", async () => {
     vi.stubGlobal(
       "fetch",
@@ -329,5 +362,6 @@ describe("NarrationPanel", () => {
     expect(
       (screen.getByRole("button", { name: "Generate narration" }) as HTMLButtonElement).disabled,
     ).toBe(true);
+    expect((screen.getByLabelText(/Narration audio/) as HTMLInputElement).disabled).toBe(true);
   });
 });
