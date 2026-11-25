@@ -18,6 +18,13 @@ import type {
   PlanningStartRequest,
 } from "../shared/planning-contract";
 import type {
+  StockImportRequest,
+  StockImportResponse,
+  StockProvider,
+  StockSearchResponse,
+  StockType,
+} from "../shared/stock-contract";
+import type {
   ProjectDeletedResponse,
   ProjectDocumentV2,
   ProjectListResponse,
@@ -274,6 +281,37 @@ export async function deleteMediaRecord(
     { method: "DELETE" },
   );
   return body.deletedId;
+}
+
+export interface StockSearchQuery {
+  query: string;
+  type: StockType;
+  sources: StockProvider[];
+  page?: number;
+}
+
+export async function searchStock(
+  accessToken: string,
+  query: StockSearchQuery,
+): Promise<StockSearchResponse> {
+  const params = new URLSearchParams({
+    q: query.query,
+    type: query.type,
+    sources: query.sources.join(","),
+  });
+  if (query.page !== undefined && query.page > 1) params.set("page", String(query.page));
+  return authorizedJson<StockSearchResponse>(`/api/stock/search?${params.toString()}`, accessToken);
+}
+
+export async function importStockAsset(
+  accessToken: string,
+  projectId: string,
+  request: StockImportRequest,
+): Promise<StockImportResponse> {
+  return authorizedJson<StockImportResponse>(`/api/projects/${projectId}/stock/import`, accessToken, {
+    method: "POST",
+    body: request,
+  });
 }
 
 export async function listProjectSources(

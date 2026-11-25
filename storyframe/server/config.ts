@@ -1,5 +1,6 @@
 import { resolveModels, type ResolvedModel } from "./models";
 import { loadMediaLimits, type MediaLimits } from "./media";
+import { loadStockLimits, type StockLimits } from "./stock";
 import { OLLAMA_BASE_URL } from "./ollama";
 import {
   MAX_PLANNING_PROVIDER_CALLS,
@@ -26,6 +27,8 @@ export interface AppConfig {
   models: ResolvedModel[];
   r2: R2Config | null;
   media: MediaLimits;
+  /** Phase 6 provider keys, cache windows, and import bounds. */
+  stock: StockLimits;
   /** One configured model per planning route; see Phase 5 in the README. */
   planning: { routes: ResolvedPlanningRoute[] };
 }
@@ -113,6 +116,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     MAX_PLANNING_PROVIDER_CALLS * providerTimeoutMs + 3 * authTimeoutMs,
   );
 
+  const media = loadMediaLimits(env);
+
   return {
     apiKey: stringEnv(env, "OLLAMA_API_KEY"),
     supabaseUrl: supabaseUrl(env),
@@ -130,7 +135,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     planningAbandonAfterMs,
     models: resolveModels(env),
     r2: r2Config(env),
-    media: loadMediaLimits(env),
+    media,
+    stock: loadStockLimits(env, media),
     planning: { routes: planningRoutes(env) },
   };
 }

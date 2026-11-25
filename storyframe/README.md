@@ -5,7 +5,8 @@ idempotent usage ledger**, and the **project data model** with owner-scoped acce
 storage in Cloudflare R2**. It adds Phase 4: a signed-in **workspace** with a dashboard, brief, script, storyboard,
 media panel, honest preview, and editable project/script export. Phase 5 adds configurable one-model-per-task planning:
 validated JSON proposals for angles, scripts, storyboards, ad concepts, and transcript analysis, kept separate from
-accepted content.
+accepted content. Phase 6 adds protected Pexels and Pixabay stock search with normalized previews, a durable shared
+cache, credited attribution, and server-mediated imports into project media.
 
 The connection-test screen still uses real Supabase email/password sign-in and remains a development harness only.
 Video rendering, billing, discovery, and deployment are **not** started here.
@@ -59,7 +60,7 @@ npm run dev
 - API: `http://127.0.0.1:8787`
 - Web: `http://localhost:3000` (Vite proxies `/api` to the API)
 
-Before using the ledger or any project route, apply the eight migrations in order. See
+Before using the ledger or any project route, apply the nine migrations in order. See
 [Applying the migrations](#applying-the-migrations) for the compatibility check that must pass
 first and the current state of the configured project.
 
@@ -72,6 +73,7 @@ npm run build             # type-check + production frontend build
 npm run smoke:live        # opt-in: five real requests + ledger check (see Tests)
 npm run verify:live-routes # provider-free two-user live route + ledger checks
 npm run verify:media-live # opt-in: two disposable accounts, real upload + playback through the routes
+npm run verify:stock-live # opt-in: real Pexels/Pixabay image and video searches through the adapters
 npm run verify:r2-live    # opt-in: real R2 presign/upload/read/delete check (no bucket is created)
 npm run verify:sql        # apply every migration to in-memory PostgreSQL and assert RLS, triggers, cascades
 npm run audit:media       # read-only bucket-vs-database orphan audit (needs hosted Supabase + R2 values)
@@ -98,6 +100,7 @@ these tables. Apply them in filename order:
 6. `20261124160000_create_media_storage.sql` (Phase 3: upload timestamps, `media_references`)
 7. `20261125120000_create_planning.sql` (Phase 5: source excerpts, claim quotes, proposal route/base version, `model_health`)
 8. `20261125140000_add_planning_attempt_preflight.sql` (Phase 5: `ai_usage.project_id` and one pending attempt per project)
+9. `20261125160000_add_stock_media.sql` (Phase 6: `media_metadata.provenance` and the durable `stock_search_cache` table)
 
 Run the compatibility check first. It must return no rows:
 
@@ -108,7 +111,7 @@ where table_schema = 'public'
   and table_name in (
     'ai_usage', 'projects', 'project_revisions', 'scenes', 'media_metadata',
     'media_references', 'sources', 'claims', 'generation_proposals',
-    'provider_jobs', 'render_snapshots', 'profiles', 'model_health'
+    'provider_jobs', 'render_snapshots', 'profiles', 'model_health', 'stock_search_cache'
   );
 ```
 
@@ -129,8 +132,11 @@ Afterwards, check the running server rather than assuming the schema is ready:
 3. Set `SMOKE_SUPABASE_ACCESS_TOKEN` to a session token and run `npm run smoke:live` (five
    billable calls, described under Tests).
 
-**All eight migrations are applied to the configured project (`myrohtkfsuppcabedwmn`), the sixth on 2026-11-24 and the
-seventh and eighth (Phase 5) on 2026-11-25.** After applying the eighth, a PostgREST probe selecting
+**The first eight migrations are applied to the configured project (`myrohtkfsuppcabedwmn`), the sixth on 2026-11-24 and
+the seventh and eighth (Phase 5) on 2026-11-25. The ninth (Phase 6) is not applied yet.** Apply
+`20261125160000_add_stock_media.sql` before running this code against the hosted project: media reads now select
+`provenance`, and stock search writes `stock_search_cache`. Until then media routes report a store error and stock
+search degrades to uncached provider calls. After applying the eighth, a PostgREST probe selecting
 `ai_usage.project_id` returned `200`, `pg_indexes` reported `ai_usage_one_pending_project_idx` as a partial unique
 index on `(project_id)` where `status = 'pending'`, `GET /api/ai/status` reported `ledger.ready: true`, and
 `verify:live-routes` passed **51/51** checks including the owner-scoped planning-status route. After applying the seventh,
@@ -187,6 +193,11 @@ anon) key; never the service-role key.
 | `MEDIA_UPLOAD_URL_SECONDS`, `MEDIA_DOWNLOAD_URL_SECONDS`, `MEDIA_UPLOAD_TTL_MS` | Presigned URL and upload-window lifetimes. |
 | `MEDIA_DELETED_RETENTION_MS`, `MEDIA_UNREFERENCED_RETENTION_MS` | Retention windows for deleted rows and unreferenced ready assets. |
 | `MEDIA_SWEEP_INTERVAL_MS` | Background sweep cadence and the minimum gap between opportunistic request-triggered passes (default 60000). `0` turns the background timer off. |
+| `PEXELS_API_KEY`, `PIXABAY_API_KEY` | Stock provider keys. Read only in the Node process; a Pixabay key is sent as a query parameter and is redacted from logs and errors. |
+| `STOCK_PROVIDER_TIMEOUT_MS`, `STOCK_PAGE_SIZE`, `STOCK_MAX_PAGE`, `STOCK_QUERY_MAX_CHARS` | Provider timeout and search bounds (defaults 8000 ms, 20 results per provider, page 50, 80 characters). |
+| `STOCK_PEXELS_CACHE_SECONDS`, `STOCK_PIXABAY_CACHE_SECONDS` | Durable page-cache windows (defaults 3600 and 86400). Pixabay is never below 86400, the provider's caching requirement. |
+| `STOCK_CACHE_PAYLOAD_BYTES`, `STOCK_CACHE_LEASE_MS`, `STOCK_CACHE_WAIT_MS` | Maximum cached page size, claim-lease length, and how long a concurrent request waits for the claim holder. |
+| `STOCK_IMPORT_TIMEOUT_MS`, `STOCK_IMPORT_REDIRECTS` | Import download timeout and redirect bound (defaults 30000 ms, 3 hops). |
 
 `.env` is git-ignored; `.env.example` contains placeholders only. Only public Supabase auth configuration uses a
 `VITE_` name; no secret is prefixed with `VITE_`, returned by the API, logged, or placed in a URL. The Supabase client
@@ -533,7 +544,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 215/215; `verify:sql` 81/81; `verify:live-routes` 51/51; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 241/241; `verify:sql` 87/87; `verify:stock-live` 8/8; `verify:live-routes` 51/51; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -674,6 +685,58 @@ so it writes no ledger row and does not consume the key.
 | Pending request identity survives reload | **PASS** | `tests/planning-panel.test.tsx`: a stored `script` route and instruction are restored into the form, and Retry sends the stored Idempotency-Key instead of minting a new one |
 | Attempt history is visible and local | **PASS** | `tests/planning-panel.test.tsx`: a successful attempt appears as `Succeeded`, survives an unmount/remount, and a cancelled attempt is recorded as `stopped`; history is capped and stored in `localStorage`, never in the project |
 
+### Phase 6: stock search (2026-11-25)
+
+`GET /api/stock/search?q=...&type=image|video&sources=pexels,pixabay` requires a verified Supabase session. The
+unprefixed `/stock/search` from the phase contract is accepted as an alias; `/api/stock/search` is canonical because it
+travels through the existing dev proxy and origin check. `sources` may repeat or be comma-separated: duplicates are
+collapsed, and an empty or unknown selection is `400` rather than a silent search of everything.
+
+Both providers are normalized into one result: `provider`, `providerId`, `type`, `title`, `previewUrl`, `renditions`,
+`selectedRendition`, `sourcePage`, `creator`, `attribution`, `license`, the selected rendition's real `width`/`height`,
+`durationSeconds`, and provider status (count, page, `hasMore`, cache hit, remaining rate limit, sanitized error code).
+Video renditions are chosen by both dimensions and aspect ratio: a portrait or square crop of a 16:9 source is never
+selected, a file labelled `video/mp4` but pointing at an `.m3u8`/`.mpd`/`.ts` playlist is excluded, and video previews
+use the thumbnail the provider supplied. Pexels photo results report the original's actual dimensions; Pixabay reports
+preview, web-format, and original dimensions. Pagination is **per provider**: `page=N` is sent to each selected
+provider, then the normalized pages are merged, so `hasMore` is reported per provider.
+
+**Durable shared cache.** Normalized pages are stored in `public.stock_search_cache` (service-role only, keyed by a hash
+of provider, type, page, and normalized query). A search reads the row, and a miss inserts a short lease claim with
+`Prefer: resolution=ignore-duplicates`; exactly one request fetches the provider, while concurrent requests poll for
+that page. A dead claim is taken over after its lease expires, a failed provider call releases it, and expired rows are
+pruned. Pixabay pages live for at least 24 hours, as its terms require; Pexels pages default to one hour. Cached
+payloads are byte-bounded and oversized pages are not stored. If the cache table is unavailable, search still works but
+reports `STOCK_CACHE_*` logs and calls the provider uncached.
+
+**Import.** `POST /api/projects/:id/stock/import` takes the selected result's provider, id, type, rendition, URL, source
+page, creator, attribution, and license. The server proves project ownership, then downloads only from
+`https://images.pexels.com`, `https://videos.pexels.com`, or `https://cdn.pixabay.com`, re-validating every redirect hop,
+refusing credentials, custom ports, non-https URLs, and hosts that resolve to loopback, private, link-local, shared, or
+reserved addresses. The body is capped while streaming (image and video limits from the media settings), a playlist MIME
+type is refused, and magic bytes must match the selected type. Accepted bytes are written to private R2 through a
+server-created presigned URL, the media row becomes `ready`, and the validated provenance is stored as JSONB on the row
+and returned by the media routes. Nothing is attached to a scene unless the UI does it explicitly.
+
+**UI.** The Media tab has a stock search form (query, image/video, per-provider checkboxes) and a separate preview grid.
+Each preview shows the provider, dimensions, selected rendition, creator, source link, and license link, and imports only
+when **Import to project** is pressed. Imported assets appear in Project media with their provenance and can use the
+existing attach/detach/delete flow. Provider failures are listed per provider; one failure does not hide the other's
+results.
+
+### Phase 6 verification (2026-11-25)
+
+| Criterion | Status | Evidence |
+| --- | --- | --- |
+| Protected search with normalized fields | **PASS** | `tests/stock.test.ts`: anonymous `401`; one image search returns Pexels and Pixabay results with provider, id, title, preview, renditions, source page, creator, attribution, license, real dimensions, and duration; a video search reports the selected 1920×1080 rendition |
+| Hardened provider handling | **PASS** | Same file: duplicate/unknown/empty sources `400`; portrait crops are never selected for a 16:9 source; a `video/mp4` link ending in `.m3u8` is excluded; video previews come from provider thumbnails; a provider failure yields a sanitized code and the response never contains the provider key or URL |
+| Durable shared cache and stampedes | **PASS** | Two identical searches make one provider call each, the second reports `cached: true`, and `stock_search_cache` holds two ready rows with a Pixabay TTL of at least 24 hours; two concurrent searches still make one call per provider; a simulated cache outage leaves search working |
+| Controlled import with provenance | **PASS** | Imported image bytes are in R2 under `media/<owner>/<id>`, the row is `ready`, JSONB provenance is stored and returned; video import is detected as `video/mp4`; foreign hosts, internal names, a redirect to another host, `http://`, oversized bodies, `text/html`, and playlists are refused; a foreign project is `404`; a type mismatch is `422` |
+| Previews stay separate from project assets | **PASS (DOM)** | `tests/stock-panel.test.tsx`: searching writes nothing to `/media`, the credit link and license link render with their URLs, the failed provider is reported, and only **Import to project** posts the import body and adds a `ready` asset |
+| Real provider searches | **PASS** | `npm run verify:stock-live` on 2026-11-25: image "rainy city street" merged 40 results (Pexels 20 + Pixabay 20) and video "ocean waves" merged 40, all with credit, source page, selected rendition, and no playlist renditions; 8/8 checks |
+| Import into a hosted project | **NOT RUN** | No R2 credentials were available in this environment. The import path is covered end to end against the fake bucket in `tests/stock.test.ts`, and real bucket mechanics remain covered by `verify:media-live`; a hosted import still needs a run after the migration is applied |
+| Hosted schema | **PENDING** | `20261125160000_add_stock_media.sql` passes `verify:sql` (87/87) but has not been applied to `myrohtkfsuppcabedwmn`; stock search therefore degrades to uncached calls and media routes need the column before that deployment |
+
 ### Phase 3 verification (2026-11-24)
 
 | Criterion | Status | Evidence |
@@ -738,7 +801,7 @@ select-own policy on each, the revision trigger, no `auth.users` trigger, and `/
 including two-user isolation), and `smoke:live` exited 0 with 5/5 model families and an identical
 stored replay. The test users and rows were deleted; the project is empty again.
 
-`npm run verify:sql` applies all eight migrations to a real PostgreSQL engine (PGlite, PostgreSQL compiled to
+`npm run verify:sql` applies all nine migrations to a real PostgreSQL engine (PGlite, PostgreSQL compiled to
 WebAssembly) with Supabase-like `anon`, `authenticated`, and `service_role` roles plus an `auth.uid()` stub, then
 asserts what the server relies on: the revision trigger, owner-only reads on every table, refused browser writes, the
 conditional version update, constraint and foreign-key rejections, and the cascades from both `projects` and
@@ -848,6 +911,19 @@ Coverage includes:
   expired/unreadable sessions. The refresh itself belongs to the Supabase client, and the session tests assert that the
   app does not start a second one.
 
+- Stock search: duplicate, empty, unknown, and malformed source/type/page selections are refused; both provider payloads
+  normalize to one shape with real dimensions, credit, and source page; video rendition choice respects aspect ratio and
+  never selects a playlist URL; provider keys and URLs never appear in a response or an error
+- Stock pagination and partial failure: one provider's `500` still returns the other provider's merged page, a failed
+  page is not cached, and per-provider `hasMore` is reported
+- Stock cache: two identical searches make one provider call, the second is served from the durable `cache_key` row,
+  Pixabay's TTL is at least 24 hours, concurrent claims make one call, and a cache outage leaves search usable
+- Stock import: owner-scoped; https and provider-host only; redirects are re-validated; private, loopback, link-local,
+  shared, and reserved addresses are refused; byte limits and magic-byte type checks apply; playlists are refused; the
+  stored row carries validated JSONB provenance and the object is in the private bucket
+- Stock UI: previews show provider, creator, source, and license, importing is a separate explicit action, a failed
+  provider is reported without hiding the other's results, and an imported asset appears as ready project media
+
 ### Repeatable live smoke check
 
 ```bash
@@ -911,13 +987,20 @@ the document-delete guard and project-deletion object cleanup.
 - Email/password sign-in only; there is no sign-up, password-reset, MFA, OAuth, or account-management UI. The
   Supabase client persists session tokens in browser `localStorage`; production needs an explicit session-storage and
   CSP review. Sign-out is local to this browser and does not revoke the account's other sessions.
-- All eight migrations and RLS policies are applied to the configured Supabase project (Phase 5 on 2026-11-25). The
+- The first eight migrations and RLS policies are applied to the configured Supabase project (Phase 5 on 2026-11-25);
+  Phase 6's ninth migration is written and verified locally but not applied yet, so the hosted project has no
+  `stock_search_cache` and no `media_metadata.provenance` until it is. The
   hosted catalog was checked (11
   tables, RLS, policies, grants, revision trigger), and live profile/project/child routes, two-user isolation, ledger
   readiness, and the planning-status route passed
   51/51 checks after the preflight migration; the disposable users were deleted afterwards. Rerun these checks with
   `npm run verify:live-routes`. `smoke:live` exposed a live-only missing-column
   bug; after the fix a clean five-call run exited 0 with 5/5 families and an identical stored replay.
+- Stock search is user-driven and bounded (20 results per provider per page), but it depends on the provider's own
+  terms: Pixabay's cache window is enforced for pages the server fetched, and provider rate-limit headers are observed
+  with a short local cooldown after an exhausted window. Someone with a valid session can still spend provider quota, and
+  the cache is shared across accounts. Imports are limited to provider-owned https hosts and capped bytes, so this is not
+  a general downloader; there is no per-account import quota beyond the existing media storage limit.
 - Pending reservations are recovered lazily, when a retry with the same key arrives after the applicable abandon window
   or a preflight for the project sees a stale row. There is no background sweeper, so a project nobody retries stays
   `pending` until its next attempt or status check, and the original attempt's outcome is never learned: the row

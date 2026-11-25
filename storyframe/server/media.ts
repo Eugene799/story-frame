@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type {
   MediaKind,
+  MediaProvenance,
   MediaRecord,
   MediaRefKind,
   MediaReferenceRecord,
@@ -296,6 +297,8 @@ export interface MediaStore {
       sceneKey: string | null;
       objectKey: string;
       uploadExpiresAt: string;
+      /** Present for assets imported from a stock provider. */
+      provenance?: MediaProvenance | null;
     },
   ): Promise<MediaRecord>;
   get(ownerId: string, projectId: string, mediaId: string): Promise<StoredMedia | null>;
@@ -335,7 +338,7 @@ export interface MediaStore {
 // object_key stays server-side: it is selected for storage operations but omitted
 // from the public MediaRecord shape.
 const MEDIA_COLUMNS =
-  "id,kind,status,scene_key,content_type,byte_size,object_key,upload_expires_at,ready_at,deleted_at,created_at";
+  "id,kind,status,scene_key,content_type,byte_size,object_key,upload_expires_at,ready_at,deleted_at,created_at,provenance";
 const REFERENCE_COLUMNS = "id,media_id,ref_kind,ref_id,created_at";
 const STORED_OBJECT_COLUMNS = "id,owner_id,project_id,object_key,scene_key";
 
@@ -352,6 +355,23 @@ function rowNullableText(row: Record<string, unknown>, name: string): string | n
   const value = row[name];
   if (value === null || value === undefined) return null;
   return typeof value === "string" ? value : corrupt(name);
+}
+
+/** A missing or malformed provenance is surfaced, never silently dropped. */
+function toProvenance(row: Record<string, unknown>): MediaProvenance | null {
+  const value = row.provenance;
+  if (value === null || value === undefined) return null;
+  if (!isRecord(value)) corrupt("provenance");
+  const provider = value.provider;
+  const type = value.type;
+  if (value.source !== "stock") corrupt("provenance.source");
+  if (provider !== "pexels" && provider !== "pixabay") corrupt("provenance.provider");
+  if (type !== "image" && type !== "video") corrupt("provenance.type");
+  for (const field of ["providerId", "rendition", "renditionUrl", "sourcePage", "creator", "attribution", "license", "downloadedAt"] as const) {
+    if (typeof value[field] !== "string") corrupt(`provenance.${field}`);
+  }
+  if (typeof value.byteSize !== "number" || !Number.isFinite(value.byteSize)) corrupt("provenance.byteSize");
+  return value as unknown as MediaProvenance;
 }
 
 function toMedia(row: Record<string, unknown>, referenceCount: number): MediaRecord {
@@ -373,6 +393,7 @@ function toMedia(row: Record<string, unknown>, referenceCount: number): MediaRec
     deletedAt: rowNullableText(row, "deleted_at"),
     createdAt: rowText(row, "created_at"),
     referenceCount,
+    provenance: toProvenance(row),
   };
 }
 
@@ -554,6 +575,7 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
               byte_size: write.byteSize,
               status: "pending",
               upload_expires_at: write.uploadExpiresAt,
+              provenance: write.provenance ?? null,
             }),
           },
           "the media reservation",

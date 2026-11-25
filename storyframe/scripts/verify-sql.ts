@@ -21,6 +21,7 @@ const MIGRATIONS = [
   "20261124160000_create_media_storage.sql",
   "20261125120000_create_planning.sql",
   "20261125140000_add_planning_attempt_preflight.sql",
+  "20261125160000_add_stock_media.sql",
 ];
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "supabase", "migrations");
 
@@ -346,6 +347,55 @@ check("model_health: an authenticated read is refused (42501)",
 check("model_health: a duplicate model id is rejected (23505)",
   (await errorCode(() => as("service_role", null,
     `insert into public.model_health (model_id) values ('gemma')`))) === "23505");
+
+// 8e. Phase 6: imported stock provenance and the durable shared cache.
+const PROVENANCE = {
+  source: "stock",
+  provider: "pexels",
+  providerId: "101",
+  type: "image",
+  rendition: "original",
+  renditionUrl: "https://images.pexels.com/photos/101/original.jpg",
+  sourcePage: "https://www.pexels.com/photo/101/",
+  creator: "Ada",
+  attribution: "Photo by Ada on Pexels",
+  license: "Pexels License",
+  downloadedAt: "2026-11-25T12:00:00.000Z",
+  byteSize: 512,
+};
+const imported = await as<{ id: string; provider: string | null; credit: string | null }>("service_role", null,
+  `insert into public.media_metadata
+     (project_id, owner_id, kind, object_key, content_type, byte_size, status, provenance)
+   values ($1, $2, 'image', $3, 'image/jpeg', 512, 'ready', $4::jsonb)
+   returning id, provenance->>'provider' as provider, provenance->>'attribution' as credit`,
+  [PROJECT_A, USER_A, `objects/${PROJECT_A}/imported`, JSON.stringify(PROVENANCE)]);
+check("media_metadata: imported provenance round-trips as JSONB",
+  imported[0]?.provider === "pexels" && imported[0]?.credit === "Photo by Ada on Pexels",
+  JSON.stringify(imported));
+check("media_metadata: a non-object provenance is rejected (23514)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.media_metadata (project_id, owner_id, kind, object_key, content_type, byte_size, provenance)
+     values ($1, $2, 'image', $3, 'image/jpeg', 1, '[]'::jsonb)`,
+    [PROJECT_A, USER_A, `objects/${PROJECT_A}/bad-provenance`]))) === "23514");
+
+await as("service_role", null,
+  `insert into public.stock_search_cache
+     (cache_key, provider, query_text, media_type, page, status, payload, payload_bytes, expires_at)
+   values ('cache-1', 'pexels', 'rain', 'image', 1, 'ready', '{"results":[]}'::jsonb, 15, now() + interval '1 hour')`);
+check("stock_search_cache: the service role reads a cached page",
+  (await count("stock_search_cache", "cache_key = 'cache-1'", [])) === 1);
+check("stock_search_cache: authenticated reads are refused (42501)",
+  (await errorCode(() => as("authenticated", USER_A, "select count(*) from public.stock_search_cache"))) === "42501");
+check("stock_search_cache: a duplicate cache key is rejected (23505)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.stock_search_cache
+       (cache_key, provider, query_text, media_type, page, expires_at)
+     values ('cache-1', 'pexels', 'rain', 'image', 1, now() + interval '1 hour')`))) === "23505");
+check("stock_search_cache: an unknown provider is rejected (23514)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.stock_search_cache
+       (cache_key, provider, query_text, media_type, page, expires_at)
+     values ('cache-2', 'getty', 'rain', 'image', 1, now() + interval '1 hour')`))) === "23514");
 
 check("render_snapshots rejects a revision that does not exist (23503)",
   (await errorCode(() => as("service_role", null,

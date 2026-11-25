@@ -6,15 +6,24 @@ import type {
 } from "../../shared/media-contract";
 import type { ProjectScene } from "../../shared/project-contract";
 import {
+  STOCK_PROVIDERS,
+  type StockProvider,
+  type StockResult,
+  type StockSearchResponse,
+  type StockType,
+} from "../../shared/stock-contract";
+import {
   AiRequestError,
   attachMediaReference,
   completeMediaUpload,
   deleteMediaRecord,
   deleteMediaReference,
   getMediaPlaybackUrl,
+  importStockAsset,
   initiateMediaUpload,
   listMediaReferences,
   listProjectMedia,
+  searchStock,
   uploadMediaObject,
 } from "../api";
 import { formatBytes } from "./model";
@@ -155,6 +164,17 @@ export function MediaPanel({
   const [error, setError] = useState<AiRequestError | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  const [stockQuery, setStockQuery] = useState("");
+  const [stockType, setStockType] = useState<StockType>("image");
+  const [stockSources, setStockSources] = useState<Record<StockProvider, boolean>>({
+    pexels: true,
+    pixabay: true,
+  });
+  const [stock, setStock] = useState<StockSearchResponse | null>(null);
+  const [stockError, setStockError] = useState<string | null>(null);
+  const [stockNotice, setStockNotice] = useState<string | null>(null);
+  const [stockSearching, setStockSearching] = useState(false);
+  const [importingId, setImportingId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!scenes.some((scene) => scene.id === sceneId)) {
@@ -262,6 +282,82 @@ export function MediaPanel({
     }
   }
 
+  const selectedSources = STOCK_PROVIDERS.filter((provider) => stockSources[provider]);
+
+  async function handleStockSearch(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const query = stockQuery.trim();
+    if (!query || selectedSources.length === 0 || stockSearching) return;
+
+    setStockSearching(true);
+    setStockError(null);
+    setStockNotice(null);
+    onBusyChange?.(true);
+    try {
+      setStock(
+        await searchStock(await getAccessToken(), { query, type: stockType, sources: selectedSources }),
+      );
+    } catch (cause) {
+      setStockError(toRequestError(cause).message);
+    } finally {
+      setStockSearching(false);
+      onBusyChange?.(false);
+    }
+  }
+
+  async function importResult(result: StockResult) {
+    const rendition =
+      result.renditions.find((entry) => entry.label === result.selectedRendition) ?? result.renditions[0];
+    if (!rendition) return;
+
+    const key = `${result.provider}:${result.providerId}`;
+    setImportingId(key);
+    setStockError(null);
+    setStockNotice(null);
+    onBusyChange?.(true);
+    try {
+      const accessToken = await getAccessToken();
+      const imported = await importStockAsset(accessToken, projectId, {
+        provider: result.provider,
+        providerId: result.providerId,
+        type: result.type,
+        rendition: rendition.label,
+        url: rendition.url,
+        sourcePage: result.sourcePage,
+        creator: result.creator,
+        attribution: result.attribution,
+        license: result.license,
+      });
+      setMedia((current) => [imported.media, ...(current ?? [])]);
+
+      if (sceneId) {
+        await attachMediaReference(accessToken, projectId, imported.media.id, {
+          refKind: "scene",
+          refId: sceneId,
+        });
+        const saved = await onAttachAsset(sceneId, imported.media.id);
+        setMedia((current) =>
+          (current ?? []).map((item) =>
+            item.id === imported.media.id ? { ...item, referenceCount: item.referenceCount + 1 } : item,
+          ),
+        );
+        const scene = scenes.find((candidate) => candidate.id === sceneId);
+        setStockNotice(
+          saved
+            ? `Imported ${result.attribution} and attached it to ${scene ? `\"${scene.heading}\"` : "the selected scene"}.`
+            : `Imported ${result.attribution} and referenced it, but the project save did not complete. Resolve the save error and retry the attach.`,
+        );
+      } else {
+        setStockNotice(`Imported ${result.attribution}. It is in the project, not attached to a scene yet.`);
+      }
+    } catch (cause) {
+      setStockError(toRequestError(cause).message);
+    } finally {
+      setImportingId(null);
+      onBusyChange?.(false);
+    }
+  }
+
   return (
     <section className="panel editor-panel" aria-labelledby="media-heading">
       <div className="panel-heading">
@@ -272,6 +368,143 @@ export function MediaPanel({
         Files upload directly to private storage with a presigned ticket, then the server verifies and records them.
         Playback links are fetched fresh and expire quickly; nothing here is public.
       </p>
+
+      <div className="panel-heading media-heading">
+        <h3>Find stock media</h3>
+        <span className="status status-dev">Pexels + Pixabay</span>
+      </div>
+      <p className="hint">
+        Searches go to the providers you select. Results below are previews with credit; nothing joins the project
+        until you import it, and import downloads the selected rendition through the server.
+      </p>
+
+      <form className="stock-search-form" onSubmit={handleStockSearch}>
+        <label className="field" htmlFor="stock-query">
+          <span className="field-label">Stock search</span>
+          <input
+            id="stock-query"
+            type="search"
+            value={stockQuery}
+            placeholder="e.g. rainy city street"
+            onChange={(event) => setStockQuery(event.target.value)}
+            disabled={stockSearching}
+          />
+        </label>
+
+        <label className="field" htmlFor="stock-type">
+          <span className="field-label">Type</span>
+          <select
+            id="stock-type"
+            value={stockType}
+            onChange={(event) => setStockType(event.target.value as StockType)}
+            disabled={stockSearching}
+          >
+            <option value="image">Images</option>
+            <option value="video">Videos</option>
+          </select>
+        </label>
+
+        <fieldset className="field stock-sources">
+          <legend className="field-label">Sources</legend>
+          {STOCK_PROVIDERS.map((provider) => (
+            <label key={provider} htmlFor={`stock-source-${provider}`}>
+              <input
+                id={`stock-source-${provider}`}
+                type="checkbox"
+                checked={stockSources[provider]}
+                onChange={(event) =>
+                  setStockSources((current) => ({ ...current, [provider]: event.target.checked }))
+                }
+                disabled={stockSearching}
+              />
+              {provider === "pexels" ? "Pexels" : "Pixabay"}
+            </label>
+          ))}
+        </fieldset>
+
+        <div className="editor-actions">
+          <button type="submit" disabled={stockSearching || !stockQuery.trim() || selectedSources.length === 0}>
+            {stockSearching ? "Searching..." : "Search stock"}
+          </button>
+          <p className="hint">
+            Pagination applies to each provider, then pages are merged. One provider can fail without hiding the
+            other&apos;s results.
+          </p>
+        </div>
+      </form>
+
+      {stockError && (
+        <p className="alert" role="alert">
+          {stockError}
+        </p>
+      )}
+      {stockNotice && (
+        <p className="notice" role="status">
+          {stockNotice}
+        </p>
+      )}
+
+      {stock && (
+        <div className="stock-results-block">
+          <div className="panel-heading media-heading">
+            <h3>Previews</h3>
+            <span className="status">{stock.results.length}</span>
+          </div>
+          {stock.providers.some((provider) => !provider.ok) && (
+            <p className="hint">
+              {stock.providers
+                .filter((provider) => !provider.ok)
+                .map((provider) => `${provider.provider} unavailable (${provider.error ?? "unknown"})`)
+                .join(" · ")}
+            </p>
+          )}
+          {stock.results.length === 0 && (
+            <p className="empty-state">No {stock.type === "image" ? "images" : "videos"} matched. Try another query.</p>
+          )}
+          <ul className="stock-results">
+            {stock.results.map((result) => {
+              const key = `${result.provider}:${result.providerId}`;
+              return (
+                <li className="stock-result" key={key}>
+                  <div className="stock-thumb">
+                    <img src={result.previewUrl} alt={result.title} loading="lazy" />
+                    <span className="status">{result.providerName}</span>
+                  </div>
+                  <div className="stock-result-body">
+                    <p className="stock-title">{result.title}</p>
+                    <p className="hint">
+                      {result.type === "image" ? "Image" : "Video"} · {result.width}×{result.height}
+                      {result.durationSeconds !== null ? ` · ${Math.round(result.durationSeconds)}s` : ""} ·{" "}
+                      {result.selectedRendition}
+                    </p>
+                    <p className="stock-credit">
+                      <a href={result.sourcePage} target="_blank" rel="noreferrer noopener">
+                        {result.attribution}
+                      </a>
+                      {" · "}
+                      <a href={result.licenseUrl} target="_blank" rel="noreferrer noopener">
+                        {result.license}
+                      </a>
+                    </p>
+                    <button
+                      type="button"
+                      className="button-secondary button-small"
+                      onClick={() => void importResult(result)}
+                      disabled={importingId !== null}
+                    >
+                      {importingId === key ? "Importing..." : "Import to project"}
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+
+      <div className="panel-heading media-heading">
+        <h3>Upload a file</h3>
+      </div>
 
       <form className="upload-form" onSubmit={handleUpload}>
         <label className="field" htmlFor="media-file">

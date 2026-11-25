@@ -91,12 +91,13 @@ export interface FakeSupabase {
   media: Record<string, unknown>[];
   mediaReferences: Record<string, unknown>[];
   modelHealth: Record<string, unknown>[];
+  stockSearchCache: Record<string, unknown>[];
   close: () => Promise<void>;
 }
 
 export interface FakeSupabaseOptions {
   /** Fail one dependency while leaving the rest of the fake healthy. */
-  failure?: "auth" | "reads" | "complete";
+  failure?: "auth" | "reads" | "complete" | "stockCache";
   /** Fail the first N ledger writes with 500, to exercise completion retries. */
   failWrites?: number;
   /** Make conditional updates match no rows, to exercise a lost takeover race. */
@@ -149,6 +150,7 @@ export async function startFakeSupabase(
   const media: Record<string, unknown>[] = [];
   const mediaReferences: Record<string, unknown>[] = [];
   const modelHealth: Record<string, unknown>[] = [];
+  const stockSearchCache: Record<string, unknown>[] = [];
   const childTables: Record<string, Record<string, unknown>[]> = {
     scenes,
     sources,
@@ -159,6 +161,7 @@ export async function startFakeSupabase(
     media_metadata: media,
     media_references: mediaReferences,
     model_health: modelHealth,
+    stock_search_cache: stockSearchCache,
   };
   let failWritesRemaining = options.failWrites ?? 0;
 
@@ -557,6 +560,11 @@ export async function startFakeSupabase(
             return;
           }
 
+          if (table === "stock_search_cache" && options.failure === "stockCache") {
+            sendJson(response, 500, { message: "simulated stock cache outage" });
+            return;
+          }
+
           const representation = String(request.headers.prefer ?? "").includes("return=representation");
           const reply = (status: number, payload: unknown) => {
             if (representation) sendJson(response, status, payload);
@@ -647,6 +655,24 @@ export async function startFakeSupabase(
                   created.push(existing);
                   continue;
                 }
+              }
+
+              // The durable stock cache is keyed by cache_key and relies on
+              // `Prefer: resolution=ignore-duplicates` for its atomic claim.
+              if (table === "stock_search_cache") {
+                const conflict = data.some((row) => row.cache_key === body.cache_key);
+                if (conflict) {
+                  if (String(request.headers.prefer ?? "").includes("ignore-duplicates")) {
+                    reply(201, []);
+                    return;
+                  }
+                  sendJson(response, 409, { code: "23505", message: "duplicate cache key" });
+                  return;
+                }
+                const row: Record<string, unknown> = { ...body, created_at: now, updated_at: now };
+                data.push(row);
+                created.push(row);
+                continue;
               }
 
               const row: Record<string, unknown> = {
@@ -769,6 +795,7 @@ export async function startFakeSupabase(
     media,
     mediaReferences,
     modelHealth,
+    stockSearchCache,
     close: () =>
       new Promise<void>((resolve, reject) => {
         server.closeAllConnections();

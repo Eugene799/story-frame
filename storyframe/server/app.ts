@@ -85,6 +85,16 @@ import {
   type ProfileStore,
 } from "./profiles";
 import {
+  buildStockProvenance,
+  createStockSearch,
+  createSupabaseStockCache,
+  downloadStockAsset,
+  parseStockImport,
+  parseStockSearchInput,
+  type HostLookup,
+  type StockCacheStore,
+} from "./stock";
+import {
   CHILD_LIMITS,
   createSupabaseChildStore,
   isChildId,
@@ -116,6 +126,8 @@ export interface ServerOptions {
   fetchImpl?: typeof fetch;
   now?: () => number;
   logger?: { error(message: string): void };
+  /** DNS resolver for stock import checks; tests inject a deterministic one. */
+  hostLookup?: HostLookup;
 }
 
 class HttpError extends Error {
@@ -454,6 +466,23 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       : null;
 
   const mediaObjects: R2Client | null = config.r2 ? createR2Client(config.r2, { fetchImpl, now }) : null;
+
+  const stockCache: StockCacheStore | null =
+    config.supabaseUrl && config.supabaseServiceRoleKey
+      ? createSupabaseStockCache({
+          url: config.supabaseUrl,
+          serviceRoleKey: config.supabaseServiceRoleKey,
+          timeoutMs: config.authTimeoutMs,
+        })
+      : null;
+  const searchStock = createStockSearch({
+    limits: config.stock,
+    cache: stockCache,
+    fetchImpl,
+    now,
+    logger: log,
+  });
+
   let lastMediaSweep = 0;
   let mediaSweep: Promise<void> | null = null;
 
@@ -507,7 +536,8 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
 
   async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const method = request.method ?? "GET";
-    const path = new URL(request.url ?? "/", "http://localhost").pathname;
+    const requestUrl = new URL(request.url ?? "/", "http://localhost");
+    const path = requestUrl.pathname;
 
     if (path === "/api/ai/status") {
       if (method !== "GET") throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for this endpoint.");
@@ -530,6 +560,13 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
 
     if (path === "/api/profile") {
       await handleProfile(request, response);
+      return;
+    }
+
+    // Phase 6 canonical route; the contract's unprefixed path is accepted too.
+    if (path === "/api/stock/search" || path === "/stock/search") {
+      if (method !== "GET") throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for stock search.");
+      await handleStockSearch(request, response, requestUrl);
       return;
     }
 
@@ -706,6 +743,104 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     sendJson(response, 200, body);
   }
 
+  async function handleStockSearch(
+    request: IncomingMessage,
+    response: ServerResponse,
+    requestUrl: URL,
+  ): Promise<void> {
+    checkOrigin(request);
+    await authenticate(request);
+    const input = parseStockSearchInput(requestUrl.searchParams, config.stock);
+    if (!stockCache) log.error("[stock] STOCK_CACHE_NOT_CONFIGURED");
+    sendJson(response, 200, await searchStock(input));
+  }
+
+  async function handleStockImport(
+    request: IncomingMessage,
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+  ): Promise<void> {
+    const store = requireMediaStore();
+    const objects = requireMediaObjects();
+    // Ownership is proven before a byte is downloaded for this project.
+    await requireProjects().get(user.id, projectId);
+
+    const write = parseStockImport(await readJsonBody(request, config.media.bodyBytes));
+    const bytes = await downloadStockAsset(
+      { provider: write.provider, type: write.type, url: write.url },
+      { limits: config.stock, fetchImpl, hostLookup: options.hostLookup },
+    );
+    if (bytes.length === 0) {
+      throw new HttpError(422, "STOCK_IMPORT_EMPTY", "The downloaded asset was empty.");
+    }
+    const detected = detectMediaType(bytes);
+    if (!detected || !mediaTypeMatches(write.type, detected)) {
+      throw new HttpError(
+        422,
+        "STOCK_IMPORT_TYPE_MISMATCH",
+        "The downloaded file is not a supported image or video of the selected type.",
+      );
+    }
+
+    const used = await store.usedBytes(user.id);
+    if (used + bytes.length > config.media.ownerStorageBytes) {
+      throw new HttpError(
+        413,
+        "MEDIA_STORAGE_LIMIT",
+        `This account's media storage limit is ${config.media.ownerStorageBytes} bytes.`,
+      );
+    }
+
+    const provenance = buildStockProvenance(write, bytes.length, new Date(now()).toISOString());
+    const mediaId = newMediaId();
+    const objectKey = mediaObjectKey(user.id, mediaId);
+    const upload = objects.presignPut(objectKey, config.media.uploadUrlSeconds);
+    const uploadExpiresAt = new Date(
+      now() + Math.min(config.media.uploadTtlMs, config.media.uploadUrlSeconds * 1000),
+    ).toISOString();
+
+    await store.createPending(user.id, projectId, {
+      id: mediaId,
+      kind: write.type,
+      contentType: detected.contentType,
+      byteSize: bytes.length,
+      sceneKey: null,
+      objectKey,
+      uploadExpiresAt,
+      provenance,
+    });
+
+    try {
+      // The server, not the browser, moves the validated bytes into private
+      // storage through a presigned URL it just created itself.
+      const put = await (fetchImpl ?? fetch)(upload.url, {
+        method: "PUT",
+        headers: { "Content-Type": detected.contentType },
+        body: new Uint8Array(bytes),
+        signal: AbortSignal.timeout(config.stock.importTimeoutMs),
+      });
+      if (!put.ok) {
+        throw new HttpError(502, "MEDIA_STORAGE_UNAVAILABLE", "The private media bucket rejected the imported asset.");
+      }
+      const head = await requireMediaBucket(() => objects.head(objectKey));
+      if (head === null) {
+        throw new HttpError(502, "MEDIA_STORAGE_UNAVAILABLE", "The imported asset was not found in the bucket.");
+      }
+      const media = await store.markReady(user.id, projectId, mediaId, {
+        contentType: detected.contentType,
+        byteSize: head.byteSize,
+      });
+      if (!media) {
+        throw new HttpError(409, "MEDIA_STATE_CHANGED", "The imported asset changed while it was being stored.");
+      }
+      sendJson(response, 201, { ok: true, media, provenance });
+    } catch (error) {
+      await discardMedia(store, objects, user.id, projectId, mediaId, objectKey);
+      throw error;
+    }
+  }
+
   async function handleProfile(request: IncomingMessage, response: ServerResponse): Promise<void> {
     checkOrigin(request);
     const user = await authenticate(request);
@@ -789,6 +924,14 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to generate a planning proposal.");
       }
       await handlePlanning(request, response, user, projectId);
+      return;
+    }
+
+    if (segments.length === 3 && segments[1] === "stock" && segments[2] === "import") {
+      if (method !== "POST") {
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to import a stock asset.");
+      }
+      await handleStockImport(request, response, user, projectId);
       return;
     }
 

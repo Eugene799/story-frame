@@ -185,6 +185,7 @@ function installBackend(backend: FakeBackend) {
           deletedAt: null,
           createdAt: NOW,
           referenceCount: 0,
+          provenance: null,
         };
         backend.media.set(projectId, [record, ...media]);
         return jsonResponse(
