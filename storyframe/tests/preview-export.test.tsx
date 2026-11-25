@@ -113,6 +113,8 @@ function renderPanel() {
       title="Rain"
       projectDocument={DOCUMENT}
       projectId="project-1"
+      projectVersion={1}
+      dirty={false}
       getAccessToken={async () => "token"}
     />,
   );

@@ -19,6 +19,11 @@ import type {
 } from "../shared/planning-contract";
 import type { ProjectExportPayload } from "../shared/project-export";
 import type {
+  VideoExportResponse,
+  VideoExportUrlResponse,
+  VideoExportsResponse,
+} from "../shared/video-contract";
+import type {
   StockImportRequest,
   StockImportResponse,
   StockProvider,
@@ -624,6 +629,39 @@ export async function rejectPlanningProposal(
       { method: "PATCH", body: { status: "rejected" } },
     )
   ).proposal;
+}
+
+export async function listVideoExports(
+  accessToken: string,
+  projectId: string,
+): Promise<VideoExportsResponse> {
+  return authorizedJson<VideoExportsResponse>(`/api/projects/${projectId}/exports/video`, accessToken);
+}
+
+/** The key makes a double click or a retried submit return the same paid export. */
+export async function submitVideoExport(
+  accessToken: string,
+  projectId: string,
+  projectRevision: number,
+  idempotencyKey: string,
+): Promise<VideoExportResponse> {
+  return authorizedJson<VideoExportResponse>(`/api/projects/${projectId}/exports/video`, accessToken, {
+    method: "POST",
+    body: { projectRevision },
+    headers: { "Idempotency-Key": idempotencyKey },
+  });
+}
+
+/** A short-lived URL for our own stored MP4, never the provider's copy. */
+export async function getVideoExportPlayback(
+  accessToken: string,
+  projectId: string,
+  exportId: string,
+): Promise<VideoExportUrlResponse> {
+  return authorizedJson<VideoExportUrlResponse>(
+    `/api/projects/${projectId}/exports/video/${exportId}/url`,
+    accessToken,
+  );
 }
 
 export interface AiTestOutcome {

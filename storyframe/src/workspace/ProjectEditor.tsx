@@ -322,6 +322,8 @@ export function ProjectEditor({
             title={title}
             projectDocument={draft}
             projectId={saved.id}
+            projectVersion={saved.version}
+            dirty={dirty}
             getAccessToken={getAccessToken}
           />
         )}

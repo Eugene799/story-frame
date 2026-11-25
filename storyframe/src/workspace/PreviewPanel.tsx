@@ -4,12 +4,17 @@ import type { ProjectDocumentV2 } from "../../shared/project-contract";
 import { buildScriptText } from "../../shared/project-export";
 import { AiRequestError, exportProject } from "../api";
 import { formatDuration, totalDurationSeconds } from "./model";
+import { VideoExportSection } from "./VideoExportSection";
 
 interface PreviewPanelProps {
   title: string;
   projectDocument: ProjectDocumentV2;
   projectId: string;
+  /** The saved revision a render must match. */
+  projectVersion: number;
+  dirty: boolean;
   getAccessToken: () => Promise<string>;
+  pollIntervalMs?: number;
 }
 
 function downloadFile(name: string, content: string, type: string): void {
@@ -32,9 +37,20 @@ function slugFor(title: string): string {
     .slice(0, 60) || "storyframe-project";
 }
 
-export function PreviewPanel({ title, projectDocument, projectId, getAccessToken }: PreviewPanelProps) {
+export function PreviewPanel({
+  title,
+  projectDocument,
+  projectId,
+  projectVersion,
+  dirty,
+  getAccessToken,
+  pollIntervalMs,
+}: PreviewPanelProps) {
   const scenes = projectDocument.scenes;
   const total = totalDurationSeconds(scenes);
+  const unapprovedScenes = scenes.filter(
+    (scene) => !(scene.approved && scene.approvedFingerprint === sceneFingerprint(scene)),
+  ).length;
   const [exporting, setExporting] = useState<"json" | "script" | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
 
@@ -87,7 +103,7 @@ export function PreviewPanel({ title, projectDocument, projectId, getAccessToken
         <strong>This is a storyboard preview, not a rendered movie.</strong>
         <p>
           It shows exactly the editable script, visual direction, on-screen text, media count, and timing stored in
-          this project. No video is generated in Phase 4.
+          this project. The video export below renders the saved revision; this list never leaves the browser.
         </p>
       </div>
 
@@ -129,8 +145,7 @@ export function PreviewPanel({ title, projectDocument, projectId, getAccessToken
       <div className="export-block">
         <h3>Export</h3>
         <p className="muted">
-          Export the editable project as JSON or the script as plain text. Video export is not available in Phase 4;
-          rendering belongs to Phase 9.
+          Export the editable project as JSON or the script as plain text. Both downloads are local and free.
         </p>
         <div className="button-row">
           <button type="button" onClick={() => void exportJson()} disabled={scenes.length === 0 || exporting !== null}>
@@ -152,6 +167,17 @@ export function PreviewPanel({ title, projectDocument, projectId, getAccessToken
           a credits block.
         </p>
       </div>
+
+      <VideoExportSection
+        projectId={projectId}
+        projectVersion={projectVersion}
+        dirty={dirty}
+        sceneCount={scenes.length}
+        unapprovedScenes={unapprovedScenes}
+        estimateSeconds={total}
+        getAccessToken={getAccessToken}
+        pollIntervalMs={pollIntervalMs}
+      />
     </section>
   );
 }
