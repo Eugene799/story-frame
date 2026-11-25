@@ -316,6 +316,31 @@ async function main(): Promise<number> {
             stored?.provenance?.providerId === result.providerId && stored?.status === "ready",
           );
 
+          const draft = {
+            ...document,
+            scenes: [{ ...document.scenes[0], assetIds: [importedMediaId] }],
+          };
+          const exported = await api(user.token, "POST", `/api/projects/${projectId}/export`, {
+            title: "Live export check",
+            document: draft,
+          });
+          const credit = exported.body?.export?.credits?.[0];
+          const sceneAsset = exported.body?.export?.renderPayload?.scenes?.[0]?.assets?.[0];
+          check(
+            "the export carries the stored stock credit and render payload",
+            exported.status === 200 &&
+              exported.body?.export?.credits?.length === 1 &&
+              credit?.mediaId === importedMediaId &&
+              credit?.creator === result.creator &&
+              credit?.provider === result.provider &&
+              credit?.sourcePage === result.sourcePage &&
+              credit?.license === result.license &&
+              credit?.sceneIds?.length === 1 &&
+              credit.sceneIds[0] === draft.scenes[0].id &&
+              sceneAsset?.mediaId === importedMediaId,
+            `status=${exported.status} code=${exported.body?.error?.code ?? "none"}`,
+          );
+
           const playback = await api(user.token, "GET", `/api/projects/${projectId}/media/${importedMediaId}/url`);
           check(
             "imported media has a private playback URL",
