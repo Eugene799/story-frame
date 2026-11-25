@@ -26,6 +26,16 @@ import type {
   StockType,
 } from "../shared/stock-contract";
 import type {
+  ImageEstimate,
+  ImageEstimateResponse,
+  ImageGenerationInput,
+  ImageGenerationListResponse,
+  ImageGenerationRecord,
+  ImageGenerationResponse,
+  ImageModelView,
+  ImageModelsResponse,
+} from "../shared/image-generation-contract";
+import type {
   ProjectDeletedResponse,
   ProjectDocumentV2,
   ProjectListResponse,
@@ -282,6 +292,59 @@ export async function deleteMediaRecord(
     { method: "DELETE" },
   );
   return body.deletedId;
+}
+
+export async function listImageModels(accessToken: string): Promise<ImageModelView[]> {
+  return (await authorizedJson<ImageModelsResponse>("/api/image-models", accessToken)).models;
+}
+
+export async function estimateImageGeneration(
+  accessToken: string,
+  projectId: string,
+  input: ImageGenerationInput,
+): Promise<ImageEstimate> {
+  return (
+    await authorizedJson<ImageEstimateResponse>(
+      `/api/projects/${projectId}/image-generations/estimate`,
+      accessToken,
+      { method: "POST", body: input },
+    )
+  ).estimate;
+}
+
+export async function createImageGeneration(
+  accessToken: string,
+  projectId: string,
+  input: ImageGenerationInput,
+): Promise<ImageGenerationResponse> {
+  return authorizedJson<ImageGenerationResponse>(`/api/projects/${projectId}/image-generations`, accessToken, {
+    method: "POST",
+    body: input,
+  });
+}
+
+export async function refreshImageGeneration(
+  accessToken: string,
+  projectId: string,
+  generationId: string,
+): Promise<ImageGenerationResponse> {
+  return authorizedJson<ImageGenerationResponse>(
+    `/api/projects/${projectId}/image-generations/${generationId}/refresh`,
+    accessToken,
+    { method: "POST", body: {} },
+  );
+}
+
+export async function listImageGenerations(
+  accessToken: string,
+  projectId: string,
+): Promise<ImageGenerationRecord[]> {
+  return (
+    await authorizedJson<ImageGenerationListResponse>(
+      `/api/projects/${projectId}/image-generations`,
+      accessToken,
+    )
+  ).generations;
 }
 
 export interface StockSearchQuery {

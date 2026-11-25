@@ -784,6 +784,12 @@ the provider is not configured the route refuses with `503 IMAGE_PROVIDER_DISABL
 | `/api/projects/:id/image-generations/:generationId/refresh` | POST | Polls the stored Leonardo job id; `202` while pending, then stores the image and settles the row. |
 | `/api/projects/:id/image-generations` | GET | Most recent 50 generations for the project. |
 
+The **Generate** workspace tab drives that flow. A model picker shows each model's dimensions, steps, and prompt
+limit, marks a provider without credentials as disabled, and a prompt produces the server's verified cost estimate
+(neurons and USD, or API credit with no invented rate). **Generate image** is explicit and calls only the selected
+provider; a queued job shows **Refresh job** until it settles. The ready asset is previewed through a short-lived
+private playback URL, and **Attach image to scene** writes the scene reference and saves the project in one action.
+
 Input is limited to a known `modelKey`, a non-empty prompt within the model's limit, and optional dimensions/steps
 that the model accepts (Cloudflare fixes 1024×1024; Leonardo accepts 32–2048 px in multiples of 8). A failed provider
 call, unreadable image, refused download host, or storage failure marks the row `failed` with a sanitized code; the
@@ -808,7 +814,7 @@ row itself is the generation record.
 | Real Cloudflare generation | **PASS** | `npm run verify:image-live` on 2026-11-25, 12/12: the route estimated 172.8 neurons / $0.001901, generated one 1024×1024 flux image through Workers AI, stored it in R2, listed it, and served it from a presigned playback URL before cleanup. Credential diagnosis: `CLOUDFLARE_API_TOKEN` is a valid, active token but Workers AI rejects it with `401` code `10000` (no Workers AI permission); the project's `CF_API_TOKEN` is the Workers AI token and works. The adapter now accepts `CF_API_TOKEN` as the `CLOUDFLARE_AI_API_TOKEN` fallback |
 | Real Leonardo generation | **BLOCKED** | `LEONARDO_API_KEY` is a 36-character UUID rather than a Leonardo API key (Leonardo keys are long JWTs), and Leonardo returns `401` for both `POST /generations` and `/me`. It cannot work until a real key is issued; the route correctly records the failure and stores no media |
 | Hosted schema | **PASS** | `20261125200000_create_image_generations.sql` applied through the Supabase management API on 2026-11-25; `verify:sql` reports 92/92, including the service-role insert, `42501` for authenticated reads, and `23514` for an unknown provider |
-| Generation UI | **UNVERIFIED** | Not part of this slice; the routes are API-only |
+| Generation UI | **PASS (DOM)** | `tests/generate-panel.test.tsx`: the model picker marks a credential-less provider disabled; a prompt triggers the server estimate and shows $0.001901 / 172.8 neurons with its verified date and source; no generation request is made before **Generate image**; the result previews from a private playback URL and **Attach image to scene** writes the scene reference and saves the document; a `202` job shows **Refresh job** and only then completes; a provider failure shows the sanitized code without a preview |
 
 | Provider | Verified model and request | Limits | Billing |
 | --- | --- | --- | --- |

@@ -792,6 +792,59 @@ button:disabled {
   margin-top: 0;
 }
 
+.generate-form {
+  display: grid;
+  grid-template-columns: minmax(0, 0.7fr) minmax(0, 1.3fr);
+  gap: 0 1rem;
+  align-items: start;
+  padding-bottom: 0.8rem;
+  border-bottom: 1px dashed var(--border);
+}
+
+.generate-form .editor-actions {
+  grid-column: 1 / -1;
+  margin-top: 0;
+}
+
+.generate-form textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.generation-estimate {
+  margin-top: 0.8rem;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.generation-cost {
+  margin: 0;
+  font-size: 1.35rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.generation-pending {
+  margin-top: 0.8rem;
+  display: grid;
+  gap: 0.5rem;
+  justify-items: start;
+}
+
+.generation-preview {
+  margin-top: 1rem;
+  display: grid;
+  gap: 0.55rem;
+  justify-items: start;
+}
+
+.generation-image {
+  max-height: 420px;
+}
+
 .media-heading {
   margin-top: 1rem;
 }
@@ -1042,6 +1095,7 @@ button:disabled {
 @media (max-width: 860px) {
   .field-grid,
   .upload-form,
+  .generate-form,
   .preview-facts {
     grid-template-columns: minmax(0, 1fr);
   }

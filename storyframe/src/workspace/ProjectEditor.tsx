@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type { ProjectDocumentV2, ProjectRecord } from "../../shared/project-contract";
 import { AiRequestError, getProject, updateProject } from "../api";
 import { BriefPanel } from "./BriefPanel";
+import { GeneratePanel } from "./GeneratePanel";
 import { MediaPanel } from "./MediaPanel";
 import { PlanningPanel } from "./PlanningPanel";
 import { SourcesPanel } from "./SourcesPanel";
@@ -10,7 +11,16 @@ import { ScriptPanel } from "./ScriptPanel";
 import { SettingsPanel } from "./SettingsPanel";
 import { StoryboardPanel } from "./StoryboardPanel";
 
-type EditorTab = "brief" | "sources" | "plan" | "script" | "storyboard" | "media" | "preview" | "settings";
+type EditorTab =
+  | "brief"
+  | "sources"
+  | "plan"
+  | "script"
+  | "storyboard"
+  | "generate"
+  | "media"
+  | "preview"
+  | "settings";
 
 const TABS: { id: EditorTab; label: string }[] = [
   { id: "brief", label: "Brief" },
@@ -18,6 +28,7 @@ const TABS: { id: EditorTab; label: string }[] = [
   { id: "plan", label: "Plan" },
   { id: "script", label: "Script" },
   { id: "storyboard", label: "Storyboard" },
+  { id: "generate", label: "Generate" },
   { id: "media", label: "Media" },
   { id: "preview", label: "Preview" },
   { id: "settings", label: "Settings" },
@@ -275,6 +286,15 @@ export function ProjectEditor({
             scenes={draft.scenes}
             targetDurationSeconds={draft.brief.targetDurationSeconds}
             onChange={(scenes) => setDraft({ ...draft, scenes })}
+          />
+        )}
+        {tab === "generate" && (
+          <GeneratePanel
+            projectId={saved.id}
+            scenes={draft.scenes}
+            getAccessToken={getAccessToken}
+            onAttachAsset={attachAsset}
+            onBusyChange={setMediaBusy}
           />
         )}
         {tab === "media" && (
