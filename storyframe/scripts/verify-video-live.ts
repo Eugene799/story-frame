@@ -382,6 +382,11 @@ async function main(): Promise<number> {
         `consumed=${finished?.creditsConsumed}`,
       );
 
+      console.log(
+        `Render measured: ${finished?.durationSeconds}s, ${finished?.byteSize} bytes, ` +
+          `${finished?.width}x${finished?.height}, ${finished?.creditsConsumed} credits consumed.`,
+      );
+
       const mediaRows = await serviceRows(
         `media_metadata?select=id,kind,status,content_type,byte_size&id=eq.${finished?.mediaId}`,
       );

@@ -51,8 +51,18 @@ import { R2Error } from "./r2";
  * slice and keeps the provider URL in the job result for a later retry path.
  */
 
-/** The only host the finished MP4 may be downloaded from. */
-export const JSON2VIDEO_OUTPUT_HOST = "assets.json2video.com";
+/**
+ * Hosts the finished MP4 may be downloaded from. The docs name
+ * `assets.json2video.com`, but a live render on 2026-11-25 was delivered from
+ * `json2video-cdn1.s3.amazonaws.com`, so the provider's CDN buckets are allowed
+ * by shape. Nothing else is: redirects are refused and only `https` is read.
+ */
+export const JSON2VIDEO_OUTPUT_HOSTS: readonly string[] = ["assets.json2video.com"];
+export const JSON2VIDEO_CDN_HOST = /^json2video-cdn\d+\.s3\.amazonaws\.com$/;
+
+export function isJson2VideoOutputHost(hostname: string): boolean {
+  return JSON2VIDEO_OUTPUT_HOSTS.includes(hostname) || JSON2VIDEO_CDN_HOST.test(hostname);
+}
 
 /** Provider statuses kept in `render_snapshots.provider_status`. */
 const PROVIDER_STATUSES: readonly VideoProviderStatus[] = [
@@ -1035,11 +1045,11 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
     } catch {
       throw new ApiError(422, "VIDEO_OUTPUT_INVALID", "The provider returned an unreadable output URL.");
     }
-    if (parsed.protocol !== "https:" || parsed.hostname !== JSON2VIDEO_OUTPUT_HOST) {
+    if (parsed.protocol !== "https:" || !isJson2VideoOutputHost(parsed.hostname)) {
       throw new ApiError(
         422,
         "VIDEO_OUTPUT_INVALID",
-        "The provider returned an output URL outside assets.json2video.com; nothing was downloaded.",
+        "The provider returned an output URL outside its own delivery hosts; nothing was downloaded.",
       );
     }
     return parsed;

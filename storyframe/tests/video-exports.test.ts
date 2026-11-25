@@ -42,6 +42,10 @@ interface FakeProvider {
   outputFails: boolean;
   /** Non-200 answers the submit, the way a provider outage does. */
   submitStatus: number;
+  /** Where the finished movie claims to live. */
+  outputUrl: string;
+  /** Every output download the server attempted, so a refusal is visible. */
+  outputDownloads: string[];
 }
 
 function fakeProvider(initial: Partial<FakeProvider> = {}): {
@@ -57,13 +61,16 @@ function fakeProvider(initial: Partial<FakeProvider> = {}): {
     consumedCredits: [6, 2],
     outputFails: false,
     submitStatus: 200,
+    outputUrl: PROVIDER_OUTPUT,
+    outputDownloads: [],
     ...initial,
   };
 
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
 
-    if (url.startsWith("https://assets.json2video.com/")) {
+    if (url.startsWith("https://assets.json2video.com/") || url === provider.outputUrl) {
+      provider.outputDownloads.push(url);
       if (provider.outputFails) {
         return new Response("output unavailable", { status: 500 });
       }
@@ -113,7 +120,7 @@ function fakeProvider(initial: Partial<FakeProvider> = {}): {
         status: provider.mode,
         success: provider.mode !== "error",
         message: provider.mode === "error" ? "render failed at step 2" : "",
-        url: provider.mode === "done" ? PROVIDER_OUTPUT : null,
+        url: provider.mode === "done" ? provider.outputUrl : null,
         thumbnail: null,
         duration: provider.mode === "done" ? 10 : null,
         size: provider.mode === "done" ? MP4.length : null,
@@ -446,6 +453,37 @@ describe("video exports", () => {
     // The row and the ledger agree on the ambiguous attempt's cost.
     expect(body.exports[0].creditsConsumed).toBe(10);
     expect(body.usage.creditsUsed).toBe(10);
+  });
+
+  it("copies the MP4 from the provider's own CDN bucket", async () => {
+    // A live render on 2026-11-25 was delivered from this host, not the
+    // documented assets.json2video.com.
+    const cdn = "https://json2video-cdn1.s3.amazonaws.com/render/abcdefghijklmnop.mp4";
+    const { app, provider } = await startExportApp({ mode: "done", outputUrl: cdn });
+    const project = await createProject(app, exportDocument([approvedScene({ durationSeconds: 5 })]));
+
+    const accepted = (await (await exportRequest(app, project.id, project.version)).json()) as ExportBody;
+    const ready = await awaitStatus(app, project.id, accepted.export.id, ["ready", "failed"]);
+    expect(ready.export.failureCode).toBeNull();
+    expect(ready.export.status).toBe("ready");
+    expect(ready.export.byteSize).toBe(MP4.length);
+    expect(provider.outputDownloads).toEqual([cdn]);
+  });
+
+  it("refuses an output URL outside the provider's delivery hosts", async () => {
+    const { app, provider } = await startExportApp({
+      mode: "done",
+      outputUrl: "https://cdn.attacker.example/render/abcdefghijklmnop.mp4",
+    });
+    const project = await createProject(app, exportDocument([approvedScene({ durationSeconds: 5 })]));
+
+    const accepted = (await (await exportRequest(app, project.id, project.version)).json()) as ExportBody;
+    const failed = await awaitStatus(app, project.id, accepted.export.id, ["failed", "ready"]);
+    expect(failed.export.failureCode).toBe("VIDEO_OUTPUT_INVALID");
+    expect(failed.export.mediaId).toBeNull();
+    // Nothing was fetched and nothing was stored.
+    expect(provider.outputDownloads).toEqual([]);
+    expect(app.r2.objects.size).toBe(0);
   });
 
   it("stops polling when the provider no longer knows the render", async () => {

@@ -148,9 +148,11 @@ Afterwards, check the running server rather than assuming the schema is ready:
 3. Set `SMOKE_SUPABASE_ACCESS_TOKEN` to a session token and run `npm run smoke:live` (five
    billable calls, described under Tests).
 
-**The seventeen migrations through Phase 8 are applied to the configured project (`myrohtkfsuppcabedwmn`): the sixth on
-2026-11-24, the seventh and eighth (Phase 5) on 2026-11-25, and the ninth through seventeenth (Phases 6–8) on 2026-11-25.
-The two Phase 9 migrations are not applied to the hosted project yet; `npm run verify:sql` proves them locally first.** The Phase 6 catalog was
+**The nineteen migrations through Phase 9 are applied to the configured project (`myrohtkfsuppcabedwmn`): the sixth on
+2026-11-24, the seventh and eighth (Phase 5) on 2026-11-25, the ninth through seventeenth (Phases 6–8) on 2026-11-25, and
+the eighteenth and nineteenth (Phase 9) on 2026-11-25 through the management API. `npm run verify:sql` still proves every
+one locally first, and after applying the last two a PostgREST probe returned `200` for `render_snapshots.kind`,
+`render_snapshots.media_id`, and `video_usage`.** The Phase 6 catalog was
 checked directly after applying it: `media_metadata.provenance` and its object constraint exist,
 `media_metadata_ready_stock_import_key` is a partial unique index on the owner, project, provider, asset id, and
 rendition where `status = 'ready'`, and `stock_search_cache` exists with RLS enabled, no `authenticated` grants, and
@@ -785,9 +787,9 @@ controlled import with provenance, credited exports, and live acceptance runs fo
 Phase 7 (Cloudflare Workers AI and Leonardo image generation) is implemented with a Generate tab, persisted cost capture,
 and recoverable pending jobs. Phase 8 (Deepgram narration and uploaded audio) is implemented with a Narration tab,
 persisted private audio, script-staleness fingerprints, measured duration warnings, and uploaded narration/music controls.
-Phase 8 is closed. Phase 9 (video export) is implemented offline end to end — contract, adapter, schema, store, routes,
-sweep, and the Preview-tab panel — while its hosted migrations and its one live render are still pending, so the phase is
-not claimed as closed.
+Phase 8 is closed. Phase 9 (video export) is closed as well: the contract, adapter, schema, store, routes, sweep, and
+Preview-tab panel are implemented, both migrations are applied to the hosted project, and a real 6-second render passed
+18/18 live checks against JSON2Video, hosted Supabase, and private R2.
 
 ### Phase 6 verification (2026-11-25)
 
@@ -986,7 +988,7 @@ deferred Phase 8 concern is JSON2Video's temporary input access, which is Phase 
 | Upload from the UI in a browser | **UNVERIFIED** | There is still no media UI; the flow is API-only until the workspace is built |
 | JSON2Video temporary input access | **DEFERRED** | Phase 9; the presign TTL policy above is the design constraint |
 
-### Phase 9: video export through JSON2Video (2026-11-25) — implemented offline, live render pending
+### Phase 9: video export through JSON2Video (2026-11-25) — complete
 
 **Provider facts.** JSON2Video exposes `POST`, `GET`, and `DELETE https://api.json2video.com/v2/movies` with an
 `x-api-key` header; a submission answers with a 16-character `project` id, and `GET ?project=…&format=simple` reports
@@ -997,7 +999,9 @@ MP4 sits on `assets.json2video.com` for about seven days.
 
 **Why the server copies the file.** JSON2Video can only deliver to an Amazon S3 destination, and this project's bucket is
 Cloudflare R2, so the server downloads the finished MP4 itself and stores it through the existing private-media path. The
-download is `https` only, host `assets.json2video.com` only, redirects refused, bounded by `VIDEO_DOWNLOAD_TIMEOUT_MS`,
+download is `https` only, redirects refused, bounded by `VIDEO_DOWNLOAD_TIMEOUT_MS`,
+restricted to the provider's own delivery hosts — the documented `assets.json2video.com` plus the
+`json2video-cdn<N>.s3.amazonaws.com` buckets it actually serves from —
 and capped while streaming at `VIDEO_MAX_BYTES` rather than trusting `Content-Length`. The bytes must pass the existing
 magic-byte check as `video/*`, so the row is always a real MP4/WebM/MOV. Our copy is the durable one: playback streams
 from private R2 and the provider copy is deleted best-effort after a successful store.
@@ -1047,10 +1051,10 @@ from the server (for example `VIDEO_NARRATION_STALE` for narration made from an 
 | --- | --- | --- |
 | Provider contract, movie builder, and credit math | **PASS (offline)** | `tests/json2video.test.ts`: request shape, `x-api-key` never echoed, every documented error class mapped (`400` validation vs bad key, `401` quota, `403` suspended, `404`, `413`, `500` retryable), status parsing, the movie JSON for image/video/text-card scenes, narration overflow refusal, and the estimate |
 | Export lifecycle, single copy, and guard | **PASS (offline, fake provider)** | `tests/video-exports.test.ts` (13 tests): submit → `running` → `done` → byte-identical copy → `ready`; one live export per project; idempotent replay; a failed copy is terminal, keeps `providerUrl`, and records its cost; an ambiguous submit failure records the estimate on both the row and the ledger; provider error and unknown job; unapproved/cross-revision/stale-narration refusals with no provider call; deletion of row, object, and provider copy |
-| Hosted schema | **NOT APPLIED** | `npm run verify:sql` proves both migrations locally (133/133), but a direct read of the hosted project on 2026-11-25 returned HTTP `400` for `render_snapshots.kind` and `404` for `video_usage`, so the hosted project does not have them yet |
-| Live render | **NOT RUN** | `JSON2VIDEO_API_KEY` is present in this workspace, but the routes need the two hosted migrations above. `npm run verify:video-live` prints a SKIP and exits 0 without the key (`1` with `--require-live`); it has not been run against a real render, so no live duration, size, or credit figure is claimed |
+| Hosted schema | **PASS** | `20261126090000_add_video_render_jobs.sql` and `20261126100000_create_video_usage.sql` applied through the Supabase management API on 2026-11-25; a PostgREST probe then returned `200` for `render_snapshots.kind`, `render_snapshots.media_id`, and `video_usage`, where the same reads returned `400` and `404` before. `verify:sql` reports 133/133 locally |
+| Live render | **PASS** | `npm run verify:video-live` on 2026-11-25 against real JSON2Video, hosted Supabase, and the `story-frame` bucket: **18/18**. A two-scene 6-second movie rendered in about a minute: **6 s**, **34 690 bytes**, **1920×1080**, **6 credits consumed**, stored as a ready `video/mp4` asset and played back byte-for-byte from private R2, with the reservation, the ledger settlement, export deletion, and project cleanup all verified. The first run scored 12/18 and found a real bug: JSON2Video delivered from `json2video-cdn1.s3.amazonaws.com`, not the documented `assets.json2video.com`, so the host guard refused the download; it now accepts the provider's CDN buckets and nothing else, with `tests/video-exports.test.ts` covering both the accepted CDN host and a refused foreign host |
 | Preview-tab UI | **PASS (DOM)** | `tests/video-panel.test.tsx`: the credit window and estimate, one `POST` with the saved revision and an idempotency key, the live status, playback of the stored MP4 from a private URL, the failure reason for a failed export, and the disabled-with-reason states for unapproved scenes and unsaved changes |
-| Whole suite | **PASS** | `npm run check` clean, `npm test` 356/356, `npm run verify:sql` 133/133 on 2026-11-25 |
+| Whole suite | **PASS** | `npm run check` clean, `npm test` 358/358, `npm run verify:sql` 133/133 on 2026-11-25 |
 | Cancel, subtitles, USD price | **NOT PROVIDED** | There is no provider cancel endpoint, no word timings are requested or inferred, and no credits-to-dollars rate is published; the UI states that a started render cannot be cancelled |
 
 **Stated limits.** One provider; the provider's documented preset resolutions at 25 fps; one copy attempt per export
