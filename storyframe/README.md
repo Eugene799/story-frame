@@ -985,7 +985,7 @@ deferred Phase 8 concern is JSON2Video's temporary input access, which is Phase 
 | Full upload through the app with a real signed-in session | **PASS** | `npm run verify:media-live`: two disposable hosted accounts, 38/38 checks, including a real bucket upload, playback, the upload-ticket CORS preflight, the document-delete guard, and project-deletion object cleanup |
 | Two-account isolation on the hosted project | **PASS** | Same check: RLS reads, refused browser write, and `404` for foreign routes |
 | Bucket CORS | **PASS** | Rule applied and probed (allowed preflight `204`, foreign origin `403`, presigned `GET` header); `verify:r2-live`, `verify:media-live`, and `verify:narration-live` now fail when the bucket does not echo the `cors.json` preview origin |
-| Upload from the UI in a browser | **UNVERIFIED** | There is still no media UI; the flow is API-only until the workspace is built |
+| Upload from the UI in a browser | **UNVERIFIED (browser)** | The upload UI exists: `MediaPanel` is mounted in `ProjectEditor` and rendered by `tests/stock-panel.test.tsx`, which covers the picker, the initiation, the PUT, completion, playback, and the error states. What is still unverified is a real-browser upload against the hosted bucket; the hosted uploads so far went through the routes (`verify:media-live`) |
 | JSON2Video temporary input access | **RESOLVED** | Closed in Phase 9: every render input is presigned with `VIDEO_INPUT_URL_SECONDS` (7 200 by default), which must outlive queueing plus the render window; the live render consumed those URLs successfully |
 
 ### Phase 9: video export through JSON2Video (2026-11-25) — complete
@@ -1088,8 +1088,11 @@ rather than the twenty reserved for it. A header that cannot be read keeps the r
 `LIPSYNC_DURATION_UNMEASURED`; fragmented output is the case to watch. An all-ones duration (`0xFFFFFFFF`, or the
 64-bit equivalent) is read as "unknown" rather than 4 294 967 seconds, the reader clamps any absurd length to
 `MAX_MP4_DURATION_SECONDS` (3 600), and settlement ignores anything longer than the request's own ceiling
-(`LIPSYNC_DURATION_OUT_OF_RANGE`), so a broken header can never inflate the ledger. A provider `FAILURE`/`REVOKED`, an
-abandoned task, or a success without a usable URL fails the export and settles zero seconds.
+(`LIPSYNC_DURATION_OUT_OF_RANGE`), so a broken header can never inflate the ledger. A provider `FAILURE`/`REVOKED`, an abandoned task, or a row whose task id
+was never stored fails the export; a reported failure settles zero seconds because the provider did not bill it, while a
+lost task id keeps the reservation. Anything that fails **after** a `SUCCESS` — no usable URL, a refused output host, an
+oversized or unreadable file, a storage error — also fails the export but keeps the reserved ceiling, because the
+provider has already billed that request.
 - The Preview tab's `LipsyncPanel` picks the source, audio and resolution, shows the seconds/USD window and an
 estimate, submits with an idempotency key, polls only while pending, plays the stored copy from a private
 presigned URL, and deletes after a confirmation. A pending task cannot be deleted.

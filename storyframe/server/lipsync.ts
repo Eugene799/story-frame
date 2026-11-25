@@ -649,7 +649,9 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
       // A success reported without a usable URL will never become usable, so it
       // fails now; every other status error is transient and retried.
       if (error instanceof ApiError && error.code === "LIPSYNC_RESULT_INVALID") {
-        await fail(row, "LIPSYNC_OUTPUT_INVALID", error.message, 0);
+        // SUCCESS without a usable URL still means the provider ran and billed
+        // this request, so the reservation is kept rather than recorded as free.
+        await fail(row, "LIPSYNC_OUTPUT_INVALID", error.message, row.secondsEstimate);
         return;
       }
       log.error(`[lipsync] LIPSYNC_POLL_FAILED ${error instanceof Error ? error.name : "unknown"}`);
@@ -696,7 +698,9 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
     } catch (error) {
       const code = error instanceof ApiError && error.code.startsWith("LIPSYNC_") ? (error.code as LipsyncFailureCode) : "LIPSYNC_OUTPUT_COPY_FAILED";
       const message = error instanceof ApiError ? error.message : "The finished lip sync could not be stored.";
-      await fail(row, code, message, 0);
+      // Reached only after the provider reported SUCCESS, so it has billed the
+      // request even when we refuse or cannot keep the output.
+      await fail(row, code, message, row.secondsEstimate);
     }
   }
 

@@ -478,7 +478,8 @@ describe("lipsync sweep", () => {
 
     expect(store.rows[0]).toMatchObject({ status: "failed", failureCode: "LIPSYNC_OUTPUT_HOST" });
     expect(calls.some((call) => call.url.startsWith("https://evil.test"))).toBe(false);
-    expect(store.settled.at(-1)).toMatchObject({ status: "failed", seconds: 0 });
+    // A refused host is still a request Everypixel finished and billed.
+    expect(store.settled.at(-1)).toMatchObject({ status: "succeeded", seconds: 20 });
   });
 
   it("records a provider failure without counting any seconds", async () => {
@@ -498,5 +499,8 @@ describe("lipsync sweep", () => {
     await service({ store: store.store, mediaStore: fakeMedia(objects).media, objects: fakeObjects(objects), fetchImpl }).sweep();
 
     expect(store.rows[0]).toMatchObject({ status: "failed", failureCode: "LIPSYNC_OUTPUT_INVALID" });
+    // The provider said SUCCESS, so the seconds are billed even with no URL.
+    expect(store.settled.at(-1)).toMatchObject({ status: "succeeded", seconds: 20 });
+    expect(store.rows[0]?.secondsCounted).toBe(20);
   });
 });
