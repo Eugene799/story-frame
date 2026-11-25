@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { sceneFingerprint } from "../shared/scene-fingerprint";
+import type { GenerationProposalRecord } from "../shared/child-contract";
 import type { MediaRecord } from "../shared/media-contract";
 import type {
   ProjectDocumentV2,
@@ -32,6 +33,10 @@ interface FakeBackend {
   saveFailures: number;
   uploads: { url: string; headers: Record<string, string> }[];
   requests: { method: string; path: string; body: unknown }[];
+  /** Planning stub: no provider is contacted; the second attempt replays. */
+  planningKeys: (string | null)[];
+  planningAttempts: number;
+  planningProposal: GenerationProposalRecord | null;
 }
 
 function makeBackend(project?: ProjectRecord): FakeBackend {
@@ -43,6 +48,9 @@ function makeBackend(project?: ProjectRecord): FakeBackend {
     saveFailures: 0,
     uploads: [],
     requests: [],
+    planningKeys: [],
+    planningAttempts: 0,
+    planningProposal: null,
   };
   return backend;
 }
@@ -269,6 +277,43 @@ function installBackend(backend: FakeBackend) {
       return jsonResponse({ ok: true, deletedId: referenceId });
     }
 
+    const proposalsMatch = path.match(/^\/api\/projects\/([^/]+)\/proposals$/);
+    if (proposalsMatch && method === "GET") {
+      return jsonResponse({
+        ok: true,
+        proposals: backend.planningProposal ? [backend.planningProposal] : [],
+      });
+    }
+
+    // Stubbed planning provider: the first attempt reports in-progress (so the
+    // key must be kept), and the same key on the next attempt replays the reply.
+    const planningMatch = path.match(/^\/api\/projects\/([^/]+)\/planning$/);
+    if (planningMatch && method === "POST") {
+      backend.planningKeys.push(new Headers(init?.headers).get("Idempotency-Key"));
+      backend.planningAttempts += 1;
+      if (backend.planningAttempts === 1) {
+        return jsonResponse(
+          { ok: false, error: { code: "IDEMPOTENCY_IN_PROGRESS", message: "The attempt is still running." } },
+          409,
+        );
+      }
+      backend.planningProposal ??= planningProposalFixture();
+      return jsonResponse({ ok: true, proposal: backend.planningProposal }, 201);
+    }
+
+    const acceptMatch = path.match(/^\/api\/projects\/([^/]+)\/proposals\/([^/]+)\/accept$/);
+    if (acceptMatch && method === "POST") {
+      const project = backend.projects.get(acceptMatch[1]);
+      if (!project || !backend.planningProposal) {
+        return jsonResponse({ ok: false, error: { code: "PROPOSAL_NOT_FOUND", message: "missing" } }, 404);
+      }
+      const accepted: GenerationProposalRecord = { ...backend.planningProposal, status: "accepted" };
+      backend.planningProposal = accepted;
+      const updated: ProjectRecord = { ...project, version: project.version + 1, updatedAt: NOW };
+      backend.projects.set(updated.id, updated);
+      return jsonResponse({ ok: true, proposal: accepted, project: updated, claimsRecorded: true });
+    }
+
     throw new Error(`Unexpected request: ${method} ${raw}`);
   });
 
@@ -290,6 +335,34 @@ function projectFixture(overrides: Partial<ProjectRecord> = {}): ProjectRecord {
   };
 }
 
+function planningProposalFixture(): GenerationProposalRecord {
+  return {
+    id: "22222222-2222-4222-8222-222222222222",
+    sceneKey: null,
+    modelId: "gemma",
+    prompt: "planning prompt",
+    status: "proposed",
+    route: "angles",
+    baseVersion: 1,
+    createdAt: NOW,
+    proposal: {
+      route: "angles",
+      summary: "Three angles for the late letter.",
+      notes: ["Kept the letter as the through-line."],
+      angles: [
+        { title: "The missed connection", hook: "A letter arrives too late.", rationale: "Immediate stakes." },
+        { title: "The wrong recipient", hook: "Someone else reads it.", rationale: "Adds a turn." },
+        { title: "The return trip", hook: "The courier goes back.", rationale: "A hopeful ending." },
+      ],
+      scenes: [],
+      clips: [],
+      claims: [],
+      insufficientEvidence: false,
+      repairAttempted: false,
+    },
+  };
+}
+
 function renderWorkspace() {
   const getAccessToken = vi.fn(async () => "access-token");
   render(<Workspace getAccessToken={getAccessToken} />);
@@ -304,6 +377,8 @@ async function openProject(backend: FakeBackend) {
 }
 
 afterEach(() => {
+  cleanup();
+  window.sessionStorage.clear();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -580,6 +655,43 @@ describe("workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "Delete asset" }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
     await waitFor(() => expect(backend.media.get(PROJECT_ID)).toHaveLength(0));
+  });
+
+  it("generates from the Plan tab, replays a reload-persisted key, and accepts", async () => {
+    const backend = makeBackend(projectFixture());
+    installBackend(backend);
+    renderWorkspace();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open The Late Letter" }));
+    await screen.findByLabelText("Project title");
+    fireEvent.click(screen.getByRole("tab", { name: "Plan" }));
+    expect(await screen.findByText("No proposals yet.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText("IDEMPOTENCY_IN_PROGRESS")).toBeInTheDocument();
+    expect(backend.planningKeys).toHaveLength(1);
+    const stored = window.sessionStorage.getItem(`storyframe.planning.pendingKey.${PROJECT_ID}`);
+    expect(stored).toBeTruthy();
+
+    // Reload the whole workspace: React state is gone, sessionStorage survives.
+    cleanup();
+    renderWorkspace();
+    fireEvent.click(await screen.findByRole("button", { name: "Open The Late Letter" }));
+    await screen.findByLabelText("Project title");
+    fireEvent.click(screen.getByRole("tab", { name: "Plan" }));
+    expect(await screen.findByText("No proposals yet.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText("Accept and save")).toBeInTheDocument();
+    expect(backend.planningKeys).toHaveLength(2);
+    expect(backend.planningKeys[1]).toBe(backend.planningKeys[0]);
+    expect(JSON.parse(stored as string).key).toBe(backend.planningKeys[1]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Accept and save" }));
+    expect(await screen.findByText(/Accepted\. The project is now version 2\./)).toBeInTheDocument();
+    expect(screen.getByText("Accepted")).toBeInTheDocument();
+    expect(backend.projects.get(PROJECT_ID)?.version).toBe(2);
+    expect(window.sessionStorage.getItem(`storyframe.planning.pendingKey.${PROJECT_ID}`)).toBeNull();
   });
 
   it("keeps the draft and offers a reload when a save conflicts", async () => {

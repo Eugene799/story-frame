@@ -525,7 +525,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 182/182; `verify:sql` 77/77; `verify:live-routes` exit 0; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 183/183; `verify:sql` 77/77; `verify:live-routes` exit 0; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -626,7 +626,7 @@ so it writes no ledger row and does not consume the key.
 | Route instructions match the validator | **PASS** | `tests/planning-prompt.test.ts` (6 tests) asserts every route names its exact root keys, counts, scene/clip fields, and duration bounds under "only these keys", keeps factual claims available to script/ad-concept/transcript-analysis, and withholds them from angles/storyboard; the tightened `angles` instruction then passed a live call with no repair |
 | Hosted schema and live routes | **PASS** | Migration 7 is applied to the hosted project (2026-11-25); probes for every new column and `model_health` return `200`; `verify:live-routes` passes against it |
 | One real hosted planning call | **PASS** | 2026-11-25, first call before tightening: `angles` → `gemma4:31b`, `201`, 3 angles, but `repairAttempted=true` (ledger tokens 715/514, latency 2311 ms). After tightening, a second call with no caller instruction: `201` in 1932 ms, `repairAttempted=false`, 3 angles; ledger `success`/`201`, tokens 301/266, latency 1144 ms, stored proposal id; same-key replay `201` in 493 ms with the same proposal and still one ledger row; proposal, project, ledger row, profile, and user deleted, cleanup read back zero rows |
-| Plan tab behavior | **PASS (DOM)** | `tests/planning-panel.test.tsx`: list, generate, review, and accept through the panel, with nothing applied before acceptance and both actions disabled while the draft is dirty; included in the production build. Not exercised in a real browser in this environment |
+| Plan tab behavior | **PASS (DOM)** | `tests/planning-panel.test.tsx`: list, generate, review, and accept through the panel, with nothing applied before acceptance and both actions disabled while the draft is dirty. `tests/workspace.test.tsx` drives the real Workspace from the Plan tab through generate, a full remount that replays the `sessionStorage` key, and accept; the provider is stubbed, so it spends nothing. Not exercised in a real browser in this environment |
 
 ### Phase 3 verification (2026-11-24)
 
@@ -761,6 +761,9 @@ Coverage includes:
 - Transcript clips become scene drafts with the quoted words, and planning routes are owner-scoped (`404` cross-account)
 - Plan tab: generate/review/accept through the real panel component, nothing applied before acceptance, and both actions
   disabled while the workspace draft is dirty
+- Workspace Plan journey: opening the Plan tab from a project, generating against a stubbed provider, reloading the whole
+  Workspace and replays the `sessionStorage`-persisted key on the same attempt, then accepting and seeing the saved
+  version and cleared key
 - Planning idempotency: key required before any provider or ledger write; one `ai_usage` success row per attempt; replay
   returns the same proposal after one provider call; key reuse for a different request is `409`; a refused reply is
   stored and replayed; keys are scoped to the verified account
