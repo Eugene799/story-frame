@@ -120,6 +120,7 @@ import {
   type NarrationTrack,
 } from "../shared/narration-contract";
 import { startMediaSweeper } from "./media-scheduler";
+import { serveStatic } from "./static";
 import { createSupabaseModelHealthStore, type ModelHealthStore } from "./model-health";
 import {
   PLANNING_LIMITS,
@@ -757,6 +758,23 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     const requestUrl = new URL(request.url ?? "/", "http://localhost");
     const path = requestUrl.pathname;
 
+    // The platform health check polls this, so it stays cheap: configuration
+    // readiness only, with no provider call and no secret in the reply.
+    if (path === "/api/health") {
+      if (method !== "GET" && method !== "HEAD") {
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for the health check.");
+      }
+      sendJson(response, 200, {
+        ok: true,
+        ready: {
+          auth: Boolean(config.supabaseUrl && config.supabasePublishableKey),
+          ledger: Boolean(config.supabaseServiceRoleKey),
+          storage: Boolean(config.r2),
+        },
+      });
+      return;
+    }
+
     if (path === "/api/ai/status") {
       if (method !== "GET") throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for this endpoint.");
       const ledgerReady = await readLedgerReadiness();
@@ -808,6 +826,13 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
 
     if (path === "/api/projects" || path.startsWith("/api/projects/")) {
       await handleProjects(request, response, path);
+      return;
+    }
+
+    // Everything that is not an API route is the built client, served from the
+    // same origin so the browser's relative /api calls have no CORS to cross.
+    if (path !== "/api" && !path.startsWith("/api/")) {
+      serveStatic(request, response, path);
       return;
     }
 

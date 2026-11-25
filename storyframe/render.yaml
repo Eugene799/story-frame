@@ -1,0 +1,52 @@
+services:
+  - type: web
+    name: storyframe
+    runtime: node
+    # A free instance sleeps, and the media, image, video, and lip sync sweeps
+    # only run while this process is alive. Confirm the plan slug in the dashboard.
+    plan: starter
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: APP_ORIGIN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_PUBLISHABLE_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: R2_ENDPOINT
+        sync: false
+      - key: R2_BUCKET_NAME
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: OLLAMA_API_KEY
+        sync: false
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: JSON2VIDEO_API_KEY
+        sync: false
+      - key: EVERYPIXEL_CLIENT_ID
+        sync: false
+      - key: EVERYPIXEL_SECRET_ID
+        sync: false
+      - key: PEXELS_API_KEY
+        sync: false
+      - key: PIXABAY_API_KEY
+        sync: false
+      - key: CLOUDFLARE_ACCOUNT_ID
+        sync: false
+      - key: CLOUDFLARE_AI_API_TOKEN
+        sync: false
+      - key: LEONARDO_API_KEY
+        sync: false

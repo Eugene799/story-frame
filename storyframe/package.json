@@ -4,6 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "description": "StoryFrame - Phase 1 Ollama Cloud development connection test",
+  "engines": {
+    "node": ">=22 <27"
+  },
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "dev:server": "tsx watch server/index.ts",
@@ -26,13 +29,15 @@
     "verify:sql": "tsx scripts/verify-sql.ts",
     "audit:media": "tsx scripts/audit-media.ts",
     "start:server": "tsx server/index.ts",
+    "start": "node --import tsx server/index.ts",
     "verify:lipsync-live": "tsx scripts/verify-lipsync-live.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.119.2",
     "music-metadata": "^12.8.3",
     "react": "^19.3.1",
-    "react-dom": "^19.3.1"
+    "react-dom": "^19.3.1",
+    "tsx": "^4.23.15"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.6.0",
@@ -44,7 +49,6 @@
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.3.0",
     "jsdom": "^31.0.1",
-    "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vite": "^8.3.8",
     "vitest": "^5.1.1"

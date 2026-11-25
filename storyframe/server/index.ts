@@ -12,6 +12,7 @@ try {
   }
 }
 
+const production = process.env.NODE_ENV === "production";
 const host = process.env.HOST?.trim() || "127.0.0.1";
 const port = Number(process.env.PORT?.trim() || 8787);
 const server = createStoryframeServer();
@@ -19,7 +20,9 @@ const server = createStoryframeServer();
 const hasPublishableKey = Boolean(process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY);
 
 server.listen(port, host, () => {
-  console.log(`[storyframe] Development AI server listening on http://${host}:${port}`);
+  console.log(
+    `[storyframe] ${production ? "Server" : "Development AI server"} listening on http://${host}:${port}`,
+  );
   console.log(`[storyframe] OLLAMA_API_KEY: ${process.env.OLLAMA_API_KEY ? "present" : "missing"}`);
   console.log(
     `[storyframe] Supabase auth: ${process.env.SUPABASE_URL && hasPublishableKey ? "configured" : "missing"}`,
@@ -31,7 +34,9 @@ server.listen(port, host, () => {
         : "missing"
     }`,
   );
-  console.log("[storyframe] Development arrangement only - not a production hosting solution.");
+  if (!production) {
+    console.log("[storyframe] Development arrangement only - not a production hosting solution.");
+  }
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
