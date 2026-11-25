@@ -12,7 +12,11 @@ import type {
   SourceResponse,
   SourcesResponse,
 } from "../shared/child-contract";
-import type { PlanningAcceptedResponse, PlanningStartRequest } from "../shared/planning-contract";
+import type {
+  PlanningAcceptedResponse,
+  PlanningAttemptStatusResponse,
+  PlanningStartRequest,
+} from "../shared/planning-contract";
 import type {
   ProjectDeletedResponse,
   ProjectDocumentV2,
@@ -318,6 +322,16 @@ export async function listProjectProposals(
       accessToken,
     )
   ).proposals;
+}
+
+export async function getPlanningAttemptStatus(
+  accessToken: string,
+  projectId: string,
+): Promise<PlanningAttemptStatusResponse> {
+  return authorizedJson<PlanningAttemptStatusResponse>(
+    `/api/projects/${projectId}/planning/status`,
+    accessToken,
+  );
 }
 
 export async function generatePlanningProposal(

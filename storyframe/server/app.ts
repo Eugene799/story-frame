@@ -72,6 +72,7 @@ import {
 } from "./planning";
 import {
   PLANNING_ROUTES,
+  type PlanningAttemptStatusResponse,
   type PlanningPayload,
   type PlanningRoute,
   type PlanningStartRequest,
@@ -775,6 +776,14 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       return;
     }
 
+    if (segments.length === 3 && segments[1] === "planning" && segments[2] === "status") {
+      if (method !== "GET") {
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for the planning attempt status.");
+      }
+      await handlePlanningStatus(response, user, projectId);
+      return;
+    }
+
     if (segments.length === 2 && segments[1] === "planning") {
       if (method !== "POST") {
         throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to generate a planning proposal.");
@@ -1104,6 +1113,110 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     throw new HttpError(404, "NOT_FOUND", "Unknown endpoint.");
   }
 
+  function planningAttemptIsStale(createdAt: string): boolean {
+    const startedAtMs = Date.parse(createdAt);
+    return !Number.isFinite(startedAtMs) || now() - startedAtMs >= config.abandonAfterMs;
+  }
+
+  /** Preflight result for this project; the project lookup proves ownership first. */
+  async function handlePlanningStatus(
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+  ): Promise<void> {
+    await requireProjects().get(user.id, projectId);
+    let pending;
+    try {
+      pending = await requireLedger().findPendingProjectAttempt(user.id, projectId);
+    } catch (error) {
+      if (error instanceof UsageLedgerError) {
+        throw new HttpError(503, "LEDGER_UNAVAILABLE", "The usage ledger is temporarily unavailable.");
+      }
+      throw error;
+    }
+    const live = pending && !planningAttemptIsStale(pending.createdAt) ? pending : null;
+    const body: PlanningAttemptStatusResponse = {
+      ok: true,
+      inFlight: live !== null,
+      idempotencyKey: live?.idempotencyKey ?? null,
+      startedAt: live?.createdAt ?? null,
+      abandonAfterMs: config.abandonAfterMs,
+    };
+    sendJson(response, 200, body);
+  }
+
+  /**
+   * Blocks a different key while this project has a live pending attempt. A
+   * stale row is settled first so the partial unique index cannot deadlock a
+   * project after a crashed process. The unique index still decides any race.
+   */
+  async function assertNoOtherProjectAttempt(
+    ledger: UsageLedger,
+    userId: string,
+    projectId: string,
+    idempotencyKey: string,
+  ): Promise<void> {
+    let pending;
+    try {
+      pending = await ledger.findPendingProjectAttempt(userId, projectId);
+    } catch (error) {
+      if (error instanceof UsageLedgerError) {
+        throw new HttpError(503, "LEDGER_UNAVAILABLE", "The usage ledger is temporarily unavailable.");
+      }
+      throw error;
+    }
+    if (!pending || pending.idempotencyKey === idempotencyKey) return;
+    if (!planningAttemptIsStale(pending.createdAt)) {
+      throw new HttpError(
+        409,
+        "PLANNING_ATTEMPT_IN_FLIGHT",
+        "Another planning attempt for this project is already in progress. Wait for it to finish or for its lease to expire.",
+      );
+    }
+
+    const body = failure("REQUEST_ABANDONED", ABANDONED_MESSAGE);
+    try {
+      await ledger.abandon({
+        id: pending.id,
+        userId,
+        startedBefore: new Date(now() - config.abandonAfterMs).toISOString(),
+        completion: {
+          status: "error",
+          returnedModel: null,
+          promptEvalCount: null,
+          evalCount: null,
+          latencyMs: 0,
+          errorCode: "REQUEST_ABANDONED",
+          upstreamStatus: null,
+          responseStatus: 409,
+          responseBody: body,
+        },
+      });
+    } catch (error) {
+      if (error instanceof UsageLedgerError) {
+        throw new HttpError(503, "LEDGER_UNAVAILABLE", "The usage ledger is temporarily unavailable.");
+      }
+      throw error;
+    }
+
+    let reread;
+    try {
+      reread = await ledger.findPendingProjectAttempt(userId, projectId);
+    } catch (error) {
+      if (error instanceof UsageLedgerError) {
+        throw new HttpError(503, "LEDGER_UNAVAILABLE", "The usage ledger is temporarily unavailable.");
+      }
+      throw error;
+    }
+    if (reread && reread.idempotencyKey !== idempotencyKey && !planningAttemptIsStale(reread.createdAt)) {
+      throw new HttpError(
+        409,
+        "PLANNING_ATTEMPT_IN_FLIGHT",
+        "Another planning attempt for this project is already in progress. Wait for it to finish or for its lease to expire.",
+      );
+    }
+  }
+
   async function handlePlanning(
     request: IncomingMessage,
     response: ServerResponse,
@@ -1169,6 +1282,8 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     // documents, and a replayed proposal must never cross that boundary.
     const requestHash = hashRequest(`${start.route}:${route.requestId}:${projectId}`, prompt);
 
+    await assertNoOtherProjectAttempt(usageLedger, user.id, projectId, idempotencyKey);
+
     beginProviderRequest(user.id);
     try {
       let reservation: ReservationResult;
@@ -1179,6 +1294,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
           requestHash,
           modelId: route.modelId ?? "unknown",
           configuredModel: route.requestId,
+          projectId,
         });
       } catch (error) {
         if (error instanceof UsageLedgerError) {
@@ -1201,6 +1317,13 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
           throw error;
         }
         return;
+      }
+      if (reservation.state === "project_busy") {
+        throw new HttpError(
+          409,
+          "PLANNING_ATTEMPT_IN_FLIGHT",
+          "Another planning attempt for this project is already in progress. Wait for it to finish or for its lease to expire.",
+        );
       }
 
       const startedAt = now();
@@ -1734,6 +1857,10 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
           throw error;
         }
         return;
+      }
+      if (reservation.state === "project_busy") {
+        // Connection tests carry no project, so this state is unreachable here.
+        throw new HttpError(409, "PLANNING_ATTEMPT_IN_FLIGHT", "A project attempt already holds the ledger.");
       }
 
       async function respondForExisting(initial: ExistingUsage): Promise<void> {

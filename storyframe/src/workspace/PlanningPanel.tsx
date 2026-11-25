@@ -19,6 +19,7 @@ import {
   acceptPlanningProposal,
   deletePlanningProposal,
   generatePlanningProposal,
+  getPlanningAttemptStatus,
   listProjectProposals,
   rejectPlanningProposal,
 } from "../api";
@@ -55,7 +56,11 @@ const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 // A stored key is only useful while its paid attempt can still be replayed.
 const PENDING_TTL_MS = 24 * 60 * 60 * 1000;
 const LOCK_PREFIX = "storyframe.planning.lock.";
-const LOCK_TTL_MS = 150_000;
+// Matches the server's default abandon window; the preflight returns the
+// configured value and every new lease uses it.
+const DEFAULT_LEASE_MS = 90_000;
+const REMOTE_ATTEMPT_NOTICE =
+  "Another device is already generating a proposal for this project. Wait for it to finish or for its lease to expire.";
 const TAB_ID_KEY = "storyframe.planning.tabId";
 const TAB_CHANNEL = "storyframe.planning.tabPresence";
 const TAB_PROBE_MS = 80;
@@ -243,14 +248,18 @@ function readPlanningLock(projectId: string): PlanningLock | null {
 }
 
 /** A short lease keeps two tabs from paying for the same duplicate attempt. */
-function tryAcquirePlanningLock(projectId: string, tabId: string): boolean {
+function tryAcquirePlanningLock(
+  projectId: string,
+  tabId: string,
+  ttlMs: number = DEFAULT_LEASE_MS,
+): boolean {
   if (typeof window === "undefined") return true;
   const current = readPlanningLock(projectId);
   if (current && current.tabId !== tabId && current.expiresAt > Date.now()) return false;
   try {
     window.localStorage.setItem(
       lockStorageName(projectId),
-      JSON.stringify({ tabId, expiresAt: Date.now() + LOCK_TTL_MS }),
+      JSON.stringify({ tabId, expiresAt: Date.now() + ttlMs }),
     );
     return true;
   } catch {
@@ -461,15 +470,18 @@ export function PlanningPanel({
   // True while this tab holds a lease whose attempt has not settled. It is kept
   // through unknown outcomes so another tab cannot start a duplicate paid call.
   const leaseHeld = useRef(false);
+  const mounted = useRef(true);
   const [attempts, setAttempts] = useState<PlanningAttemptEntry[]>(() => readAttempts(projectId));
   const [otherTabGenerating, setOtherTabGenerating] = useState(false);
+  const [checkingAttempt, setCheckingAttempt] = useState(false);
+  const [remoteAttemptUntil, setRemoteAttemptUntil] = useState<number | null>(null);
   const [leaseSettling, setLeaseSettling] = useState(() => {
     const lock = readPlanningLock(projectId);
     return Boolean(lock && lock.tabId === tabId.current && lock.expiresAt > Date.now());
   });
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
 
-  const busy = generating || acting;
+  const busy = generating || acting || checkingAttempt;
 
   // A different project is a different attempt; never carry a key or history across it.
   useEffect(() => {
@@ -479,6 +491,7 @@ export function PlanningPanel({
     // Retry must rebuild the exact request the stored key was minted for.
     setRoute(pending?.route ?? "angles");
     setInstruction(pending?.instruction ?? "");
+    setRemoteAttemptUntil(null);
     // A reload keeps the tab id and the unsettled key, so it also keeps the
     // lease: unmounting again must not free a possibly-running paid attempt.
     const lock = readPlanningLock(projectId);
@@ -565,6 +578,29 @@ export function PlanningPanel({
     };
   }, [projectId]);
 
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  // A remote attempt blocks this tab only until the server's abandon window
+  // ends; the next Generate re-checks the server anyway.
+  useEffect(() => {
+    if (remoteAttemptUntil === null) return;
+    const remaining = remoteAttemptUntil - Date.now();
+    if (remaining <= 0) {
+      setRemoteAttemptUntil(null);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setRemoteAttemptUntil(null);
+      setNotice((current) => (current === REMOTE_ATTEMPT_NOTICE ? null : current));
+    }, remaining);
+    return () => window.clearTimeout(timer);
+  }, [remoteAttemptUntil]);
+
   function recordAttempt(entry: PlanningAttemptEntry) {
     setAttempts(appendAttempt(projectId, entry));
   }
@@ -608,23 +644,48 @@ export function PlanningPanel({
   }
 
   async function handleGenerate() {
-    if (generating || dirty || otherTabGenerating || leaseSettling) return;
-    if (!tryAcquirePlanningLock(projectId, tabId.current)) {
-      setOtherTabGenerating(true);
-      setNotice("Another tab is already generating a proposal for this project. Wait for it to finish before starting one here.");
-      return;
-    }
-    leaseHeld.current = true;
-    setGenerating(true);
-    setError(null);
-    setNotice(null);
-    const controller = new AbortController();
-    abortRef.current = controller;
+    if (busy || dirty || otherTabGenerating || leaseSettling || remoteAttemptUntil !== null) return;
     const previous = pendingAttempt.current ?? readPendingAttempt(projectId);
     const key =
       previous && isSameRequest(previous, route, instruction, baseVersion)
         ? previous.key
         : newIdempotencyKey();
+    setError(null);
+    setNotice(null);
+    setCheckingAttempt(true);
+    let leaseMs = DEFAULT_LEASE_MS;
+    try {
+      try {
+        const status = await getPlanningAttemptStatus(await getAccessToken(), projectId);
+        leaseMs =
+          Number.isFinite(status.abandonAfterMs) && status.abandonAfterMs > 0
+            ? status.abandonAfterMs
+            : DEFAULT_LEASE_MS;
+        if (status.inFlight && status.idempotencyKey !== key) {
+          const startedAtMs = status.startedAt ? Date.parse(status.startedAt) : NaN;
+          const until = (Number.isFinite(startedAtMs) ? startedAtMs : Date.now()) + leaseMs;
+          setRemoteAttemptUntil(until);
+          setNotice(REMOTE_ATTEMPT_NOTICE);
+          return;
+        }
+        setRemoteAttemptUntil(null);
+      } catch {
+        // The reservation's unique pending row still enforces this server-side.
+      }
+      if (!mounted.current) return;
+      if (!tryAcquirePlanningLock(projectId, tabId.current, leaseMs)) {
+        setOtherTabGenerating(true);
+        setNotice("Another tab is already generating a proposal for this project. Wait for it to finish before starting one here.");
+        return;
+      }
+      leaseHeld.current = true;
+      setGenerating(true);
+    } finally {
+      setCheckingAttempt(false);
+    }
+
+    const controller = new AbortController();
+    abortRef.current = controller;
     // A changed request can never replay the old attempt (the server hashes the
     // exact prompt), so keeping the old key would only produce a 409 reuse.
     pendingAttempt.current = { key, route, instruction, baseVersion, startedAt: Date.now() };
@@ -796,9 +857,9 @@ export function PlanningPanel({
           <button
             type="button"
             onClick={() => void handleGenerate()}
-            disabled={busy || dirty || otherTabGenerating || leaseSettling}
+            disabled={busy || dirty || otherTabGenerating || leaseSettling || remoteAttemptUntil !== null}
           >
-            {generating ? "Generating..." : "Generate proposal"}
+            {checkingAttempt ? "Checking..." : generating ? "Generating..." : "Generate proposal"}
           </button>
           {generating && (
             <button type="button" className="button-secondary" onClick={handleStop}>
@@ -810,7 +871,9 @@ export function PlanningPanel({
               ? "Save or discard the draft first: planning is generated from the saved version."
               : otherTabGenerating
                 ? "Another tab is generating a proposal for this project. Wait for it to finish before starting one here."
-                : leaseSettling
+                : remoteAttemptUntil !== null
+                  ? "Another device is generating a proposal for this project. This tab will unlock when the server's attempt window ends."
+                  : leaseSettling
                   ? "Checking whether this tab owns the project lease before reusing it."
                   : "Each attempt uses one Idempotency-Key; a retry after a lost response replays it instead of calling the provider again."}
           </p>

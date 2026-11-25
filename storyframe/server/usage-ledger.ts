@@ -14,9 +14,7 @@ const COLUMNS = [
   "upstream_status",
   "created_at",
 ].join(",");
-// Probing these columns proves both migrations are applied. `created_at` decides
-// whether a pending reservation may be recovered, and `status` is required to
-// interpret it. PostgREST returns only the selected columns, so every field the
+// PostgREST returns only the selected columns, so every field the reservation
 // mapper reads must be listed here.
 const RESERVATION_COLUMNS = [
   "id",
@@ -27,6 +25,10 @@ const RESERVATION_COLUMNS = [
   "response_body",
   "response_status",
 ].join(",");
+// The readiness probe must also prove all three ai_usage migrations exist.
+// `project_id` belongs to the planning preflight migration, not to the
+// reservation shape, so keep it out of ordinary reservation lookups.
+const READINESS_COLUMNS = `${RESERVATION_COLUMNS},project_id`;
 
 export class UsageLedgerError extends Error {
   constructor(message: string) {
@@ -43,6 +45,14 @@ export interface UsageReservation {
   requestHash: string;
   modelId: string;
   configuredModel: string;
+  /** Set only for project-scoped planning attempts. */
+  projectId?: string | null;
+}
+
+export interface PendingProjectAttempt {
+  id: string;
+  createdAt: string;
+  idempotencyKey: string | null;
 }
 
 export interface ExistingUsage {
@@ -56,7 +66,9 @@ export interface ExistingUsage {
 
 export type ReservationResult =
   | { state: "reserved"; id: string }
-  | { state: "existing"; usage: ExistingUsage };
+  | { state: "existing"; usage: ExistingUsage }
+  /** A different key already holds this project's single pending attempt. */
+  | { state: "project_busy" };
 
 export interface UsageCompletion {
   status: "success" | "error";
@@ -82,6 +94,7 @@ export interface UsageLedger {
   check(): Promise<void>;
   reserve(entry: UsageReservation): Promise<ReservationResult>;
   lookup(userId: string, idempotencyKey: string): Promise<ExistingUsage | null>;
+  findPendingProjectAttempt(userId: string, projectId: string): Promise<PendingProjectAttempt | null>;
   /** Conditionally settles a stale pending reservation. False means it lost a race. */
   abandon(request: AbandonRequest): Promise<boolean>;
   /**
@@ -202,6 +215,54 @@ export function createSupabaseUsageLedger(options: SupabaseUsageLedgerOptions): 
     Authorization: `Bearer ${options.serviceRoleKey}`,
   };
 
+  async function findPendingProjectAttempt(
+    userId: string,
+    projectId: string,
+  ): Promise<PendingProjectAttempt | null> {
+    const query = new URLSearchParams({
+      select: "id,created_at,idempotency_key",
+      user_id: `eq.${userId}`,
+      project_id: `eq.${projectId}`,
+      status: "eq.pending",
+      order: "created_at.desc",
+      limit: "1",
+    });
+
+    let response: Response;
+    try {
+      response = await fetch(`${endpoint}?${query}`, {
+        headers: { ...authHeaders, Accept: "application/json" },
+        signal: AbortSignal.timeout(options.timeoutMs),
+      });
+    } catch {
+      throw new UsageLedgerError("The usage ledger is unreachable.");
+    }
+    if (!response.ok) {
+      throw new UsageLedgerError(`The usage ledger rejected the project lookup (HTTP ${response.status}).`);
+    }
+
+    const payload: unknown = await response.json().catch(() => null);
+    if (!Array.isArray(payload)) {
+      throw new UsageLedgerError("The usage ledger returned an unreadable project attempt.");
+    }
+    const row = payload[0];
+    if (!row || typeof row !== "object") return null;
+    const record = row as Record<string, unknown>;
+    if (
+      typeof record.id !== "string" ||
+      typeof record.created_at !== "string" ||
+      !Number.isFinite(Date.parse(record.created_at)) ||
+      (record.idempotency_key !== null && typeof record.idempotency_key !== "string")
+    ) {
+      throw new UsageLedgerError("The usage ledger returned a malformed project attempt.");
+    }
+    return {
+      id: record.id,
+      createdAt: record.created_at,
+      idempotencyKey: record.idempotency_key,
+    };
+  }
+
   async function findReservation(userId: string, idempotencyKey: string): Promise<ExistingUsage | null> {
     const query = new URLSearchParams({
       select: RESERVATION_COLUMNS,
@@ -233,7 +294,7 @@ export function createSupabaseUsageLedger(options: SupabaseUsageLedgerOptions): 
 
   return {
     async check(): Promise<void> {
-      const query = new URLSearchParams({ select: RESERVATION_COLUMNS, limit: "0" });
+      const query = new URLSearchParams({ select: READINESS_COLUMNS, limit: "0" });
       let response: Response;
       try {
         response = await fetch(`${endpoint}?${query}`, {
@@ -265,6 +326,7 @@ export function createSupabaseUsageLedger(options: SupabaseUsageLedgerOptions): 
             request_hash: entry.requestHash,
             model_id: entry.modelId,
             configured_model: entry.configuredModel,
+            project_id: entry.projectId ?? null,
             latency_ms: 0,
             status: "pending",
           }),
@@ -276,10 +338,11 @@ export function createSupabaseUsageLedger(options: SupabaseUsageLedgerOptions): 
 
       if (response.status === 409) {
         const existing = await findReservation(entry.userId, entry.idempotencyKey);
-        if (!existing) {
-          throw new UsageLedgerError("The usage ledger rejected a duplicate reservation.");
+        if (existing) return { state: "existing", usage: existing };
+        if (entry.projectId && (await findPendingProjectAttempt(entry.userId, entry.projectId))) {
+          return { state: "project_busy" };
         }
-        return { state: "existing", usage: existing };
+        throw new UsageLedgerError("The usage ledger rejected a duplicate reservation.");
       }
       if (!response.ok) {
         throw new UsageLedgerError(`The usage ledger rejected the reservation (HTTP ${response.status}).`);
@@ -297,6 +360,8 @@ export function createSupabaseUsageLedger(options: SupabaseUsageLedgerOptions): 
     lookup(userId: string, idempotencyKey: string): Promise<ExistingUsage | null> {
       return findReservation(userId, idempotencyKey);
     },
+
+    findPendingProjectAttempt,
 
     async abandon(request: AbandonRequest): Promise<boolean> {
       // Conditional on `pending`, on the owner, and on age: exactly one caller

@@ -136,6 +136,15 @@ async function main(): Promise<number> {
 
   const users: TestUser[] = [];
   try {
+    const readinessResponse = await fetch(`${appUrl}/api/ai/status`);
+    const readiness = (await readinessResponse.json().catch(() => null)) as
+      | { ledger?: { ready?: boolean } }
+      | null;
+    check(
+      "hosted ai_usage ledger is ready after the migrations",
+      readinessResponse.status === 200 && readiness?.ledger?.ready === true,
+    );
+
     const a = await createUser("a");
     users.push(a);
     const b = await createUser("b");
@@ -371,6 +380,71 @@ async function main(): Promise<number> {
     check(
       "B project is untouched",
       (await api(b.token, "GET", `/api/projects/${bProjectId}`)).status === 200,
+    );
+
+    const statusAttemptId = randomUUID();
+    const statusKey = `routes-status-${randomUUID()}`;
+    const insertStatus = await fetch(`${base}/rest/v1/ai_usage`, {
+      method: "POST",
+      headers: { ...adminHeaders, Prefer: "return=representation" },
+      body: JSON.stringify({
+        id: statusAttemptId,
+        user_id: b.id,
+        project_id: bProjectId,
+        model_id: "gemma",
+        configured_model: "gemma4:31b",
+        latency_ms: 0,
+        status: "pending",
+        idempotency_key: statusKey,
+        request_hash: "routes-status-hash",
+        created_at: new Date().toISOString(),
+      }),
+    });
+    check("seed B pending planning attempt", insertStatus.status === 201);
+
+    const bPlanningStatus = await api(
+      b.token,
+      "GET",
+      `/api/projects/${bProjectId}/planning/status`,
+    );
+    check(
+      "B planning status reports its live attempt",
+      bPlanningStatus.status === 200 &&
+        bPlanningStatus.body?.inFlight === true &&
+        bPlanningStatus.body?.idempotencyKey === statusKey &&
+        typeof bPlanningStatus.body?.startedAt === "string" &&
+        typeof bPlanningStatus.body?.abandonAfterMs === "number" &&
+        bPlanningStatus.body.abandonAfterMs > 0,
+    );
+    check(
+      "A cannot preflight B project",
+      (await api(a.token, "GET", `/api/projects/${bProjectId}/planning/status`)).status === 404,
+    );
+
+    const settleStatus = await fetch(
+      `${base}/rest/v1/ai_usage?id=eq.${statusAttemptId}&status=eq.pending`,
+      {
+        method: "PATCH",
+        headers: { ...adminHeaders, Prefer: "return=representation" },
+        body: JSON.stringify({
+          status: "success",
+          latency_ms: 1,
+          response_status: 200,
+          response_body: { ok: true },
+        }),
+      },
+    );
+    check("settle B planning attempt", settleStatus.status === 200);
+    const settledPlanningStatus = await api(
+      b.token,
+      "GET",
+      `/api/projects/${bProjectId}/planning/status`,
+    );
+    check(
+      "B planning status clears after settlement",
+      settledPlanningStatus.status === 200 &&
+        settledPlanningStatus.body?.inFlight === false &&
+        settledPlanningStatus.body?.idempotencyKey === null,
     );
 
     const pendingId = randomUUID();

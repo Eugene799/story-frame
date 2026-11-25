@@ -4,7 +4,7 @@ import type { AiStatusResponse } from "../shared/ai-contract";
 import type { GenerationProposalRecord } from "../shared/child-contract";
 import type { PlanningPayload } from "../shared/planning-contract";
 import type { ProjectDocumentV2, ProjectRecord } from "../shared/project-contract";
-import { USER_A, USER_B } from "./fake-supabase";
+import { USER_A, USER_B, pendingUsageRow } from "./fake-supabase";
 import { documentFixture, sceneFixture } from "./project-fixture";
 import { apiRequest, startTestServer, type TestApp } from "./server-helpers";
 
@@ -79,6 +79,10 @@ function generate(
     },
     token,
   );
+}
+
+function planningStatus(appUrl: string, projectId: string, token: string = USER_A.token) {
+  return apiRequest(appUrl, `/api/projects/${projectId}/planning/status`, {}, token);
 }
 
 function accept(appUrl: string, projectId: string, proposalId: string, token: string = USER_A.token) {
@@ -644,6 +648,91 @@ describe("Phase 5 planning", () => {
       const response = await generate(app.url, projectId, { route: "transcript-analysis", baseVersion: 1 });
       expect(response.status).toBe(422);
       expect(app.supabase.proposals).toHaveLength(0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("preflights an owner-scoped in-flight attempt and blocks another key", async () => {
+    const provider = stubProvider([scriptReply("Should not run.")]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url);
+      const pendingKey = "other-device-key-12345678";
+      app.supabase.usage.push(
+        pendingUsageRow({
+          userId: USER_A.id,
+          projectId,
+          idempotencyKey: pendingKey,
+          requestHash: "pending-request-hash",
+          createdAt: new Date().toISOString(),
+        }),
+      );
+
+      const status = await planningStatus(app.url, projectId);
+      expect(status.status).toBe(200);
+      expect(await status.json()).toMatchObject({
+        ok: true,
+        inFlight: true,
+        idempotencyKey: pendingKey,
+        abandonAfterMs: 90_000,
+      });
+
+      const foreignStatus = await planningStatus(app.url, projectId, USER_B.token);
+      expect(foreignStatus.status).toBe(404);
+
+      const blocked = await generate(
+        app.url,
+        projectId,
+        { route: "script", baseVersion: 1 },
+        USER_A.token,
+        "new-device-key-12345678",
+      );
+      expect(blocked.status).toBe(409);
+      expect(await blocked.json()).toMatchObject({
+        ok: false,
+        error: { code: "PLANNING_ATTEMPT_IN_FLIGHT" },
+      });
+      expect(provider.calls).toHaveLength(0);
+      expect(app.supabase.usage).toHaveLength(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("settles a stale project attempt before reserving a new key", async () => {
+    const provider = stubProvider([scriptReply("After the stale attempt.")]);
+    const app = await startTestServer({ fetchImpl: provider.impl });
+    try {
+      const projectId = await createProject(app.url);
+      const staleKey = "stale-device-key-12345678";
+      app.supabase.usage.push(
+        pendingUsageRow({
+          userId: USER_A.id,
+          projectId,
+          idempotencyKey: staleKey,
+          requestHash: "stale-request-hash",
+          createdAt: new Date(Date.now() - 120_000).toISOString(),
+        }),
+      );
+
+      const status = await planningStatus(app.url, projectId);
+      expect(await status.json()).toMatchObject({ inFlight: false, idempotencyKey: null });
+
+      const response = await generate(
+        app.url,
+        projectId,
+        { route: "script", baseVersion: 1 },
+        USER_A.token,
+        "fresh-device-key-12345678",
+      );
+      expect(response.status).toBe(201);
+      expect(provider.calls).toHaveLength(1);
+
+      const stale = app.supabase.usage.find((row) => row.idempotency_key === staleKey);
+      expect(stale).toMatchObject({ status: "error", error_code: "REQUEST_ABANDONED" });
+      const fresh = app.supabase.usage.find((row) => row.idempotency_key === "fresh-device-key-12345678");
+      expect(fresh).toMatchObject({ status: "success", project_id: projectId });
     } finally {
       await app.close();
     }

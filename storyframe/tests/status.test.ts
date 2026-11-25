@@ -74,6 +74,16 @@ describe("GET /api/ai/status", () => {
     }
   });
 
+  it("is not ready when ai_usage lacks the planning preflight column", async () => {
+    const app = await startTestServer({ supabase: { missingProjectIdColumn: true } });
+    try {
+      const status = (await (await fetch(`${app.url}/api/ai/status`)).json()) as AiStatusResponse;
+      expect(status.ledger).toMatchObject({ configured: true, ready: false, table: "ai_usage" });
+    } finally {
+      await app.close();
+    }
+  });
+
   it("reports a fully unconfigured server without leaking secrets", async () => {
     const app = await startTestServer({
       env: {

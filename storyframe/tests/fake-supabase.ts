@@ -26,6 +26,7 @@ export const EXPIRED_TOKEN = "test-session-expired";
 export interface FakeUsageRow {
   id: string;
   user_id: string;
+  project_id: string | null;
   model_id: string;
   configured_model: string;
   returned_model: string | null;
@@ -100,6 +101,8 @@ export interface FakeSupabaseOptions {
   failWrites?: number;
   /** Make conditional updates match no rows, to exercise a lost takeover race. */
   loseConditionalUpdate?: boolean;
+  /** Simulate the schema before the planning preflight migration. */
+  missingProjectIdColumn?: boolean;
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
@@ -223,10 +226,20 @@ export async function startFakeSupabase(
             sendJson(response, 409, { code: "23505", message: "duplicate idempotency key" });
             return;
           }
+          const projectId = typeof body.project_id === "string" ? body.project_id : null;
+          if (
+            projectId &&
+            body.status === "pending" &&
+            usage.some((row) => row.project_id === projectId && row.status === "pending")
+          ) {
+            sendJson(response, 409, { code: "23505", message: "one pending attempt per project" });
+            return;
+          }
 
           const row: FakeUsageRow = {
             id: randomUUID(),
             user_id: userId,
+            project_id: projectId,
             model_id: String(body.model_id),
             configured_model: String(body.configured_model),
             returned_model: null,
@@ -305,6 +318,16 @@ export async function startFakeSupabase(
             sendJson(response, 500, { message: "simulated ledger read failure" });
             return;
           }
+          if (
+            options.missingProjectIdColumn &&
+            url.searchParams.get("select")?.split(",").map((column) => column.trim()).includes("project_id")
+          ) {
+            sendJson(response, 400, {
+              code: "42703",
+              message: "column ai_usage.project_id does not exist",
+            });
+            return;
+          }
           let rows = usage;
 
           const userId = eqFilter(url.searchParams.get("user_id"));
@@ -314,6 +337,9 @@ export async function startFakeSupabase(
           if (idempotencyKey) {
             rows = rows.filter((row) => row.idempotency_key === idempotencyKey);
           }
+
+          const projectId = eqFilter(url.searchParams.get("project_id"));
+          if (projectId) rows = rows.filter((row) => row.project_id === projectId);
 
           const statusFilter = url.searchParams.get("status");
           if (statusFilter?.startsWith("eq.")) {
@@ -751,10 +777,12 @@ export function pendingUsageRow(input: {
   createdAt: string;
   modelId?: string;
   configuredModel?: string;
+  projectId?: string | null;
 }): FakeUsageRow {
   return {
     id: randomUUID(),
     user_id: input.userId,
+    project_id: input.projectId ?? null,
     model_id: input.modelId ?? "gemma",
     configured_model: input.configuredModel ?? "gemma4:31b",
     returned_model: null,

@@ -100,6 +100,15 @@ function installBackend() {
     if (path === `/api/projects/${PROJECT_ID}/proposals` && method === "GET") {
       return jsonResponse({ ok: true, proposals: [] });
     }
+    if (path === `/api/projects/${PROJECT_ID}/planning/status` && method === "GET") {
+      return jsonResponse({
+        ok: true,
+        inFlight: false,
+        idempotencyKey: null,
+        startedAt: null,
+        abandonAfterMs: 90_000,
+      });
+    }
     if (path === `/api/projects/${PROJECT_ID}/planning` && method === "POST") {
       return jsonResponse({ ok: true, proposal: proposalFixture() }, 201);
     }
@@ -579,6 +588,145 @@ describe("PlanningPanel", () => {
       expect((screen.getByRole("button", { name: "Generate proposal" }) as HTMLButtonElement).disabled).toBe(true),
     );
     expect(screen.getByText(/Another tab is generating a proposal/)).toBeTruthy();
+  });
+
+  it("blocks generation when the server reports another device's live attempt", async () => {
+    let planningCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input), "http://localhost").pathname;
+        if (path.endsWith("/proposals")) return jsonResponse({ ok: true, proposals: [] });
+        if (path.endsWith("/planning/status")) {
+          return jsonResponse({
+            ok: true,
+            inFlight: true,
+            idempotencyKey: "other-device-key-12345678",
+            startedAt: new Date().toISOString(),
+            abandonAfterMs: 60_000,
+          });
+        }
+        if (path.endsWith("/planning") && init?.method === "POST") {
+          planningCalls += 1;
+          return jsonResponse({ ok: true, proposal: proposalFixture() }, 201);
+        }
+        return jsonResponse({ ok: false, error: { code: "NOT_FOUND", message: "not found" } }, 404);
+      }),
+    );
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText(/Another device is already generating/)).toBeTruthy();
+    expect(planningCalls).toBe(0);
+    expect(storedLease()).toBeNull();
+    expect((screen.getByRole("button", { name: "Generate proposal" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("sizes a new lease from the server abandon window", async () => {
+    const before = Date.now();
+    let leaseAtRequest: ReturnType<typeof storedLease> = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input), "http://localhost").pathname;
+        if (path.endsWith("/proposals")) return jsonResponse({ ok: true, proposals: [] });
+        if (path.endsWith("/planning/status")) {
+          return jsonResponse({
+            ok: true,
+            inFlight: false,
+            idempotencyKey: null,
+            startedAt: null,
+            abandonAfterMs: 120_000,
+          });
+        }
+        if (path.endsWith("/planning") && init?.method !== "GET") {
+          leaseAtRequest = storedLease();
+          return jsonResponse({ ok: true, proposal: proposalFixture() }, 201);
+        }
+        return jsonResponse({ ok: false, error: { code: "NOT_FOUND", message: "not found" } }, 404);
+      }),
+    );
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText("Accept and save")).toBeTruthy();
+    expect(leaseAtRequest).not.toBeNull();
+    expect(leaseAtRequest!.expiresAt - before).toBeGreaterThan(115_000);
+    expect(leaseAtRequest!.expiresAt - before).toBeLessThan(125_000);
+  });
+
+  it("lets the same key reported by preflight retry its own attempt", async () => {
+    const storedKey = "same-device-key-12345678";
+    window.sessionStorage.setItem(
+      `storyframe.planning.pendingKey.${PROJECT_ID}`,
+      JSON.stringify({
+        key: storedKey,
+        route: "script",
+        instruction: "Keep it tight.",
+        baseVersion: 1,
+        startedAt: Date.now(),
+      }),
+    );
+    let sentKey: string | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input), "http://localhost").pathname;
+        if (path.endsWith("/proposals")) return jsonResponse({ ok: true, proposals: [] });
+        if (path.endsWith("/planning/status")) {
+          return jsonResponse({
+            ok: true,
+            inFlight: true,
+            idempotencyKey: storedKey,
+            startedAt: new Date().toISOString(),
+            abandonAfterMs: 90_000,
+          });
+        }
+        if (path.endsWith("/planning") && init?.method !== "GET") {
+          sentKey = new Headers(init?.headers).get("Idempotency-Key");
+          return jsonResponse({ ok: true, proposal: proposalFixture() }, 201);
+        }
+        return jsonResponse({ ok: false, error: { code: "NOT_FOUND", message: "not found" } }, 404);
+      }),
+    );
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Generate proposal" }) as HTMLButtonElement).disabled).toBe(false),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText("Accept and save")).toBeTruthy();
+    expect(sentKey).toBe(storedKey);
   });
 
   it("does not let a duplicated tab inherit the lease", async () => {

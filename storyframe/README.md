@@ -59,7 +59,7 @@ npm run dev
 - API: `http://127.0.0.1:8787`
 - Web: `http://localhost:3000` (Vite proxies `/api` to the API)
 
-Before using the ledger or any project route, apply the seven migrations in order. See
+Before using the ledger or any project route, apply the eight migrations in order. See
 [Applying the migrations](#applying-the-migrations) for the compatibility check that must pass
 first and the current state of the configured project.
 
@@ -97,6 +97,7 @@ these tables. Apply them in filename order:
 5. `20261124150000_create_profiles.sql`
 6. `20261124160000_create_media_storage.sql` (Phase 3: upload timestamps, `media_references`)
 7. `20261125120000_create_planning.sql` (Phase 5: source excerpts, claim quotes, proposal route/base version, `model_health`)
+8. `20261125140000_add_planning_attempt_preflight.sql` (Phase 5: `ai_usage.project_id` and one pending attempt per project)
 
 Run the compatibility check first. It must return no rows:
 
@@ -128,8 +129,12 @@ Afterwards, check the running server rather than assuming the schema is ready:
 3. Set `SMOKE_SUPABASE_ACCESS_TOKEN` to a session token and run `npm run smoke:live` (five
    billable calls, described under Tests).
 
-**All seven migrations are applied to the configured project (`myrohtkfsuppcabedwmn`), the sixth on 2026-11-24 and the
-seventh (Phase 5) on 2026-11-25.** After applying the seventh, direct REST probes for `sources.excerpt`,
+**All eight migrations are applied to the configured project (`myrohtkfsuppcabedwmn`), the sixth on 2026-11-24 and the
+seventh and eighth (Phase 5) on 2026-11-25.** After applying the eighth, a PostgREST probe selecting
+`ai_usage.project_id` returned `200`, `pg_indexes` reported `ai_usage_one_pending_project_idx` as a partial unique
+index on `(project_id)` where `status = 'pending'`, `GET /api/ai/status` reported `ledger.ready: true`, and
+`verify:live-routes` passed **51/51** checks including the owner-scoped planning-status route. After applying the seventh,
+direct REST probes for `sources.excerpt`,
 `generation_proposals.route`/`base_version`, `claims.supporting_quote`, and `model_health.model_id` all returned
 `200`. After
 applying it, the hosted catalog was checked directly: `media_metadata` has the four added columns, `media_references`
@@ -205,9 +210,10 @@ production account-management UI.
 ### `GET /api/ai/status`
 
 Safe configuration data: provider key presence, Supabase auth presence, ledger configuration and **readiness**, fixed
-upstream, catalog check date, bounds, and the allowlisted models. Readiness probes the columns added by both `ai_usage`
-migrations, so a configured but unmigrated project reports `ledger.ready: false`. No keys or session tokens are
-returned.
+upstream, catalog check date, bounds, and the allowlisted models. Readiness probes the columns added by all three
+`ai_usage` migrations, including `project_id`, so a configured but unmigrated project reports `ledger.ready: false`.
+`tests/status.test.ts` simulates the schema before the planning-preflight migration and asserts that readiness is
+false. No keys or session tokens are returned.
 
 ### `POST /api/ai/test`
 
@@ -362,7 +368,8 @@ of those policies, so no table can drift from the pattern. Six of them are reach
 | `GET`/`POST /api/projects/:id/proposals` | List generation proposals, or record a frozen proposal. |
 | `PATCH /api/projects/:id/proposals/:proposalId` | Accept or reject a hand-recorded proposal. |
 | `DELETE /api/projects/:id/proposals/:proposalId` | Delete a pending or rejected proposal (`200`); an accepted proposal is immutable (`409 PROPOSAL_ACCEPTED`). |
-| `POST /api/projects/:id/planning` | Ask one configured model for a validated planning proposal (`201`); requires `Idempotency-Key`, one ledger row per attempt, and a retry with the same key replays the stored response; stored against the given base version and never applied. |
+| `GET /api/projects/:id/planning/status` | Owner-scoped preflight: the project's live pending attempt key and start time, plus `abandonAfterMs` for sizing the browser lease. |
+| `POST /api/projects/:id/planning` | Ask one configured model for a validated planning proposal (`201`); requires `Idempotency-Key`, one ledger row per attempt, and a retry with the same key replays the stored response; a different key while this project has a live attempt is `409 PLANNING_ATTEMPT_IN_FLIGHT`; stored against the given base version and never applied. |
 | `POST /api/projects/:id/proposals/:proposalId/accept` | Apply a pending planning proposal, respecting locks, and save one new project version (`200`); stale proposals are `409`. |
 | `GET`/`POST /api/projects/:id/jobs` | List provider jobs, or queue one. |
 | `PATCH /api/projects/:id/jobs/:jobId` | Move a job's status and record its result. |
@@ -526,7 +533,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 202/202; `verify:sql` 77/77; `verify:live-routes` exit 0; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 208/208; `verify:sql` 81/81; `verify:live-routes` 51/51; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -608,10 +615,21 @@ different route, instruction, or document returns `409 IDEMPOTENCY_KEY_REUSED`; 
 IDEMPOTENCY_IN_PROGRESS`; an attempt older than `AI_ABANDON_AFTER_MS` is settled as `REQUEST_ABANDONED` without calling
 the provider. The key is scoped to the verified account and the project: the same key from another account, or in
 another project with an identical document, is a separate attempt and can never read the first attempt's response.
+The ledger row records `project_id`, and a partial unique index allows only one `pending` attempt per project, so two
+near-simultaneous reservations cannot both start a paid call.
+
+**One attempt per project, across devices.** Before a new paid call, `GET /api/projects/:id/planning/status` reports the
+project's live pending attempt for the verified owner. A live attempt with a different key blocks generation with `409
+PLANNING_ATTEMPT_IN_FLIGHT`; the same key is allowed so Retry can replay its own attempt. An attempt older than the
+configured abandon window is settled as `REQUEST_ABANDONED` first, exactly like same-key recovery. The browser also
+calls this preflight before acquiring its local lease, so a stale tab on another device, or a browser without
+BroadcastChannel, is blocked by the server instead of only by `localStorage`. The response's `abandonAfterMs` sizes
+the new local lease, matching the server window (90 seconds by default).
+
 The browser keeps an unsettled key in `sessionStorage` for at most 24 hours, and a per-project `localStorage` lease
 stops a second tab from starting a duplicate attempt while the first is waiting. The lease is released when an attempt
-settles (success or a recorded refusal) and retained until its 150-second expiry when the outcome is unknown: Stop
-waiting, unmount, a network failure, or `IDEMPOTENCY_IN_PROGRESS`/`LEDGER_UNAVAILABLE`. The tab id lives in
+settles (success or a recorded refusal) and retained until the server's abandon window ends when the outcome is unknown:
+Stop waiting, unmount, a network failure, or `IDEMPOTENCY_IN_PROGRESS`/`LEDGER_UNAVAILABLE`. The tab id lives in
 `sessionStorage`, so a reload recognizes its own retained lease instead of locking itself out, and the pending route and
 instruction are restored so Retry rebuilds the same request and reuses the key. Because a duplicated tab copies
 `sessionStorage`, a mounted panel probes a BroadcastChannel for a live page using the same tab id; if one answers, the
@@ -636,12 +654,14 @@ so it writes no ledger row and does not consume the key.
 | Planning is owner-scoped | **PASS** | Another account gets `404` on generate and on accept, and the provider is not called |
 | Planning calls are metered and replayable | **PASS** | Generating stores one `ai_usage` row (`model_id: gemma`, `configured_model: gemma4:31b`, `response_status: 201`) and a retry with the same key returns the same proposal id after exactly one provider call and one proposal row |
 | Key reuse and account scoping | **PASS** | The same key with a different instruction is `409 IDEMPOTENCY_KEY_REUSED` with no second call; the same key from another account is a separate attempt, and each account replays only its own proposal |
+| One live attempt per project, across devices | **PASS** | `tests/planning.test.ts`: the status preflight reports another device's pending key and start time, another account gets `404`, a new key is `409 PLANNING_ATTEMPT_IN_FLIGHT` with zero provider calls, and a stale pending row is settled before the new key is reserved. `verify:sql` proves the partial unique index rejects a second pending row for the project while another project can reserve one |
+| Browser lease matches the server abandon window | **PASS** | `tests/planning-panel.test.tsx`: a server `abandonAfterMs` of 120 seconds produces a lease about 120 seconds out, a remote pending attempt disables Generate and makes no `/planning` call, and the same key reported by preflight is allowed so Retry can replay |
 | Refused replies are recorded and replayed | **PASS** | Invalid twice stores an `ai_usage` error row (`PLANNING_INVALID_JSON`, `422`), and a retry with that key replays the `422` without another provider call |
 | Planning without a key is refused | **PASS** | A request with no `Idempotency-Key` is `400 IDEMPOTENCY_KEY_REQUIRED` before the provider or the ledger is touched |
 | Evidence can be supplied in-app | **PASS** | `tests/sources-panel.test.tsx`: add a source with kind, title, URL, and excerpt, see it listed, flag an excerpt-less source as unusable evidence, require a title, and delete; the Sources tab is wired into the editor and reads the existing owner-scoped routes |
 | Source text is treated as data | **PASS** | `tests/planning-prompt.test.ts` places an excerpt inside `<<<SOURCE ... SOURCE>>>` and asserts the prompt calls it untrusted data that must not be followed as instructions |
 | Route instructions match the validator | **PASS** | `tests/planning-prompt.test.ts` (6 tests) asserts every route names its exact root keys, counts, scene/clip fields, and duration bounds under "only these keys", keeps factual claims available to script/ad-concept/transcript-analysis, and withholds them from angles/storyboard; the tightened `angles` instruction then passed a live call with no repair |
-| Hosted schema and live routes | **PASS** | Migration 7 is applied to the hosted project (2026-11-25); probes for every new column and `model_health` return `200`; `verify:live-routes` passes against it |
+| Hosted schema and live routes | **PASS** | Migrations 7 and 8 are applied to the hosted project (2026-11-25); probes for every new column, `model_health`, and `ai_usage.project_id` return `200`, and the partial unique pending-attempt index is present. `verify:live-routes` passes 51/51, including `ledger.ready: true` and the owner-scoped planning-status route reporting a seeded pending attempt then clearing after settlement |
 | One real hosted planning call | **PASS** | 2026-11-25, first call before tightening: `angles` → `gemma4:31b`, `201`, 3 angles, but `repairAttempted=true` (ledger tokens 715/514, latency 2311 ms). After tightening, a second call with no caller instruction: `201` in 1932 ms, `repairAttempted=false`, 3 angles; ledger `success`/`201`, tokens 301/266, latency 1144 ms, stored proposal id; same-key replay `201` in 493 ms with the same proposal and still one ledger row; proposal, project, ledger row, profile, and user deleted, cleanup read back zero rows |
 | Plan tab behavior | **PASS (DOM)** | `tests/planning-panel.test.tsx`: list, generate, review, and accept through the panel, with nothing applied before acceptance and both actions disabled while the draft is dirty; Stop waiting aborts the browser request while keeping the key and recording a `stopped` attempt; expired keys are replaced; a second tab's lease disables generation, while an expired lease and a duplicated tab that inherits the lease are handled; a reload restores the pending route and instruction and replays the same key. `tests/workspace.test.tsx` drives the real Workspace from the Plan tab through generate, a full remount that replays the `sessionStorage` key, and accept; the provider is stubbed, so it spends nothing. Not exercised in a real browser in this environment |
 | Pending proposals have a lifecycle | **PASS** | `tests/planning.test.ts`: a pending proposal deletes `200` and disappears from the list; an accepted proposal refuses deletion with `409 PROPOSAL_ACCEPTED` and stays stored. `tests/planning-panel.test.tsx`: Delete proposal → Confirm delete removes it without changing the project |
@@ -716,7 +736,7 @@ select-own policy on each, the revision trigger, no `auth.users` trigger, and `/
 including two-user isolation), and `smoke:live` exited 0 with 5/5 model families and an identical
 stored replay. The test users and rows were deleted; the project is empty again.
 
-`npm run verify:sql` applies all seven migrations to a real PostgreSQL engine (PGlite, PostgreSQL compiled to
+`npm run verify:sql` applies all eight migrations to a real PostgreSQL engine (PGlite, PostgreSQL compiled to
 WebAssembly) with Supabase-like `anon`, `authenticated`, and `service_role` roles plus an `auth.uid()` stub, then
 asserts what the server relies on: the revision trigger, owner-only reads on every table, refused browser writes, the
 conditional version update, constraint and foreign-key rejections, and the cascades from both `projects` and
@@ -889,16 +909,18 @@ the document-delete guard and project-deletion object cleanup.
 - Email/password sign-in only; there is no sign-up, password-reset, MFA, OAuth, or account-management UI. The
   Supabase client persists session tokens in browser `localStorage`; production needs an explicit session-storage and
   CSP review. Sign-out is local to this browser and does not revoke the account's other sessions.
-- All seven migrations and RLS policies are applied to the configured Supabase project (Phase 5 on 2026-11-25). The
+- All eight migrations and RLS policies are applied to the configured Supabase project (Phase 5 on 2026-11-25). The
   hosted catalog was checked (11
-  tables, RLS, policies, grants, revision trigger), live profile/project/child routes and two-user isolation passed
-  39/39 checks on the hardening commit, and the disposable users were deleted afterwards. Rerun these checks with
+  tables, RLS, policies, grants, revision trigger), and live profile/project/child routes, two-user isolation, ledger
+  readiness, and the planning-status route passed
+  51/51 checks after the preflight migration; the disposable users were deleted afterwards. Rerun these checks with
   `npm run verify:live-routes`. `smoke:live` exposed a live-only missing-column
   bug; after the fix a clean five-call run exited 0 with 5/5 families and an identical stored replay.
-- Pending reservations are recovered only lazily, when a retry with the same key arrives after `AI_ABANDON_AFTER_MS`.
-  There is no background sweeper, so a key nobody retries stays `pending`, and the original attempt's outcome is never
-  learned: the row becomes a terminal `error` with `REQUEST_ABANDONED`, no token counts, and zero latency. Recovery
-  never calls the provider, so it cannot bill twice, but it cannot tell you whether the original attempt was charged.
+- Pending reservations are recovered lazily, when a retry with the same key arrives after `AI_ABANDON_AFTER_MS` or a
+  preflight for the project sees a stale row. There is no background sweeper, so a project nobody retries stays
+  `pending` until its next attempt or status check, and the original attempt's outcome is never learned: the row
+  becomes a terminal `error` with `REQUEST_ABANDONED`, no token counts, and zero latency. Recovery never calls the
+  provider, so it cannot bill twice, but it cannot tell you whether the original attempt was charged.
 - A reply whose completion could not be recorded after the retry is delivered but not persisted: the ledger holds no
   usage row for it, and retrying that key later can only end as `REQUEST_ABANDONED`, because the reply exists nowhere
   the server can read.
@@ -925,11 +947,14 @@ the document-delete guard and project-deletion object cleanup.
   timestamps and error codes are best-effort evidence, not an audit log. Cost rates stay `unpriced` until Phase 14.
 - Sources can be added and deleted in the editor but not edited in place. Deleting a source now removes the claims that
   cite it before the source row; the UI says so, and no supported claim is left pointing at missing evidence.
-- Multi-tab protection is a best-effort `localStorage` lease, not a server-side lock: a near-simultaneous read in two
-  tabs can still race, but any normal second click is refused while the lease is live. An unknown outcome keeps the
-  lease until expiry, so the original tab must wait (or retry safely with its stored key) rather than freeing it early.
-  Clone detection needs BroadcastChannel and a live original page; without either, the stored id is inherited and only
-  the lease/race guards apply. Attempt history is per-browser.
+- Cross-device protection is authoritative for normal attempts but not a distributed transaction: the preflight and
+  the partial unique index refuse a second live attempt for a project, including when BroadcastChannel is unavailable
+  or the stale tab is on another device. Two reservations that race can both pass the preflight, but only one inserts;
+  the other receives `409 PLANNING_ATTEMPT_IN_FLIGHT` before calling the provider. The `localStorage` lease remains a
+  browser-local fast path. An unknown outcome keeps the lease until the server window ends, so the original tab must
+  wait (or retry safely with its stored key) rather than freeing it early. Clone detection needs BroadcastChannel and a
+  live original page; without either, the stored id is inherited and the server preflight still guards the attempt.
+  Attempt history is per-browser.
 - Planning is verified against the local fake and `verify:sql`, and migration 7 is applied to the hosted project. Real
   hosted `angles` calls and same-key replays were verified on 2026-11-25; the call after tightening needed no repair
   (see Phase 5 verification). The Plan tab has not been exercised in a real browser in this environment.

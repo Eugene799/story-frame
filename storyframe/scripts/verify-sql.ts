@@ -20,6 +20,7 @@ const MIGRATIONS = [
   "20261124150000_create_profiles.sql",
   "20261124160000_create_media_storage.sql",
   "20261125120000_create_planning.sql",
+  "20261125140000_add_planning_attempt_preflight.sql",
 ];
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "supabase", "migrations");
 
@@ -27,6 +28,7 @@ const USER_A = "11111111-1111-4111-8111-111111111111";
 const USER_B = "22222222-2222-4222-8222-222222222222";
 const PROJECT_A = "44444444-4444-4444-8444-444444444444";
 const PROJECT_B = "55555555-5555-4555-8555-555555555555";
+const PROJECT_C = "66666666-6666-4666-8666-666666666666";
 
 const DOCUMENT = {
   schemaVersion: 1,
@@ -300,6 +302,39 @@ check("generation_proposals: a base version below 1 is rejected (23514)",
   (await errorCode(() => as("service_role", null,
     `insert into public.generation_proposals (project_id, owner_id, model_id, prompt, proposal, base_version)
      values ($1, $2, 'gemma4:31b', 'x', '{}'::jsonb, 0)`, [PROJECT_A, USER_A]))) === "23514");
+
+// 8d. Phase 5: a project can have at most one pending planning reservation.
+await as("service_role", null,
+  `insert into public.projects (id, owner_id, project_type, title, schema_version, document)
+   values ($1, $2, 'story', 'Second Project', 1, $3::jsonb)`,
+  [PROJECT_C, USER_B, JSON.stringify(DOCUMENT)]);
+const pendingAttempt = await as<{ id: string }>("service_role", null,
+  `insert into public.ai_usage
+     (user_id, model_id, configured_model, latency_ms, status, project_id)
+   values ($1, 'gemma', 'gemma4:31b', 0, 'pending', $2)
+   returning id`, [USER_A, PROJECT_A]);
+check("ai_usage: a pending planning attempt records its project",
+  (await as<{ project_id: string }>("service_role", null,
+    `select project_id from public.ai_usage where id = $1`, [pendingAttempt[0].id]))[0].project_id === PROJECT_A);
+check("ai_usage: a second pending attempt for the same project is rejected (23505)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.ai_usage
+       (user_id, model_id, configured_model, latency_ms, status, project_id)
+     values ($1, 'gemma', 'gemma4:31b', 0, 'pending', $2)`, [USER_A, PROJECT_A]))) === "23505");
+await as("service_role", null,
+  `insert into public.ai_usage
+     (user_id, model_id, configured_model, latency_ms, status, project_id)
+   values ($1, 'gemma', 'gemma4:31b', 0, 'pending', $2)`, [USER_B, PROJECT_C]);
+check("ai_usage: another project may hold its own pending attempt",
+  (await count("ai_usage", "project_id = $1 and status = 'pending'", [PROJECT_C])) === 1);
+await as("service_role", null,
+  `update public.ai_usage set status = 'success' where id = $1`, [pendingAttempt[0].id]);
+await as("service_role", null,
+  `insert into public.ai_usage
+     (user_id, model_id, configured_model, latency_ms, status, project_id)
+   values ($1, 'gemma', 'gemma4:31b', 0, 'pending', $2)`, [USER_A, PROJECT_A]);
+check("ai_usage: settling the pending attempt frees the project",
+  (await count("ai_usage", "project_id = $1 and status = 'pending'", [PROJECT_A])) === 1);
 
 await as("service_role", null,
   `insert into public.model_health (model_id, last_success_at, success_count)

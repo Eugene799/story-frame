@@ -111,6 +111,16 @@ export interface PlanningStatus {
   registry: PlanningRegistryEntry[];
 }
 
+export interface PlanningAttemptStatusResponse {
+  ok: true;
+  inFlight: boolean;
+  /** The owner's pending key, or null when no attempt is live. */
+  idempotencyKey: string | null;
+  startedAt: string | null;
+  /** The server's authoritative abandon window for client lease sizing. */
+  abandonAfterMs: number;
+}
+
 export interface PlanningProposalResponse {
   ok: true;
   proposal: GenerationProposalRecord;
