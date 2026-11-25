@@ -731,6 +731,36 @@ export async function startFakeSupabase(
           if (request.method === "PATCH") {
             const body = (await readJson(request)) as Record<string, unknown>;
             const matched = data.filter(matches);
+            // Mirrors media_metadata_ready_stock_import_key: one ready copy of a
+            // stock rendition per project, reported as PostgreSQL's 23505.
+            if (table === "media_metadata" && body.status === "ready") {
+              const identity = (row: Record<string, unknown>): string | null => {
+                const provenance = row.provenance;
+                if (!provenance || typeof provenance !== "object") return null;
+                const value = provenance as Record<string, unknown>;
+                return `${value.provider}|${value.providerId}|${value.rendition}`;
+              };
+              for (const row of matched) {
+                const key = identity(row);
+                const conflict = data.some(
+                  (other) =>
+                    other !== row &&
+                    other.status === "ready" &&
+                    other.owner_id === row.owner_id &&
+                    other.project_id === row.project_id &&
+                    key !== null &&
+                    identity(other) === key,
+                );
+                if (conflict) {
+                  sendJson(response, 409, {
+                    code: "23505",
+                    message:
+                      'duplicate key value violates unique constraint "media_metadata_ready_stock_import_key"',
+                  });
+                  return;
+                }
+              }
+            }
             for (const row of matched) {
               for (const [key, value] of Object.entries(body)) {
                 if (key === "id" || key === "project_id" || key === "owner_id") continue;

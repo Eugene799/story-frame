@@ -22,6 +22,7 @@ const MIGRATIONS = [
   "20261125120000_create_planning.sql",
   "20261125140000_add_planning_attempt_preflight.sql",
   "20261125160000_add_stock_media.sql",
+  "20261125180000_enforce_stock_import_uniqueness.sql",
 ];
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "supabase", "migrations");
 
@@ -372,6 +373,18 @@ const imported = await as<{ id: string; provider: string | null; credit: string 
 check("media_metadata: imported provenance round-trips as JSONB",
   imported[0]?.provider === "pexels" && imported[0]?.credit === "Photo by Ada on Pexels",
   JSON.stringify(imported));
+check("media_metadata: a duplicate ready stock import is rejected (23505)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.media_metadata
+       (project_id, owner_id, kind, object_key, content_type, byte_size, status, provenance)
+     values ($1, $2, 'image', $3, 'image/jpeg', 512, 'ready', $4::jsonb)`,
+    [PROJECT_A, USER_A, `objects/${PROJECT_A}/imported-copy`, JSON.stringify(PROVENANCE)]))) === "23505");
+check("media_metadata: a deleted duplicate stock import is allowed",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.media_metadata
+       (project_id, owner_id, kind, object_key, content_type, byte_size, status, provenance)
+     values ($1, $2, 'image', $3, 'image/jpeg', 512, 'deleted', $4::jsonb)`,
+    [PROJECT_A, USER_A, `objects/${PROJECT_A}/imported-deleted`, JSON.stringify(PROVENANCE)]))) === "NO_ERROR");
 check("media_metadata: a non-object provenance is rejected (23514)",
   (await errorCode(() => as("service_role", null,
     `insert into public.media_metadata (project_id, owner_id, kind, object_key, content_type, byte_size, provenance)

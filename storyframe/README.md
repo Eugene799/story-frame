@@ -60,7 +60,7 @@ npm run dev
 - API: `http://127.0.0.1:8787`
 - Web: `http://localhost:3000` (Vite proxies `/api` to the API)
 
-Before using the ledger or any project route, apply the nine migrations in order. See
+Before using the ledger or any project route, apply the ten migrations in order. See
 [Applying the migrations](#applying-the-migrations) for the compatibility check that must pass
 first and the current state of the configured project.
 
@@ -106,6 +106,7 @@ these tables. Apply them in filename order:
 7. `20261125120000_create_planning.sql` (Phase 5: source excerpts, claim quotes, proposal route/base version, `model_health`)
 8. `20261125140000_add_planning_attempt_preflight.sql` (Phase 5: `ai_usage.project_id` and one pending attempt per project)
 9. `20261125160000_add_stock_media.sql` (Phase 6: `media_metadata.provenance` and the durable `stock_search_cache` table)
+10. `20261125180000_enforce_stock_import_uniqueness.sql` (Phase 6: one ready copy per imported stock rendition per project)
 
 Run the compatibility check first. It must return no rows:
 
@@ -137,10 +138,12 @@ Afterwards, check the running server rather than assuming the schema is ready:
 3. Set `SMOKE_SUPABASE_ACCESS_TOKEN` to a session token and run `npm run smoke:live` (five
    billable calls, described under Tests).
 
-**All nine migrations are applied to the configured project (`myrohtkfsuppcabedwmn`): the sixth on 2026-11-24, the
-seventh and eighth (Phase 5) on 2026-11-25, and the ninth (Phase 6) on 2026-11-25.** The Phase 6 catalog was checked
-directly after applying it: `media_metadata.provenance` and its object constraint exist, and `stock_search_cache`
-exists with RLS enabled, no `authenticated` grants, and service-role access only. After applying the eighth, a PostgREST probe selecting
+**All ten migrations are applied to the configured project (`myrohtkfsuppcabedwmn`): the sixth on 2026-11-24, the
+seventh and eighth (Phase 5) on 2026-11-25, and the ninth and tenth (Phase 6) on 2026-11-25.** The Phase 6 catalog was
+checked directly after applying it: `media_metadata.provenance` and its object constraint exist,
+`media_metadata_ready_stock_import_key` is a partial unique index on the owner, project, provider, asset id, and
+rendition where `status = 'ready'`, and `stock_search_cache` exists with RLS enabled, no `authenticated` grants, and
+service-role access only. After applying the eighth, a PostgREST probe selecting
 `ai_usage.project_id` returned `200`, `pg_indexes` reported `ai_usage_one_pending_project_idx` as a partial unique
 index on `(project_id)` where `status = 'pending'`, `GET /api/ai/status` reported `ledger.ready: true`, and
 `verify:live-routes` passed **51/51** checks including the owner-scoped planning-status route. After applying the seventh,
@@ -548,7 +551,7 @@ editable project JSON and the script as plain text; video export is not offered 
 | Bounded history | **PASS** | `GET /api/projects/:id/revisions` returns the 20 newest summaries, owner-scoped; Settings lists them |
 | Media upload/playback exercised from the UI | **PASS** | UI test covers initiate → direct PUT → complete → scene reference → asset id save → presigned playback; the automated media E2E is 37/37 against hosted Supabase and the real bucket |
 | Document v1 rows remain readable | **PASS** | Migration test reads a stored v1 row, returns v2 with defaults, and saves it back as v2 |
-| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 245/245; `verify:sql` 87/87; `verify:stock-live` 8/8; `verify:stock-routes-live` 22/22; `verify:live-routes` 51/51; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
+| Typecheck, unit/UI tests, SQL, and live route suites | **PASS** | `npm run check`; `npm test` 246/246; `verify:sql` 89/89; `verify:stock-live` 8/8; `verify:stock-routes-live` 22/22; `verify:live-routes` 51/51; `verify:r2-live` 7/7; `verify:media-live` 37/37 |
 | Locks enforced on a direct API write, not just disabled fields | **PASS** | In the real browser, a locked narration edit sent straight to `PUT /api/projects/:id` returned `409 SCENE_FIELD_LOCKED` and left the stored document at the same version and wording |
 | Stale approval cleared by the server on save | **PASS** | Editing approved narration showed **Approval out of date** immediately; saving returned `approved: false` and a null fingerprint at version 6 |
 | Responsive layouts visually reviewed | **PASS** | Real browser at 320, 360, 390, 768, and 1280 px on all six editor tabs: no horizontal overflow. The review found and fixed a 320 px overflow caused by the editor's implicit grid column and the storyboard's fixed 290 px minimum |
@@ -722,7 +725,10 @@ type is refused, and magic bytes must match the selected type. Accepted bytes ar
 server-created presigned URL, the media row becomes `ready`, and the validated provenance is stored as JSONB on the row
 and returned by the media routes. Importing the same provider, asset id, and rendition again into the same project
 returns that ready asset (`200`, `reused: true`) without downloading or storing a second copy; another project or
-rendition is a separate asset. Nothing is attached to a scene unless the UI does it explicitly.
+rendition is a separate asset. The pre-check is a fast path, not the guarantee: a partial unique index on the ready row
+(`media_metadata_ready_stock_import_key`) settles simultaneous imports, and the losing request reuses the winner's
+media while its own reservation and object are discarded. Nothing is attached to a scene unless the UI does it
+explicitly.
 
 **UI.** The Media tab has a stock search form (query, image/video, per-provider checkboxes) and a separate preview grid.
 Each preview shows the provider, dimensions, selected rendition, creator, source link, and license link, and imports only
@@ -737,12 +743,12 @@ results.
 | Protected search with normalized fields | **PASS** | `tests/stock.test.ts`: anonymous `401`; one image search returns Pexels and Pixabay results with provider, id, title, preview, renditions, source page, creator, attribution, license, real dimensions, and duration; a video search reports the selected 1920×1080 rendition |
 | Hardened provider handling | **PASS** | Same file: duplicate/unknown/empty sources `400`; portrait crops are never selected for a 16:9 source; a `video/mp4` link ending in `.m3u8` is excluded; video previews come from provider thumbnails; a provider failure yields a sanitized code and the response never contains the provider key or URL |
 | Durable shared cache and stampedes | **PASS** | Two identical searches make one provider call each, the second reports `cached: true`, and `stock_search_cache` holds two ready rows with a Pixabay TTL of at least 24 hours; two concurrent searches still make one call per provider; a simulated cache outage leaves search working |
-| Repeated imports reuse one asset | **PASS** | `tests/stock.test.ts`: importing the same provider, asset id, and rendition twice makes one R2 write and one media row, returns the first media id with `reused: true` at `200`, and does not fetch the asset again; the same asset in another project is a separate `201` asset. `tests/stock-panel.test.tsx`: a reused import reports it and leaves one media item |
+| Repeated imports reuse one asset | **PASS** | `tests/stock.test.ts`: importing the same provider, asset id, and rendition twice makes one R2 write and one ready media row, returns the first media id with `reused: true` at `200`, and does not fetch the asset again; two simultaneous imports held at the asset fetch produce one `201` and one `200`, the same media id, exactly one ready row and one settled reservation; the same asset in another project is a separate `201` asset. `verify:sql`: a second ready row for the same rendition is rejected `23505`, while a deleted duplicate is allowed. `tests/stock-panel.test.tsx`: a reused import reports it and leaves one media item |
 | Controlled import with provenance | **PASS** | Imported image bytes are in R2 under `media/<owner>/<id>`, the row is `ready`, JSONB provenance is stored and returned; video import is detected as `video/mp4`; foreign hosts, internal names, a redirect to another host, `http://`, oversized bodies, `text/html`, and playlists are refused; a foreign project is `404`; a type mismatch is `422` |
 | Previews stay separate from project assets | **PASS (DOM)** | `tests/stock-panel.test.tsx`: searching writes nothing to `/media`, the credit link and license link render with their URLs, the failed provider is reported, and only **Import to project** posts the import body and adds a `ready` asset; the media item then shows the stored provider, creator, source link, and license |
 | Real provider searches | **PASS** | `npm run verify:stock-live` on 2026-11-25: image "rainy city street" merged 40 results (Pexels 20 + Pixabay 20) and video "ocean waves" merged 40, all with credit, source page, selected rendition, and no playlist renditions; 8/8 checks |
 | Import into a hosted project | **PASS** | `npm run verify:stock-routes-live` on 2026-11-25 against hosted Supabase and the real `story-frame` bucket: a selected image imported `201` with `ready` media and provenance, a repeat import returned the same media (`200`, `reused: true`) without a second object, it appeared in the media list with that provenance, returned a presigned playback URL, deleted `200` with its object, and the deleted row stopped being ready; 22/22 checks, including cache rows and cleanup |
-| Hosted schema | **PASS** | `20261125160000_add_stock_media.sql` applied through the Supabase management API on 2026-11-25; the catalog reports `media_metadata.provenance` plus its object constraint, `stock_search_cache` with RLS on, `service_role` grants, and zero `authenticated` grants; `verify:stock-routes-live` then wrote and read both through the routes |
+| Hosted schema | **PASS** | `20261125160000_add_stock_media.sql` applied through the Supabase management API on 2026-11-25; the catalog reports `media_metadata.provenance` plus its object constraint, `stock_search_cache` with RLS on, `service_role` grants, and zero `authenticated` grants; `media_metadata_ready_stock_import_key` was applied on 2026-11-25 after confirming the hosted data had no duplicate ready groups; `verify:stock-routes-live` then wrote and read both through the routes |
 
 ### Phase 3 verification (2026-11-24)
 
@@ -808,7 +814,7 @@ select-own policy on each, the revision trigger, no `auth.users` trigger, and `/
 including two-user isolation), and `smoke:live` exited 0 with 5/5 model families and an identical
 stored replay. The test users and rows were deleted; the project is empty again.
 
-`npm run verify:sql` applies all nine migrations to a real PostgreSQL engine (PGlite, PostgreSQL compiled to
+`npm run verify:sql` applies all ten migrations to a real PostgreSQL engine (PGlite, PostgreSQL compiled to
 WebAssembly) with Supabase-like `anon`, `authenticated`, and `service_role` roles plus an `auth.uid()` stub, then
 asserts what the server relies on: the revision trigger, owner-only reads on every table, refused browser writes, the
 conditional version update, constraint and foreign-key rejections, and the cascades from both `projects` and
@@ -994,7 +1000,8 @@ the document-delete guard and project-deletion object cleanup.
 - Email/password sign-in only; there is no sign-up, password-reset, MFA, OAuth, or account-management UI. The
   Supabase client persists session tokens in browser `localStorage`; production needs an explicit session-storage and
   CSP review. Sign-out is local to this browser and does not revoke the account's other sessions.
-- All nine migrations and RLS policies are applied to the configured Supabase project (Phase 6 on 2026-11-25). The
+- All ten migrations and RLS policies are applied to the configured Supabase project (Phase 6 on 2026-11-25,
+  including the ready-import uniqueness index). The
   hosted catalog was checked (12 tables, RLS, policies, grants, revision trigger), and live profile/project/child
   routes, two-user isolation, ledger readiness, and the planning-status route passed 51/51 checks; the disposable users
   were deleted afterwards. Rerun these checks with `npm run verify:live-routes`. The Phase 6 live route check

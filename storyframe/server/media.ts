@@ -453,6 +453,15 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
     } catch {
       throw new ApiError(503, "MEDIA_STORE_UNAVAILABLE", "The media store is unreachable.");
     }
+    if (response.status === 409) {
+      // PostgREST reports a unique violation as 409 with PostgreSQL's code. The
+      // import route uses this to reuse the row that won the race.
+      const detail = await response.json().catch(() => null);
+      const code = isRecord(detail) && typeof detail.code === "string" ? detail.code : null;
+      if (code === "23505") {
+        throw new ApiError(409, "MEDIA_STORE_CONFLICT", `The media store rejected ${action} as a duplicate.`);
+      }
+    }
     if (!response.ok) {
       throw new ApiError(
         503,

@@ -176,11 +176,14 @@ interface FakeProviders {
   failPexels: boolean;
   remaining: number;
   assetHits: number;
+  /** Blocks asset responses until `expected` imports are waiting, so they overlap. */
+  pauseAssets: (expected: number) => { arrived: Promise<void>; release: () => void };
   close: () => Promise<void>;
 }
 
 async function startFakeProviders(): Promise<FakeProviders> {
   const hits = { pexelsImage: 0, pexelsVideo: 0, pixabayImage: 0, pixabayVideo: 0 };
+  let assetGate: Promise<void> | null = null;
   const state: FakeProviders = {
     origin: "",
     hits,
@@ -188,6 +191,29 @@ async function startFakeProviders(): Promise<FakeProviders> {
     failPexels: false,
     remaining: 199,
     assetHits: 0,
+    pauseAssets: (expected) => {
+      const start = state.assetHits;
+      let release: () => void = () => undefined;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      assetGate = gate;
+      const arrived = new Promise<void>((resolve) => {
+        const timer = setInterval(() => {
+          if (state.assetHits - start >= expected) {
+            clearInterval(timer);
+            resolve();
+          }
+        }, 5);
+      });
+      return {
+        arrived,
+        release: () => {
+          assetGate = null;
+          release();
+        },
+      };
+    },
     close: async () => undefined,
   };
 
@@ -229,6 +255,7 @@ async function startFakeProviders(): Promise<FakeProviders> {
 
     if (url.pathname === "/photos/101/original.jpg") {
       state.assetHits += 1;
+      if (assetGate) await assetGate;
       response.writeHead(200, { "Content-Type": "image/jpeg", "Content-Length": String(PHOTO_BYTES.length) });
       return response.end(PHOTO_BYTES);
     }
@@ -820,6 +847,49 @@ describe("stock import", () => {
     expect(((await otherProject.json()) as { reused: boolean }).reused).toBe(false);
 
     expect(app.supabase.media).toHaveLength(2);
+  });
+
+  it("reuses the winner when two identical imports complete at the same time", async () => {
+    const { app, provider } = await startStockApp();
+    const projectId = await createProject(app.url);
+
+    const paused = provider.pauseAssets(2);
+    const start = () =>
+      apiRequest(app.url, `/api/projects/${projectId}/stock/import`, {
+        method: "POST",
+        body: JSON.stringify(importBody()),
+      });
+    const first = start();
+    const second = start();
+    // Both requests passed the pre-download check and are now holding the same asset.
+    await paused.arrived;
+    paused.release();
+    const [one, two] = await Promise.all([first, second]);
+
+    expect([one.status, two.status].sort()).toEqual([200, 201]);
+    const bodies = (await Promise.all([one.json(), two.json()])) as {
+      media: MediaRecord;
+      provenance: MediaProvenance;
+      reused: boolean;
+    }[];
+    const created = bodies.find((body) => !body.reused);
+    const reusedBody = bodies.find((body) => body.reused);
+    expect(created).toBeDefined();
+    expect(reusedBody).toBeDefined();
+    expect(reusedBody?.media.id).toBe(created?.media.id);
+
+    // The store keeps exactly one ready copy; the loser's reservation is settled.
+    const matching = app.supabase.media.filter((row) => {
+      const provenance = row.provenance as Record<string, unknown> | null;
+      return (
+        provenance?.provider === "pexels" &&
+        provenance.providerId === "101" &&
+        provenance.rendition === "original"
+      );
+    });
+    expect(matching.filter((row) => row.status === "ready")).toHaveLength(1);
+    expect(matching.filter((row) => row.status === "deleted")).toHaveLength(1);
+    expect(matching.find((row) => row.status === "ready")?.id).toBe(created?.media.id);
   });
 
   it("accepts Pixabay's own site host for web-format images", async () => {

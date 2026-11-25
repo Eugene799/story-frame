@@ -41,6 +41,7 @@ import {
   type ProjectStore,
 } from "./projects";
 import { ApiError } from "./api-error";
+import type { MediaRecord } from "../shared/media-contract";
 import {
   MEDIA_NOT_FOUND_MESSAGE,
   createSupabaseMediaStore,
@@ -845,12 +846,34 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       if (head === null) {
         throw new HttpError(502, "MEDIA_STORAGE_UNAVAILABLE", "The imported asset was not found in the bucket.");
       }
-      const media = await store.markReady(user.id, projectId, mediaId, {
-        contentType: detected.contentType,
-        byteSize: head.byteSize,
-      });
-      if (!media) {
-        throw new HttpError(409, "MEDIA_STATE_CHANGED", "The imported asset changed while it was being stored.");
+      let media: MediaRecord;
+      try {
+        const marked = await store.markReady(user.id, projectId, mediaId, {
+          contentType: detected.contentType,
+          byteSize: head.byteSize,
+        });
+        if (!marked) {
+          throw new HttpError(409, "MEDIA_STATE_CHANGED", "The imported asset changed while it was being stored.");
+        }
+        media = marked;
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.code !== "MEDIA_STORE_CONFLICT") throw error;
+        // A parallel import completed first; its ready row is the canonical
+        // asset. Drop this request's reservation and object, then reuse it.
+        const winner = await store.findImported(user.id, projectId, {
+          provider: write.provider,
+          providerId: write.providerId,
+          rendition: write.rendition,
+        });
+        if (!winner?.media.provenance) throw error;
+        await discardMedia(store, objects, user.id, projectId, mediaId, objectKey);
+        sendJson(response, 200, {
+          ok: true,
+          media: winner.media,
+          provenance: winner.media.provenance,
+          reused: true,
+        });
+        return;
       }
       sendJson(response, 201, { ok: true, media, provenance, reused: false });
     } catch (error) {
