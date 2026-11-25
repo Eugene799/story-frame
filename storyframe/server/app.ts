@@ -106,6 +106,9 @@ import {
   createVideoExportService,
   type VideoExportService,
 } from "./video-exports";
+import { createLipsyncService, createSupabaseLipsyncStore, type LipsyncService } from "./lipsync";
+import { loadEverypixelSettings } from "./everypixel";
+import { parseLipsyncExportInput } from "../shared/lipsync-contract";
 import {
   DEEPGRAM_AURA2_USD_PER_1K_CHARS,
   DEEPGRAM_RATE_VERSION,
@@ -605,6 +608,31 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         })
       : null;
 
+  // Same shape as the video export: the service exists without provider
+  // credentials so listing, playback and deletion keep working.
+  const lipsyncStore =
+    config.supabaseUrl && config.supabaseServiceRoleKey
+      ? createSupabaseLipsyncStore({
+          url: config.supabaseUrl,
+          serviceRoleKey: config.supabaseServiceRoleKey,
+          timeoutMs: config.authTimeoutMs,
+        })
+      : null;
+  const lipsync: LipsyncService | null =
+    lipsyncStore && mediaStore && mediaObjects
+      ? createLipsyncService({
+          store: lipsyncStore,
+          media: mediaStore,
+          objects: mediaObjects,
+          settings: loadEverypixelSettings(options.env ?? process.env),
+          limits: config.lipsync,
+          mediaLimits: config.media,
+          fetchImpl,
+          now,
+          logger: log,
+        })
+      : null;
+
   const stockCache: StockCacheStore | null =
     config.supabaseUrl && config.supabaseServiceRoleKey
       ? createSupabaseStockCache({
@@ -702,6 +730,17 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       : null;
   videoSweeper?.unref?.();
   if (videoSweeper) server.on("close", () => clearInterval(videoSweeper));
+
+  // A lip sync is advanced by its sweep too, so a restart resumes a paid task
+  // and a GET never triggers a provider call.
+  const lipsyncSweeper =
+    lipsync && config.lipsync.sweepIntervalMs > 0
+      ? setInterval(() => {
+          void lipsync.sweep().catch(() => log.error("[lipsync] LIPSYNC_SWEEP_FAILED"));
+        }, config.lipsync.sweepIntervalMs)
+      : null;
+  lipsyncSweeper?.unref?.();
+  if (lipsyncSweeper) server.on("close", () => clearInterval(lipsyncSweeper));
 
   // Pending image jobs expire even if no request ever asks about them again.
   const imageSweeper =
@@ -902,6 +941,17 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       );
     }
     return videoExports;
+  }
+
+  function requireLipsync(): LipsyncService {
+    if (!lipsync) {
+      throw new HttpError(
+        503,
+        "LIPSYNC_UNAVAILABLE",
+        "Lip sync is not configured on the server. Set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and the R2 keys.",
+      );
+    }
+    return lipsync;
   }
 
   function requireNarrationUsageStore(): NarrationUsageStore {
@@ -1895,6 +1945,11 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       return;
     }
 
+    if (segments.length >= 3 && segments[1] === "exports" && segments[2] === "lipsync") {
+      await handleLipsyncExports(request, response, user, projectId, segments.slice(3), method);
+      return;
+    }
+
     if (segments.length > 1 && segments[1] === "media") {
       await handleMedia(request, response, user, projectId, segments.slice(2));
       return;
@@ -2474,6 +2529,78 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         return;
       }
       throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET or DELETE for one video export.");
+    }
+
+    if (action === "url") {
+      if (method !== "GET") throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for a playback URL.");
+      const playback = await service.playback(user.id, projectId, exportId);
+      sendJson(response, 200, { ok: true, ...playback });
+      return;
+    }
+
+    throw new HttpError(404, "NOT_FOUND", "Unknown endpoint.");
+  }
+
+  /** Lip sync exports: seconds-guarded submission, one live task per project. */
+  async function handleLipsyncExports(
+    request: IncomingMessage,
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    projectId: string,
+    rest: string[],
+    method: string,
+  ): Promise<void> {
+    const service = requireLipsync();
+    await requireProjects().get(user.id, projectId);
+
+    if (rest.length === 0) {
+      if (method === "GET") {
+        const listed = await service.list(user.id, projectId);
+        sendJson(response, 200, { ok: true, exports: listed.exports, usage: listed.usage });
+        return;
+      }
+      if (method === "POST") {
+        let input;
+        try {
+          input = parseLipsyncExportInput(await readJsonBody(request, PROJECT_LIMITS.bodyBytes));
+        } catch (error) {
+          throw new HttpError(422, "LIPSYNC_INPUT_INVALID", error instanceof Error ? error.message : "Invalid lip sync input.");
+        }
+        const idempotencyKey = readIdempotencyKey(request);
+        const detail = await service.submit(user.id, projectId, input, idempotencyKey);
+        sendJson(response, 202, {
+          ok: true,
+          export: detail.record,
+          media: detail.media,
+          usage: detail.usage,
+        });
+        return;
+      }
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET or POST for lip sync exports.");
+    }
+
+    const [exportId, action, ...extra] = rest;
+    if (!isChildId(exportId) || extra.length > 0) {
+      throw new HttpError(404, "LIPSYNC_NOT_FOUND", "No lip sync export with that id belongs to this project.");
+    }
+
+    if (action === undefined) {
+      if (method === "GET") {
+        const detail = await service.get(user.id, projectId, exportId);
+        sendJson(response, 200, {
+          ok: true,
+          export: detail.record,
+          media: detail.media,
+          usage: detail.usage,
+        });
+        return;
+      }
+      if (method === "DELETE") {
+        await service.remove(user.id, projectId, exportId);
+        sendJson(response, 200, { ok: true, deletedId: exportId });
+        return;
+      }
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET or DELETE for one lip sync export.");
     }
 
     if (action === "url") {

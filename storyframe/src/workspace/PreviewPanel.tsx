@@ -4,6 +4,7 @@ import type { ProjectDocumentV2 } from "../../shared/project-contract";
 import { buildScriptText } from "../../shared/project-export";
 import { AiRequestError, exportProject } from "../api";
 import { formatDuration, totalDurationSeconds } from "./model";
+import { LipsyncPanel } from "./LipsyncPanel";
 import { VideoExportSection } from "./VideoExportSection";
 
 interface PreviewPanelProps {
@@ -178,6 +179,8 @@ export function PreviewPanel({
         getAccessToken={getAccessToken}
         pollIntervalMs={pollIntervalMs}
       />
+
+      <LipsyncPanel projectId={projectId} getAccessToken={getAccessToken} pollIntervalMs={pollIntervalMs} />
     </section>
   );
 }

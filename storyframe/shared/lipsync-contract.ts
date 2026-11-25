@@ -119,3 +119,76 @@ export function lipsyncStatusFromProvider(status: string): LipsyncStatus | null 
 export function lipsyncEstimateUsd(seconds: number): number {
   return Number((seconds * LIPSYNC_ESTIMATE_USD_PER_SECOND).toFixed(4));
 }
+
+/** Stable codes a failed export may carry, so the UI never parses prose. */
+export const LIPSYNC_FAILURE_CODES = [
+  "LIPSYNC_PROVIDER_DISABLED",
+  "LIPSYNC_MEDIA_NOT_READY",
+  "LIPSYNC_SOURCE_TOO_LONG",
+  "LIPSYNC_INPUT_TOO_LARGE",
+  "LIPSYNC_DAILY_LIMIT",
+  "LIPSYNC_PROVIDER_FAILED",
+  "LIPSYNC_OUTPUT_HOST",
+  "LIPSYNC_OUTPUT_INVALID",
+  "LIPSYNC_OUTPUT_TOO_LARGE",
+  "LIPSYNC_STORAGE_LIMIT",
+  "LIPSYNC_OUTPUT_COPY_FAILED",
+  "LIPSYNC_ABANDONED",
+] as const;
+export type LipsyncFailureCode = (typeof LIPSYNC_FAILURE_CODES)[number];
+
+export interface LipsyncExportRecord {
+  id: string;
+  projectId: string;
+  status: LipsyncStatus;
+  provider: typeof LIPSYNC_PROVIDER;
+  providerStatus: string | null;
+  sourceMediaId: string | null;
+  audioMediaId: string | null;
+  outputMediaId: string | null;
+  resolution: LipsyncResolution;
+  /** Reserved seconds: the provider's 20-second ceiling for one request. */
+  secondsEstimate: number;
+  secondsCounted: number | null;
+  usdEstimate: number;
+  byteSize: number | null;
+  failureCode: LipsyncFailureCode | null;
+  failureMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LipsyncUsageSummary {
+  windowHours: number;
+  secondsUsed: number;
+  secondsLimit: number | null;
+  usdUsed: number;
+  usdLimit: number | null;
+  resetAt: string | null;
+}
+
+export interface LipsyncExportInput {
+  sourceMediaId: string;
+  audioMediaId: string;
+  resolution: LipsyncResolution;
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Validates the request body the routes accept; nothing optional hides here. */
+export function parseLipsyncExportInput(input: unknown): LipsyncExportInput {
+  const record = (input ?? {}) as Record<string, unknown>;
+  const sourceMediaId = typeof record.sourceMediaId === "string" ? record.sourceMediaId.trim() : "";
+  const audioMediaId = typeof record.audioMediaId === "string" ? record.audioMediaId.trim() : "";
+  if (!UUID_PATTERN.test(sourceMediaId)) {
+    throw new Error("sourceMediaId must be the id of a media asset in this project.");
+  }
+  if (!UUID_PATTERN.test(audioMediaId)) {
+    throw new Error("audioMediaId must be the id of a media asset in this project.");
+  }
+  const resolution = record.resolution === undefined ? LIPSYNC_DEFAULT_RESOLUTION : record.resolution;
+  if (!isLipsyncResolution(resolution)) {
+    throw new Error("resolution must be 360p, 480p or 720p.");
+  }
+  return { sourceMediaId, audioMediaId, resolution };
+}

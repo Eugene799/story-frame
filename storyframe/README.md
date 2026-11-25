@@ -1063,9 +1063,35 @@ unsaved changes, no scenes exist, or an export is already running. A refusal fro
 (retries and the `…/refresh` endpoint are deferred); no renders-per-day cap; the provider copy is deleted best-effort
 after our own copy exists; no cancel; no subtitle or word-timing claim; no USD estimate.
 
-### Lip sync through Everypixel Labs (2026-11-25) — adapter only
+### Lip sync through Everypixel Labs (2026-11-26) — complete, no live call yet
 
-Started, not yet a feature: there is no route, table or UI for it yet and nothing calls the provider from the app.
+One source (a talking clip or a still portrait) plus one audio track becomes a new MP4 whose mouth
+matches the audio. Routes are `GET|POST /api/projects/:id/exports/lipsync` and
+`GET|DELETE /api/projects/:id/exports/lipsync/:exportId` plus `/url` for playback, mirroring the video export.
+
+- `supabase/migrations/20261126110000_create_lipsync_exports.sql` adds `lipsync_exports` and `lipsync_usage`
+with `reserve_lipsync_usage`: a per-owner advisory lock, one live task per project, one reservation per export,
+and a rolling 24-hour window counted in provider seconds (600 by default) and USD (\$5). The reservation is the
+provider's 20-second ceiling for one request, never a client-declared length, so a short clip cannot slip past
+the window.
+- The copy is host-guarded the way `OUTPUT_HOSTS` guards JSON2Video: `isLipsyncOutputHost` trusts
+`everypixel.com` and its subdomains plus anything in `LIPSYNC_OUTPUT_HOSTS`, and every redirect hop is
+re-checked before a byte is read. A foreign host fails the export with `LIPSYNC_OUTPUT_HOST` and no download.
+The host Everypixel actually serves outputs from has not been observed live yet, so the first real render may
+need one entry in `LIPSYNC_OUTPUT_HOSTS` — the refusal is explicit rather than silent.
+- A finished video is downloaded, re-detected as video, uploaded to R2 under a new media row, and settled at
+the reserved seconds. A provider `FAILURE`/`REVOKED`, an abandoned task, or a success without a usable URL
+fails the export and settles zero seconds.
+- The Preview tab's `LipsyncPanel` picks the source, audio and resolution, shows the seconds/USD window and an
+estimate, submits with an idempotency key, polls only while pending, plays the stored copy from a private
+presigned URL, and deletes after a confirmation. A pending task cannot be deleted.
+- `tests/lipsync.test.ts` (9) and `tests/lipsync-panel.test.tsx` (3) cover the host guard, the seconds refusal,
+wrong-kind assets, the inline submit, the copy, a foreign output host, provider failure, success without an
+output, the disabled reasons, polling to playback and the confirmed delete.
+
+**No live call was made**, so the adapter contract and the copy path are proven against fakes only.
+
+#### Earlier slice (2026-11-25)
 
 - `shared/lipsync-contract.ts` holds the shapes: `360p`/`480p`/`720p`, the provider's 20-second cap on source video and
 audio at 720p, the audio/video/still formats it documents, the mapping from `PENDING`/`STARTED`/`SUCCESS`/`FAILURE`/

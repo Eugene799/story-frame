@@ -32,6 +32,7 @@ const MIGRATIONS = [
   "20261125260000_preserve_narration_usage_on_project_delete.sql",
   "20261126090000_add_video_render_jobs.sql",
   "20261126100000_create_video_usage.sql",
+  "20261126110000_create_lipsync_exports.sql",
 ];
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "supabase", "migrations");
 

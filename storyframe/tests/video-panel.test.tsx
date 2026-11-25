@@ -89,6 +89,17 @@ function installBackend(options: BackendOptions = {}) {
       const idempotencyKey = new Headers(init?.headers as HeadersInit).get("Idempotency-Key");
       requests.push({ method, path: url.pathname, body, idempotencyKey });
 
+      // The Preview tab also mounts the lip sync panel; it has nothing to show here.
+      if (url.pathname === `/api/projects/${PROJECT_ID}/exports/lipsync` && method === "GET") {
+        return jsonResponse({
+          ok: true,
+          exports: [],
+          usage: { windowHours: 24, secondsUsed: 0, secondsLimit: 600, usdUsed: 0, usdLimit: 5, resetAt: null },
+        });
+      }
+      if (url.pathname === `/api/projects/${PROJECT_ID}/media` && method === "GET") {
+        return jsonResponse({ ok: true, media: [] });
+      }
       if (url.pathname === `/api/projects/${PROJECT_ID}/exports/video` && method === "GET") {
         if (submitted && options.settled) {
           pollsAfterSubmit += 1;

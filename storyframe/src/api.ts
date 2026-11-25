@@ -1,4 +1,5 @@
 import type { AiErrorResponse, AiStatusResponse, AiTestSuccess } from "../shared/ai-contract";
+import type { LipsyncExportInput, LipsyncExportRecord, LipsyncUsageSummary } from "../shared/lipsync-contract";
 import type {
   MediaPlayback,
   MediaRecord,
@@ -203,6 +204,57 @@ export async function listProjectMedia(accessToken: string, projectId: string): 
 export interface MediaInitiation {
   media: MediaRecord;
   upload: MediaUploadTicket;
+}
+
+export async function listLipsyncExports(
+  accessToken: string,
+  projectId: string,
+): Promise<{ exports: LipsyncExportRecord[]; usage: LipsyncUsageSummary }> {
+  const body = await authorizedJson<{ ok: true; exports: LipsyncExportRecord[]; usage: LipsyncUsageSummary }>(
+    `/api/projects/${projectId}/exports/lipsync`,
+    accessToken,
+  );
+  return { exports: body.exports, usage: body.usage };
+}
+
+export async function submitLipsyncExport(
+  accessToken: string,
+  projectId: string,
+  input: LipsyncExportInput,
+): Promise<{ export: LipsyncExportRecord; media: MediaRecord | null; usage: LipsyncUsageSummary }> {
+  return authorizedJson<{ ok: true; export: LipsyncExportRecord; media: MediaRecord | null; usage: LipsyncUsageSummary }>(
+    `/api/projects/${projectId}/exports/lipsync`,
+    accessToken,
+    { method: "POST", body: input },
+  );
+}
+
+export async function getLipsyncPlayback(
+  accessToken: string,
+  projectId: string,
+  exportId: string,
+): Promise<{ url: string; expiresAt: string; contentType: string; byteSize: number }> {
+  const body = await authorizedJson<{
+    ok: true;
+    url: string;
+    expiresAt: string;
+    contentType: string;
+    byteSize: number;
+  }>(`/api/projects/${projectId}/exports/lipsync/${exportId}/url`, accessToken);
+  return { url: body.url, expiresAt: body.expiresAt, contentType: body.contentType, byteSize: body.byteSize };
+}
+
+export async function deleteLipsyncExport(
+  accessToken: string,
+  projectId: string,
+  exportId: string,
+): Promise<string> {
+  const body = await authorizedJson<{ ok: true; deletedId: string }>(
+    `/api/projects/${projectId}/exports/lipsync/${exportId}`,
+    accessToken,
+    { method: "DELETE" },
+  );
+  return body.deletedId;
 }
 
 export async function listNarrationVoices(accessToken: string): Promise<NarrationVoiceCatalogResponse> {

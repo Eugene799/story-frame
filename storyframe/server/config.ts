@@ -3,6 +3,7 @@ import { loadMediaLimits, type MediaLimits } from "./media";
 import { loadStockLimits, type StockLimits } from "./stock";
 import { resolveVideoResolution } from "./json2video";
 import type { VideoLimits } from "./video-exports";
+import type { LipsyncLimits } from "./lipsync";
 import { OLLAMA_BASE_URL } from "./ollama";
 import {
   MAX_PLANNING_PROVIDER_CALLS,
@@ -54,6 +55,8 @@ export interface AppConfig {
   planning: { routes: ResolvedPlanningRoute[] };
   /** Phase 9 render bounds, single-copy download limits, and the credit guard. */
   video: VideoLimits & { sweepIntervalMs: number };
+  /** Lip sync bounds, output-host allowlist, and the seconds guard. */
+  lipsync: LipsyncLimits;
 }
 
 function intEnv(
@@ -212,6 +215,28 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       timingToleranceSeconds: usdEnv(env, "VIDEO_TIMING_TOLERANCE_SECONDS", 0.5, 0, 5),
       // Rolling 24-hour credit window. Zero disables the dimension.
       dailyCreditsLimit: intEnv(env, "VIDEO_DAILY_CREDITS_PER_USER", 600, 0, 100_000),
+      spendWindowMs: 24 * 60 * 60 * 1000,
+    },
+    lipsync: {
+      timeoutMs: intEnv(env, "LIPSYNC_TIMEOUT_MS", 60_000, 5_000, 180_000),
+      // The provider queues sequentially, so a status read every few seconds is plenty.
+      pollIntervalMs: intEnv(env, "LIPSYNC_POLL_INTERVAL_MS", 5_000, 0, 120_000),
+      sweepIntervalMs: intEnv(env, "LIPSYNC_SWEEP_INTERVAL_MS", 10_000, 0, 600_000),
+      abandonAfterMs: intEnv(env, "LIPSYNC_ABANDON_AFTER_MS", 60 * 60 * 1000, 60_000, 24 * 60 * 60 * 1000),
+      downloadTimeoutMs: intEnv(env, "LIPSYNC_DOWNLOAD_TIMEOUT_MS", 60_000, 5_000, 300_000),
+      // Both inputs are inlined as base64, so this stays well below the media cap.
+      maxInputBytes: intEnv(env, "LIPSYNC_MAX_INPUT_BYTES", 25 * 1024 * 1024, 1024, 100 * 1024 * 1024),
+      maxOutputBytes: intEnv(env, "LIPSYNC_MAX_OUTPUT_BYTES", 256 * 1024 * 1024, 1024 * 1024, 1024 * 1024 * 1024),
+      redirectLimit: intEnv(env, "LIPSYNC_REDIRECTS", 3, 0, 5),
+      // Extra hosts beyond everypixel.com, so a real output host can be pinned
+      // without a redeploy. Empty by default: only Everypixel is trusted.
+      outputHosts: (env.LIPSYNC_OUTPUT_HOSTS ?? "")
+        .split(",")
+        .map((host) => host.trim().toLowerCase())
+        .filter((host) => host.length > 0),
+      // Rolling 24-hour guard in provider seconds. Zero disables the dimension.
+      dailySecondsLimit: intEnv(env, "LIPSYNC_DAILY_SECONDS_PER_USER", 600, 0, 100_000),
+      dailyUsdLimit: usdEnv(env, "LIPSYNC_DAILY_USD_PER_USER", 5, 0, 1000),
       spendWindowMs: 24 * 60 * 60 * 1000,
     },
   };
