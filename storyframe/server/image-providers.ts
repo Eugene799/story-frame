@@ -184,6 +184,9 @@ export interface CloudflareImageResult {
   width: number;
   height: number;
   steps: number;
+  /** Workers AI's reported usage, which carries the billed neuron count. */
+  usage: Record<string, unknown> | null;
+  neurons: number | null;
 }
 
 /**
@@ -230,8 +233,17 @@ export async function generateWithCloudflare(
     );
   }
   const body = (await response.json().catch(() => null)) as
-    | { result?: { image?: unknown } }
+    | { result?: { image?: unknown; usage?: unknown } }
     | null;
+  const rawUsage = body?.result?.usage;
+  const usage =
+    rawUsage && typeof rawUsage === "object" && !Array.isArray(rawUsage)
+      ? (rawUsage as Record<string, unknown>)
+      : null;
+  const neurons =
+    typeof usage?.neurons === "number" && Number.isFinite(usage.neurons) && usage.neurons >= 0
+      ? usage.neurons
+      : null;
   const base64 = body?.result?.image;
   if (typeof base64 !== "string" || base64.length === 0) {
     throw new ApiError(502, "IMAGE_PROVIDER_FAILED", "Cloudflare Workers AI returned no image.");
@@ -250,6 +262,8 @@ export async function generateWithCloudflare(
     width: model.width,
     height: model.height,
     steps,
+    usage,
+    neurons,
   };
 }
 
@@ -257,6 +271,8 @@ export interface LeonardoGenerationStart {
   provider: "leonardo";
   modelKey: string;
   jobId: string;
+  /** Credits reported at submit time, when the provider includes them. */
+  apiCreditCost: number | null;
 }
 
 /** Submits an async v1 generation; the provider returns a job id to poll. */
@@ -310,18 +326,28 @@ export async function startLeonardoGeneration(
     );
   }
   const body = (await response.json().catch(() => null)) as
-    | { sdGenerationJob?: { generationId?: unknown } }
+    | { sdGenerationJob?: { generationId?: unknown; apiCreditCost?: unknown }; apiCreditCost?: unknown }
     | null;
   const jobId = body?.sdGenerationJob?.generationId;
+  const rawCost = body?.sdGenerationJob?.apiCreditCost ?? body?.apiCreditCost;
   if (typeof jobId !== "string" || jobId.length === 0) {
     throw new ApiError(502, "IMAGE_PROVIDER_FAILED", "Leonardo returned no generation id.");
   }
-  return { provider: "leonardo", modelKey: model.key, jobId };
+  return {
+    provider: "leonardo",
+    modelKey: model.key,
+    jobId,
+    apiCreditCost:
+      typeof rawCost === "number" && Number.isInteger(rawCost) && rawCost >= 0 ? rawCost : null,
+  };
 }
 
 export interface LeonardoGenerationStatus {
   status: "pending" | "succeeded" | "failed";
   imageUrls: string[];
+  /** Credits and the provider's cost object, when the poll response carries them. */
+  apiCreditCost: number | null;
+  cost: Record<string, unknown> | null;
 }
 
 /** Polls a v1 generation; COMPLETE carries the generated image URLs. */
@@ -361,6 +387,8 @@ export async function fetchLeonardoGeneration(
         generations_by_pk?: {
           status?: unknown;
           generated_images?: { url?: unknown }[] | null;
+          apiCreditCost?: unknown;
+          cost?: unknown;
         } | null;
       }
     | null;
@@ -369,11 +397,20 @@ export async function fetchLeonardoGeneration(
     throw new ApiError(502, "IMAGE_PROVIDER_FAILED", "Leonardo returned no generation.");
   }
   const raw = String(job.status ?? "").toUpperCase();
-  if (raw === "PENDING") return { status: "pending", imageUrls: [] };
-  if (raw !== "COMPLETE") return { status: "failed", imageUrls: [] };
+  const rawCredits = job.apiCreditCost;
+  const apiCreditCost =
+    typeof rawCredits === "number" && Number.isInteger(rawCredits) && rawCredits >= 0
+      ? rawCredits
+      : null;
+  const cost =
+    job.cost && typeof job.cost === "object" && !Array.isArray(job.cost)
+      ? (job.cost as Record<string, unknown>)
+      : null;
+  if (raw === "PENDING") return { status: "pending", imageUrls: [], apiCreditCost, cost };
+  if (raw !== "COMPLETE") return { status: "failed", imageUrls: [], apiCreditCost, cost };
   const imageUrls = (job.generated_images ?? [])
     .map((image) => image?.url)
     .filter((url): url is string => typeof url === "string" && /^https:\/\//.test(url));
-  if (imageUrls.length === 0) return { status: "failed", imageUrls: [] };
-  return { status: "succeeded", imageUrls };
+  if (imageUrls.length === 0) return { status: "failed", imageUrls: [], apiCreditCost, cost };
+  return { status: "succeeded", imageUrls, apiCreditCost, cost };
 }

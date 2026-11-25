@@ -52,6 +52,7 @@ import {
   isImageProviderConfigured,
   loadImageProviderSettings,
   startLeonardoGeneration,
+  type LeonardoGenerationStatus,
 } from "./image-providers";
 import {
   createSupabaseImageGenerationStore,
@@ -604,6 +605,12 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       return;
     }
 
+    if (path === "/api/image-usage") {
+      if (method !== "GET") throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for image usage.");
+      await handleImageUsage(request, response);
+      return;
+    }
+
     if (path === "/api/image-models") {
       if (method !== "GET") throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for the image models.");
       await handleImageModels(request, response);
@@ -846,6 +853,35 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     });
   }
 
+  async function handleImageUsage(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    checkOrigin(request);
+    const user = await authenticate(request);
+    const spend = await requireImageStore().usageSince(
+      user.id,
+      new Date(now() - config.image.spendWindowMs).toISOString(),
+    );
+    const oldest = spend.oldestAt === null ? null : Date.parse(spend.oldestAt);
+    sendJson(response, 200, {
+      ok: true,
+      usage: {
+        windowHours: config.image.spendWindowMs / (60 * 60 * 1000),
+        attempts: spend.attempts,
+        // The ledger charges actual cost when the provider settled it.
+        spentUsd: spend.spentUsd,
+        actualUsd: spend.actualUsd,
+        estimatedUsd: spend.estimatedUsd,
+        limits: {
+          images: config.image.dailyImageLimit > 0 ? config.image.dailyImageLimit : null,
+          usd: config.image.dailyUsdLimit > 0 ? config.image.dailyUsdLimit : null,
+        },
+        resetAt:
+          oldest !== null && Number.isFinite(oldest)
+            ? new Date(oldest + config.image.spendWindowMs).toISOString()
+            : null,
+      },
+    });
+  }
+
   async function handleImageEstimate(
     request: IncomingMessage,
     response: ServerResponse,
@@ -863,7 +899,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
    * passes. A still-pending job is returned so the caller can refresh later;
    * no provider call is retried and the record keeps its job id.
    */
-  async function waitForLeonardo(jobId: string): Promise<{ status: "pending" | "succeeded" | "failed"; imageUrls: string[] }> {
+  async function waitForLeonardo(jobId: string): Promise<LeonardoGenerationStatus> {
     const deadline = now() + config.image.pollTimeoutMs;
     for (;;) {
       const status = await fetchLeonardoGeneration(imageSettings, jobId, {
@@ -918,6 +954,47 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
    * pending row, presigned PUT, HEAD check, then markReady. A failure discards
    * both the object and the row.
    */
+  /** Credits and provider cost objects are stored raw; only a dollar amount is spendable. */
+  function leonardoCost(
+    startCredits: number | null,
+    pollCredits: number | null,
+    rawCost: Record<string, unknown> | null,
+    existing: Record<string, unknown> | null,
+  ): {
+    providerCost: Record<string, unknown> | null;
+    actualUsd: number | null;
+    actualNeurons: number | null;
+    costSource: "provider" | "rate" | "credits" | null;
+  } {
+    const existingCost =
+      existing?.cost && typeof existing.cost === "object" && !Array.isArray(existing.cost)
+        ? (existing.cost as Record<string, unknown>)
+        : null;
+    const costObject = rawCost ?? existingCost;
+    const existingCredits = existing?.apiCreditCost;
+    const credits =
+      pollCredits ??
+      startCredits ??
+      (typeof existingCredits === "number" && Number.isInteger(existingCredits) ? existingCredits : null);
+    const merged = {
+      ...(existing ?? {}),
+      ...(credits === null ? {} : { apiCreditCost: credits }),
+      ...(costObject === null ? {} : { cost: costObject }),
+    };
+    const amount = costObject?.amount;
+    const unit = typeof costObject?.unit === "string" ? costObject.unit.toLowerCase() : "";
+    const actualUsd =
+      typeof amount === "number" && Number.isFinite(amount) && ["usd", "dollar", "dollars"].includes(unit)
+        ? Number(amount.toFixed(6))
+        : null;
+    return {
+      providerCost: Object.keys(merged).length === 0 ? null : { provider: "leonardo", ...merged },
+      actualUsd,
+      actualNeurons: null,
+      costSource: actualUsd !== null ? "provider" : credits !== null || costObject !== null ? "credits" : null,
+    };
+  }
+
   async function persistGeneratedImage(
     ownerId: string,
     projectId: string,
@@ -1028,6 +1105,14 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     ownerId: string,
     estimate: ImageEstimate,
   ): Promise<void> {
+    if (await store.hasPending(ownerId)) {
+      throw new HttpError(
+        429,
+        "IMAGE_GENERATION_IN_FLIGHT",
+        "An image generation is already pending for this account. Refresh or settle it before starting another.",
+      );
+    }
+
     const since = new Date(now() - config.image.spendWindowMs).toISOString();
     const spend = await store.usageSince(ownerId, since);
 
@@ -1044,12 +1129,12 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     if (
       usdLimit > 0 &&
       estimate.estimatedUsd !== null &&
-      spend.estimatedUsd + estimate.estimatedUsd > usdLimit + 1e-9
+      spend.spentUsd + estimate.estimatedUsd > usdLimit + 1e-9
     ) {
       throw new HttpError(
         429,
         "IMAGE_SPEND_LIMIT",
-        `Estimated image spend for the last 24 hours is $${spend.estimatedUsd.toFixed(4)} of $${usdLimit.toFixed(2)}; this image would exceed the limit.`,
+        `Image spend for the last 24 hours is $${spend.spentUsd.toFixed(4)} of $${usdLimit.toFixed(2)}; this image would exceed the limit.`,
       );
     }
   }
@@ -1087,6 +1172,12 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       let bytes: Buffer;
       let contentType: string;
       let jobId: string | null = null;
+      let cost: {
+        providerCost: Record<string, unknown> | null;
+        actualUsd: number | null;
+        actualNeurons: number | null;
+        costSource: "provider" | "rate" | "credits" | null;
+      } = { providerCost: null, actualUsd: null, actualNeurons: null, costSource: null };
 
       if (resolved.model.provider === "cloudflare") {
         const result = await generateWithCloudflare(
@@ -1100,6 +1191,17 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         );
         bytes = result.bytes;
         contentType = result.contentType;
+        const usdPerThousand =
+          estimate.billing.kind === "neurons" ? estimate.billing.usdPerThousandNeurons ?? null : null;
+        cost = {
+          providerCost: result.usage ? { provider: "cloudflare", usage: result.usage } : null,
+          actualNeurons: result.neurons,
+          actualUsd:
+            result.neurons !== null && usdPerThousand !== null
+              ? Number((((result.neurons / 1000) * usdPerThousand)).toFixed(6))
+              : null,
+          costSource: result.neurons !== null && usdPerThousand !== null ? "rate" : null,
+        };
       } else {
         const started = await startLeonardoGeneration(
           imageSettings,
@@ -1112,7 +1214,12 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
           { fetchImpl, timeoutMs: Math.min(30_000, config.image.pollTimeoutMs) },
         );
         jobId = started.jobId;
-        await store.update(user.id, projectId, generation.id, { jobId });
+        await store.update(user.id, projectId, generation.id, {
+          jobId,
+          ...(started.apiCreditCost === null
+            ? {}
+            : { providerCost: { provider: "leonardo", apiCreditCost: started.apiCreditCost } }),
+        });
         const polled = await waitForLeonardo(jobId);
         if (polled.status === "pending") {
           const pending = await store.get(user.id, projectId, generation.id);
@@ -1125,6 +1232,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         const download = await downloadGeneratedImage(polled.imageUrls[0]);
         bytes = download.bytes;
         contentType = download.contentType;
+        cost = leonardoCost(started.apiCreditCost, polled.apiCreditCost, polled.cost, null);
       }
 
       const media = await persistGeneratedImage(user.id, projectId, bytes, contentType);
@@ -1132,6 +1240,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         status: "succeeded",
         mediaId: media.id,
         jobId,
+        ...cost,
       });
       if (!updated) {
         throw new HttpError(503, "IMAGE_STORE_UNAVAILABLE", "The image store did not confirm the generation.");
@@ -1176,6 +1285,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       const updated = await store.update(user.id, projectId, generation.id, {
         status: "succeeded",
         mediaId: media.id,
+        ...leonardoCost(null, polled.apiCreditCost, polled.cost, generation.providerCost),
       });
       sendJson(response, 200, { ok: true, generation: updated ?? generation, media });
     } catch (error) {

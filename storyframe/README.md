@@ -784,12 +784,26 @@ the provider is not configured the route refuses with `503 IMAGE_PROVIDER_DISABL
 | `/api/projects/:id/image-generations` | POST | Re-checks credentials, creates a `pending` row (prompt, provider, model, settings, estimate, rate version), generates, persists the image as `image`, and returns `201` with the settled record and media. A Leonardo job still pending at the poll deadline returns `202` with its job id. |
 | `/api/projects/:id/image-generations/:generationId/refresh` | POST | Polls the stored Leonardo job id; `202` while pending, then stores the image and settles the row. |
 | `/api/projects/:id/image-generations` | GET | Most recent 50 generations for the project. |
+| `/api/image-usage` | GET | The caller's image cost ledger for the guard window: attempts, actual/estimated/charged USD, limits, and reset time. |
+
+Every settled generation records what the provider actually charged, not only the preview estimate: Workers AI returns
+`result.usage.neurons`, stored as `actual_neurons` and priced at the catalog's verified rate (`cost_source = 'rate'`).
+Leonardo credits and its `cost` object are stored raw in `provider_cost`; a dollar amount becomes `actual_usd`
+(`cost_source = 'provider'`) only when the provider reports one, and credits alone (`cost_source = 'credits'`) never
+invent a dollar value. The spending guard charges `actual_usd` when it exists and falls back to the estimate otherwise.
+`GET /api/image-usage` returns the caller's ledger totals over the guard window (attempts, actual, estimated, charged,
+limits, and when the window frees up), and the Generate tab shows that line.
+
+A partial unique index allows only one `pending` generation per owner, so the one-at-a-time rule holds across server
+instances rather than only inside one Node process.
 
 The **Generate** workspace tab drives that flow. A model picker shows each model's dimensions, steps, and prompt
 limit, marks a provider without credentials as disabled, and a prompt produces the server's verified cost estimate
 (neurons and USD, or API credit with no invented rate). **Generate image** is explicit and calls only the selected
 provider; a queued job shows **Refresh job** until it settles. The ready asset is previewed through a short-lived
 private playback URL, and **Attach image to scene** writes the scene reference and saves the project in one action.
+The prompt can be seeded from the selected scene's heading and visual direction, and **Regenerate** repeats the current
+prompt and settings without retyping them.
 
 Before any provider call the route applies a per-account spending guard over a rolling 24 hours. It counts every
 recorded attempt for that owner — including failed ones, which may still have been billed — and the sum of their
@@ -823,6 +837,9 @@ row itself is the generation record.
 | Real Cloudflare generation | **PASS** | `npm run verify:image-live` on 2026-11-25, 12/12: the route estimated 172.8 neurons / $0.001901, generated one 1024×1024 flux image through Workers AI, stored it in R2, listed it, and served it from a presigned playback URL before cleanup. Credential diagnosis: `CLOUDFLARE_API_TOKEN` is a valid, active token but Workers AI rejects it with `401` code `10000` (no Workers AI permission); the project's `CF_API_TOKEN` is the Workers AI token and works. The adapter now accepts `CF_API_TOKEN` as the `CLOUDFLARE_AI_API_TOKEN` fallback |
 | Real Leonardo generation | **BLOCKED** | `LEONARDO_API_KEY` is a 36-character UUID rather than a Leonardo API key (Leonardo keys are long JWTs), and Leonardo returns `401` for both `POST /generations` and `/me`. It cannot work until a real key is issued; the route correctly records the failure and stores no media |
 | Hosted schema | **PASS** | `20261125200000_create_image_generations.sql` applied through the Supabase management API on 2026-11-25; `verify:sql` reports 92/92, including the service-role insert, `42501` for authenticated reads, and `23514` for an unknown provider |
+| Actual provider cost | **PASS** | `tests/image-providers.test.ts` maps Workers AI usage and Leonardo credit/cost payloads; `tests/image-generations.test.ts` stores `actualNeurons: 57.6`, `actualUsd: 0.000634`, `costSource: 'rate'` for flux, a provider-reported `0.02 USD` cost for Leonardo, and no invented USD when only credits exist. `verify:sql` rejects an unknown `cost_source` (`23514`); the route-live suite checks the stored cost against the real database |
+| Cost ledger and actual-first guard | **PASS** | `GET /api/image-usage` returns the caller's attempts, actual/estimated/charged totals, limits, and reset time and refuses anonymous reads; a seeded settled cost of $0.01 blocks the next image under a $0.005 limit even though the estimates alone would fit; the DOM shows the last-24-hours spend on the Generate tab |
+| One pending generation across instances | **PASS** | `20261125220000_one_pending_image_generation.sql` adds a partial unique index; `verify:sql` rejects a second pending row for the owner (`23505`) and allows one after the first settles; the route returns `429 IMAGE_GENERATION_IN_FLIGHT` for a stored pending job without a provider call |
 | Per-user spending guard | **PASS** | `tests/image-generations.test.ts`: two recorded attempts with a limit of 2 return `429 IMAGE_SPEND_LIMIT` without a row or provider write; a prior $0.001901 estimate with a $0.0035 limit refuses the next priced image; a 25-hour-old attempt and two other-account attempts do not count; a provider with no USD rate is still capped by image count; two simultaneous requests yield one `201` and one `429 IMAGE_GENERATION_IN_FLIGHT`. `verify:image-routes-live` runs with a limit of 1 and gets `429 IMAGE_SPEND_LIMIT` for a second generation with no new row or media |
 | Generation UI | **PASS (DOM)** | `tests/generate-panel.test.tsx`: the model picker marks a credential-less provider disabled; a prompt triggers the server estimate and shows $0.001901 / 172.8 neurons with its verified date and source; no generation request is made before **Generate image**; the result previews from a private playback URL and **Attach image to scene** writes the scene reference and saves the document; a `202` job shows **Refresh job** and only then completes; a provider failure shows the sanitized code without a preview |
 

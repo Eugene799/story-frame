@@ -131,6 +131,20 @@ function installBackend(options: BackendOptions = {}) {
       if (url.pathname === "/api/image-models" && method === "GET") {
         return jsonResponse({ ok: true, models: MODELS });
       }
+      if (url.pathname === "/api/image-usage" && method === "GET") {
+        return jsonResponse({
+          ok: true,
+          usage: {
+            windowHours: 24,
+            attempts: 1,
+            spentUsd: 0.000634,
+            actualUsd: 0.000634,
+            estimatedUsd: 0.001901,
+            limits: { images: 20, usd: 1 },
+            resetAt: null,
+          },
+        });
+      }
       if (url.pathname === `/api/projects/${PROJECT_ID}/image-generations/estimate` && method === "POST") {
         return jsonResponse({
           ok: true,
@@ -200,6 +214,21 @@ function installBackend(options: BackendOptions = {}) {
   return { requests, polled: () => polled };
 }
 
+async function eventuallyRequests(
+  backend: { requests: { method: string; path: string }[] },
+  count: number,
+): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const posts = backend.requests.filter(
+      (request) =>
+        request.method === "POST" && request.path === `/api/projects/${PROJECT_ID}/image-generations`,
+    );
+    if (posts.length >= count) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("generation request was not sent");
+}
+
 function renderPanel(
   options: { onAttachAsset?: (sceneId: string, mediaId: string) => Promise<boolean> } = {},
 ) {
@@ -225,11 +254,20 @@ describe("GeneratePanel", () => {
     const backend = installBackend();
     renderPanel();
 
+    const spend = await screen.findByLabelText("Daily image spend");
+    expect(spend.textContent).toContain("$0.0006");
+    expect(spend.textContent).toContain("20 image limit");
+
     const model = await screen.findByLabelText("Model");
     expect(within(model).getByRole("option", { name: "Cloudflare FLUX.1 schnell" })).toBeTruthy();
     const disabled = within(model).getByRole("option", { name: /Leonardo Phoenix 1.0 — credentials missing/ });
     expect((disabled as HTMLOptionElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: "Generate image" }) as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Use scene direction" }));
+    expect((screen.getByLabelText("Prompt") as HTMLTextAreaElement).value).toBe(
+      "Opening. Stormy coast",
+    );
 
     fireEvent.change(screen.getByLabelText("Prompt"), {
       target: { value: "a lighthouse on a stormy coast" },
@@ -275,7 +313,10 @@ describe("GeneratePanel", () => {
     });
     expect(await screen.findByText(/682 KiB/)).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "Attach image to scene" }));
+    fireEvent.click(screen.getByRole("button", { name: "Regenerate" }));
+    await eventuallyRequests(backend, 2);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Attach image to scene" }));
 
     await waitFor(() => expect(attach).toHaveBeenCalledWith(SCENE_ID, MEDIA_ID));
     const reference = backend.requests.find(

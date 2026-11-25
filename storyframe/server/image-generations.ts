@@ -147,7 +147,7 @@ export function estimateImageGeneration(request: ResolvedImageRequest): ImageEst
 // ---- Store ------------------------------------------------------------------
 
 const COLUMNS =
-  "id,project_id,provider,model_key,prompt,settings,status,job_id,media_id,estimated_usd,estimated_neurons,rate_version,provider_cost,error_code,created_at,updated_at";
+  "id,project_id,provider,model_key,prompt,settings,status,job_id,media_id,estimated_usd,estimated_neurons,actual_usd,actual_neurons,cost_source,rate_version,provider_cost,error_code,created_at,updated_at";
 
 function corrupt(field: string): never {
   throw new ApiError(503, "IMAGE_STORE_CORRUPT", `The image store returned a malformed row (${field}).`);
@@ -179,6 +179,10 @@ function toRecord(row: Record<string, unknown>): ImageGenerationRecord {
   };
   const usd = numeric(row.estimated_usd);
   const neurons = numeric(row.estimated_neurons);
+  const costSource = row.cost_source;
+  if (costSource !== null && costSource !== undefined && costSource !== "provider" && costSource !== "rate" && costSource !== "credits") {
+    corrupt("cost_source");
+  }
   return {
     id: text(row, "id"),
     projectId: text(row, "project_id"),
@@ -195,6 +199,9 @@ function toRecord(row: Record<string, unknown>): ImageGenerationRecord {
     mediaId: nullableText(row, "media_id"),
     estimatedUsd: usd,
     estimatedNeurons: neurons,
+    actualUsd: numeric(row.actual_usd),
+    actualNeurons: numeric(row.actual_neurons),
+    costSource: (costSource ?? null) as ImageGenerationRecord["costSource"],
     rateVersion: text(row, "rate_version"),
     providerCost:
       row.provider_cost && typeof row.provider_cost === "object" && !Array.isArray(row.provider_cost)
@@ -223,16 +230,26 @@ export interface ImageGenerationPatch {
   jobId?: string | null;
   mediaId?: string | null;
   providerCost?: Record<string, unknown> | null;
+  actualUsd?: number | null;
+  actualNeurons?: number | null;
+  costSource?: "provider" | "rate" | "credits" | null;
   errorCode?: string | null;
 }
 
 export interface ImageSpendSnapshot {
   attempts: number;
+  /** What the guard charges: actual cost when settled, otherwise the estimate. */
+  spentUsd: number;
+  actualUsd: number;
   estimatedUsd: number;
+  /** Oldest counted attempt, which decides when the window frees up. */
+  oldestAt: string | null;
 }
 
 export interface ImageGenerationStore {
   create(ownerId: string, generation: ImageGenerationCreate): Promise<ImageGenerationRecord>;
+  /** True while any generation for this owner is still pending. */
+  hasPending(ownerId: string): Promise<boolean>;
   /** Every recorded attempt in the window, whatever its final status, since a
    *  failed attempt may still have been billed by the provider. */
   usageSince(ownerId: string, sinceIso: string): Promise<ImageSpendSnapshot>;
@@ -264,12 +281,21 @@ export function createSupabaseImageGenerationStore(
     Prefer: "return=representation",
   };
 
-  async function request(target: string, init: RequestInit, action: string): Promise<unknown> {
+    async function request(target: string, init: RequestInit, action: string): Promise<unknown> {
     let response: Response;
+
     try {
       response = await fetch(target, { ...init, signal: AbortSignal.timeout(options.timeoutMs) });
     } catch {
       throw new ApiError(503, "IMAGE_STORE_UNAVAILABLE", "The image store is unreachable.");
+    }
+    if (response.status === 409) {
+      // The partial unique index on pending generations is the race backstop.
+      throw new ApiError(
+        429,
+        "IMAGE_GENERATION_IN_FLIGHT",
+        "An image generation is already pending for this account. Refresh or settle it before starting another.",
+      );
     }
     if (!response.ok) {
       throw new ApiError(
@@ -325,27 +351,60 @@ export function createSupabaseImageGenerationStore(
       return toRecord(created[0]);
     },
 
+    async hasPending(ownerId) {
+      const found = rows(
+        await request(
+          tableUrl({
+            select: "id",
+            owner_id: `eq.${ownerId}`,
+            status: "eq.pending",
+            limit: "1",
+          }),
+          { headers },
+          "the pending generation read",
+        ),
+      );
+      return found.length > 0;
+    },
+
     async usageSince(ownerId, sinceIso) {
       const found = rows(
         await request(
           tableUrl({
-            select: "created_at,estimated_usd",
+            select: "created_at,estimated_usd,actual_usd",
             owner_id: `eq.${ownerId}`,
             created_at: `gte.${sinceIso}`,
+            order: "created_at.asc",
             limit: "1000",
           }),
           { headers },
           "the image usage read",
         ),
       );
+      const amount = (value: unknown): number => {
+        if (value === null || value === undefined) return 0;
+        const parsed = typeof value === "number" ? value : Number(value);
+        return Number.isFinite(parsed) ? parsed : corrupt("cost");
+      };
       let estimatedUsd = 0;
+      let actualUsd = 0;
+      let spentUsd = 0;
       for (const row of found) {
-        const value = row.estimated_usd;
-        const parsed = typeof value === "number" ? value : value === null ? 0 : Number(value);
-        if (!Number.isFinite(parsed)) corrupt("estimated_usd");
-        estimatedUsd += parsed;
+        const estimated = amount(row.estimated_usd);
+        const hasActual = row.actual_usd !== null && row.actual_usd !== undefined;
+        const actual = amount(row.actual_usd);
+        estimatedUsd += estimated;
+        actualUsd += actual;
+        spentUsd += hasActual ? actual : estimated;
       }
-      return { attempts: found.length, estimatedUsd: Number(estimatedUsd.toFixed(6)) };
+      const oldest = found[0]?.created_at;
+      return {
+        attempts: found.length,
+        spentUsd: Number(spentUsd.toFixed(6)),
+        actualUsd: Number(actualUsd.toFixed(6)),
+        estimatedUsd: Number(estimatedUsd.toFixed(6)),
+        oldestAt: typeof oldest === "string" ? oldest : null,
+      };
     },
 
     async update(ownerId, projectId, generationId, patch) {
@@ -354,6 +413,9 @@ export function createSupabaseImageGenerationStore(
       if (patch.jobId !== undefined) body.job_id = patch.jobId;
       if (patch.mediaId !== undefined) body.media_id = patch.mediaId;
       if (patch.providerCost !== undefined) body.provider_cost = patch.providerCost;
+      if (patch.actualUsd !== undefined) body.actual_usd = patch.actualUsd;
+      if (patch.actualNeurons !== undefined) body.actual_neurons = patch.actualNeurons;
+      if (patch.costSource !== undefined) body.cost_source = patch.costSource;
       if (patch.errorCode !== undefined) body.error_code = patch.errorCode;
       const updated = rows(
         await request(

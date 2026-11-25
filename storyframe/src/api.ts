@@ -34,6 +34,8 @@ import type {
   ImageGenerationResponse,
   ImageModelView,
   ImageModelsResponse,
+  ImageUsageResponse,
+  ImageUsageSummary,
 } from "../shared/image-generation-contract";
 import type {
   ProjectDeletedResponse,
@@ -296,6 +298,10 @@ export async function deleteMediaRecord(
 
 export async function listImageModels(accessToken: string): Promise<ImageModelView[]> {
   return (await authorizedJson<ImageModelsResponse>("/api/image-models", accessToken)).models;
+}
+
+export async function getImageUsage(accessToken: string): Promise<ImageUsageSummary> {
+  return (await authorizedJson<ImageUsageResponse>("/api/image-usage", accessToken)).usage;
 }
 
 export async function estimateImageGeneration(

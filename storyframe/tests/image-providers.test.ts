@@ -156,6 +156,8 @@ describe("leonardo adapter", () => {
     await expect(poll({ generations_by_pk: { status: "PENDING" } })).resolves.toEqual({
       status: "pending",
       imageUrls: [],
+      apiCreditCost: null,
+      cost: null,
     });
     await expect(
       poll({
@@ -167,10 +169,27 @@ describe("leonardo adapter", () => {
           ],
         },
       }),
-    ).resolves.toEqual({ status: "succeeded", imageUrls: ["https://cdn.leonardo.ai/image-1.png"] });
+    ).resolves.toEqual({
+      status: "succeeded",
+      imageUrls: ["https://cdn.leonardo.ai/image-1.png"],
+      apiCreditCost: null,
+      cost: null,
+    });
+    await expect(
+      poll({
+        generations_by_pk: {
+          status: "COMPLETE",
+          apiCreditCost: 3,
+          cost: { amount: 0.02, unit: "USD" },
+          generated_images: [{ url: "https://cdn.leonardo.ai/image-2.png" }],
+        },
+      }),
+    ).resolves.toMatchObject({ apiCreditCost: 3, cost: { amount: 0.02, unit: "USD" } });
     await expect(poll({ generations_by_pk: { status: "FAILED" } })).resolves.toEqual({
       status: "failed",
       imageUrls: [],
+      apiCreditCost: null,
+      cost: null,
     });
   });
 

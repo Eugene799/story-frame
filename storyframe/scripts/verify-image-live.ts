@@ -52,7 +52,12 @@ function fakeProviderFetch(): typeof fetch {
   return (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (url.startsWith("https://api.cloudflare.com/")) {
-      return new Response(JSON.stringify({ result: { image: PNG.toString("base64") }, success: true }), {
+      return new Response(
+        JSON.stringify({
+          result: { image: PNG.toString("base64"), usage: { neurons: 57.6 } },
+          success: true,
+        }),
+        {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
@@ -268,6 +273,22 @@ async function main(): Promise<number> {
         generation?.rateVersion?.length > 0,
       `status=${generated.status} code=${generated.body?.error?.code ?? "none"}`,
     );
+    if (modelKey === "cloudflare:flux-1-schnell") {
+      const actualNeurons = generation?.actualNeurons;
+      const expectedUsd =
+        typeof actualNeurons === "number" ? Number(((actualNeurons / 1000) * 0.011).toFixed(6)) : null;
+      check(
+        "the provider-reported cost is stored with the generation",
+        typeof actualNeurons === "number" &&
+          actualNeurons > 0 &&
+          generation?.actualUsd === expectedUsd &&
+          generation?.costSource === "rate" &&
+          typeof generation?.providerCost?.usage?.neurons === "number" &&
+          Math.abs(generation.providerCost.usage.neurons - actualNeurons) < 0.001,
+        `neurons=${actualNeurons} usd=${generation?.actualUsd} expected=${expectedUsd} source=${generation?.costSource} cost=${JSON.stringify(generation?.providerCost).slice(0, 200)}`,
+      );
+    }
+
     check(
       "the generation keeps the provider job or synchronous marker and settings",
       generation?.provider === (modelKey === "leonardo:phoenix-1.0" ? "leonardo" : "cloudflare") &&

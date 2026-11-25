@@ -30,6 +30,8 @@ interface ProviderState {
   /** Polls return PENDING while true. */
   leonardoPending?: boolean;
   leonardoJobId?: string;
+  /** Adds the provider's cost object and credits to the completed poll. */
+  leonardoCost?: boolean;
   imageUrl?: string;
   imageBytes?: Buffer;
 }
@@ -45,7 +47,10 @@ function providerFetch(state: ProviderState = {}): typeof fetch {
       if (state.cloudflareStatus && state.cloudflareStatus >= 400) {
         return jsonResponse({ error: "provider failure cf-token" }, state.cloudflareStatus);
       }
-      return jsonResponse({ result: { image: PNG.toString("base64") }, success: true });
+      return jsonResponse({
+        result: { image: PNG.toString("base64"), usage: { neurons: 57.6 } },
+        success: true,
+      });
     }
     if (url === "https://cloud.leonardo.ai/api/rest/v1/generations" && init?.method === "POST") {
       return jsonResponse({ sdGenerationJob: { generationId: jobId } });
@@ -54,7 +59,13 @@ function providerFetch(state: ProviderState = {}): typeof fetch {
       return jsonResponse({
         generations_by_pk: state.leonardoPending
           ? { status: "PENDING" }
-          : { status: "COMPLETE", generated_images: [{ url: imageUrl }] },
+          : {
+              status: "COMPLETE",
+              generated_images: [{ url: imageUrl }],
+              ...(state.leonardoCost
+                ? { apiCreditCost: 3, cost: { amount: 0.02, unit: "USD" } }
+                : {}),
+            },
       });
     }
     if (url === imageUrl) {
@@ -198,6 +209,10 @@ describe("image generation", () => {
       status: "succeeded",
       jobId: null,
       estimatedNeurons: 172.8,
+      actualNeurons: 57.6,
+      actualUsd: 0.000634,
+      costSource: "rate",
+      providerCost: { provider: "cloudflare", usage: { neurons: 57.6 } },
       rateVersion: "cloudflare-flux-schnell-2026-11-25",
     });
     expect(response.body.media).toMatchObject({ kind: "image", status: "ready", contentType: "image/png" });
@@ -235,6 +250,26 @@ describe("image generation", () => {
     });
     expect(response.body.media.status).toBe("ready");
     expect(app.r2.puts).toBe(1);
+    // Without a provider cost object, no dollar amount is invented.
+    expect(response.body.generation.actualUsd).toBeNull();
+    expect(response.body.generation.costSource).toBeNull();
+  });
+
+  it("captures a provider-reported dollar cost on completion", async () => {
+    const app = await startImageApp({ leonardoCost: true });
+    const projectId = await createProject(app);
+    const response = await api(app, USER_A.token, "POST", `/api/projects/${projectId}/image-generations`, {
+      modelKey: "leonardo:phoenix-1.0",
+      prompt: "a lighthouse",
+    });
+
+    expect(response.status).toBe(201);
+    expect(response.body.generation).toMatchObject({
+      actualUsd: 0.02,
+      actualNeurons: null,
+      costSource: "provider",
+      providerCost: { provider: "leonardo", apiCreditCost: 3, cost: { amount: 0.02, unit: "USD" } },
+    });
   });
 
   it("leaves a pending Leonardo job refreshable and completes it later", async () => {
@@ -348,7 +383,7 @@ describe("image generation", () => {
 
     expect(response.status).toBe(429);
     expect(response.body.error.code).toBe("IMAGE_SPEND_LIMIT");
-    expect(response.body.error.message).toContain("Estimated image spend");
+    expect(response.body.error.message).toContain("Image spend");
     expect(app.supabase.imageGenerations).toHaveLength(1);
     expect(app.r2.puts).toBe(0);
   });
@@ -394,6 +429,22 @@ describe("image generation", () => {
     expect(response.body.generation.estimatedUsd).toBeNull();
   });
 
+  it("refuses a new generation while a stored job is still pending", async () => {
+    const app = await startImageApp();
+    const projectId = await createProject(app);
+    seedGeneration(app, { status: "pending", media_id: null, job_id: "job-old" });
+
+    const response = await api(app, USER_A.token, "POST", `/api/projects/${projectId}/image-generations`, {
+      modelKey: "cloudflare:flux-1-schnell",
+      prompt: "another",
+    });
+
+    expect(response.status).toBe(429);
+    expect(response.body.error.code).toBe("IMAGE_GENERATION_IN_FLIGHT");
+    expect(app.supabase.imageGenerations).toHaveLength(1);
+    expect(app.r2.puts).toBe(0);
+  });
+
   it("refuses a second generation while the first is still in flight", async () => {
     let releaseGate: () => void = () => undefined;
     const gate = new Promise<void>((resolve) => {
@@ -420,6 +471,44 @@ describe("image generation", () => {
     const completed = await first;
     expect(completed.status).toBe(201);
     expect(app.supabase.imageGenerations).toHaveLength(1);
+  });
+
+  it("charges the guard the actual cost, not the estimate, once settled", async () => {
+    const app = await startImageApp({}, { ...PROVIDER_ENV, IMAGE_DAILY_USD_PER_USER: "0.005" });
+    const projectId = await createProject(app);
+    seedGeneration(app, { estimated_usd: 0.0009, actual_usd: 0.01, cost_source: "provider" });
+
+    const response = await api(app, USER_A.token, "POST", `/api/projects/${projectId}/image-generations`, {
+      modelKey: "cloudflare:flux-1-schnell",
+      prompt: "one more",
+    });
+
+    // The estimates alone (0.0009 + 0.001901) would fit under 0.005.
+    expect(response.status).toBe(429);
+    expect(response.body.error.code).toBe("IMAGE_SPEND_LIMIT");
+    expect(app.r2.puts).toBe(0);
+  });
+
+  it("reports the caller's image cost ledger", async () => {
+    const app = await startImageApp();
+    seedGeneration(app, { estimated_usd: 0.001, actual_usd: 0.01, cost_source: "provider" });
+    seedGeneration(app, { estimated_usd: 0.002 });
+    seedGeneration(app, { owner_id: USER_B.id, estimated_usd: 5 });
+
+    const response = await api(app, USER_A.token, "GET", "/api/image-usage");
+
+    expect(response.status).toBe(200);
+    expect(response.body.usage).toMatchObject({
+      windowHours: 24,
+      attempts: 2,
+      actualUsd: 0.01,
+      estimatedUsd: 0.003,
+      spentUsd: 0.012,
+      limits: { images: 20, usd: 1 },
+    });
+    expect(typeof response.body.usage.resetAt).toBe("string");
+    const anonymous = await fetch(`${app.url}/api/image-usage`);
+    expect(anonymous.status).toBe(401);
   });
 
   it("refuses another account's project", async () => {

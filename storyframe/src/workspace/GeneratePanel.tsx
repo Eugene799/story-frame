@@ -3,6 +3,7 @@ import type {
   ImageEstimate,
   ImageGenerationRecord,
   ImageModelView,
+  ImageUsageSummary,
 } from "../../shared/image-generation-contract";
 import type { MediaPlayback, MediaRecord } from "../../shared/media-contract";
 import type { ProjectScene } from "../../shared/project-contract";
@@ -11,6 +12,7 @@ import {
   attachMediaReference,
   createImageGeneration,
   estimateImageGeneration,
+  getImageUsage,
   getMediaPlaybackUrl,
   listImageModels,
   refreshImageGeneration,
@@ -46,6 +48,7 @@ export function GeneratePanel({
   const [modelKey, setModelKey] = useState("");
   const [prompt, setPrompt] = useState("");
   const [estimate, setEstimate] = useState<ImageEstimate | null>(null);
+  const [usage, setUsage] = useState<ImageUsageSummary | null>(null);
   const [estimating, setEstimating] = useState(false);
   const [estimateError, setEstimateError] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
@@ -64,6 +67,25 @@ export function GeneratePanel({
     Boolean(prompt.trim()) && Boolean(selectedModel?.configured) && !generating && Boolean(modelKey);
   const selectedScene = scenes.find((scene) => scene.id === sceneId) ?? null;
   const alreadyAttached = Boolean(media && selectedScene?.assetIds.includes(media.id));
+  const scenePrompt = selectedScene
+    ? [selectedScene.heading, selectedScene.visualDirection]
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .join(". ")
+    : "";
+
+  async function refreshUsage(): Promise<void> {
+    try {
+      setUsage(await getImageUsage(await getAccessToken()));
+    } catch {
+      // The spend line is informational; the guard still enforces the limit.
+    }
+  }
+
+  useEffect(() => {
+    void refreshUsage();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (!scenes.some((scene) => scene.id === sceneId)) {
@@ -154,6 +176,7 @@ export function GeneratePanel({
     setGeneration(next);
     setMedia(nextMedia);
     setError(null);
+    void refreshUsage();
     if (next.status === "succeeded" && nextMedia) {
       setNotice("Image generated and stored in private media.");
     } else if (next.status === "pending") {
@@ -280,6 +303,23 @@ export function GeneratePanel({
           </p>
         )}
 
+        <label className="field" htmlFor="generate-scene-source">
+          <span className="field-label">Scene</span>
+          <select
+            id="generate-scene-source"
+            value={sceneId}
+            onChange={(event) => setSceneId(event.target.value)}
+            disabled={generating}
+          >
+            <option value="">No scene</option>
+            {scenes.map((scene, index) => (
+              <option key={scene.id} value={scene.id}>
+                Scene {index + 1}: {scene.heading}
+              </option>
+            ))}
+          </select>
+        </label>
+
         <label className="field" htmlFor="generate-prompt">
           <span className="field-label">Prompt</span>
           <textarea
@@ -294,6 +334,19 @@ export function GeneratePanel({
         </label>
         <p className="hint">
           {prompt.trim().length} / {selectedModel?.maxPromptChars ?? "—"} characters
+          {scenePrompt && (
+            <>
+              {" · "}
+              <button
+                type="button"
+                className="button-secondary button-small"
+                onClick={() => setPrompt(scenePrompt.slice(0, selectedModel?.maxPromptChars ?? 2000))}
+                disabled={generating}
+              >
+                Use scene direction
+              </button>
+            </>
+          )}
         </p>
 
         <div className="editor-actions">
@@ -334,6 +387,16 @@ export function GeneratePanel({
           </>
         )}
       </div>
+
+      {usage && (
+        <p className="hint" aria-label="Daily image spend">
+          Last 24 hours: {usage.attempts} generation{usage.attempts === 1 ? "" : "s"} · $
+          {usage.spentUsd.toFixed(4)} spent
+          {usage.limits.usd !== null ? ` of $${usage.limits.usd.toFixed(2)}` : " (no USD limit set)"}
+          {usage.limits.images !== null ? ` · ${usage.limits.images} image limit` : ""}
+          {usage.resetAt ? ` · resets ${new Date(usage.resetAt).toLocaleTimeString()}` : ""}
+        </p>
+      )}
 
       {generation?.status === "pending" && (
         <div className="generation-pending">
@@ -399,6 +462,14 @@ export function GeneratePanel({
               disabled={!sceneId || attaching || alreadyAttached}
             >
               {attaching ? "Attaching..." : "Attach image to scene"}
+            </button>
+            <button
+              type="button"
+              className="button-secondary button-small"
+              onClick={() => void generate()}
+              disabled={!canGenerate}
+            >
+              Regenerate
             </button>
             {alreadyAttached && <p className="hint">Already attached to this scene.</p>}
           </div>

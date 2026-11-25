@@ -24,6 +24,8 @@ const MIGRATIONS = [
   "20261125160000_add_stock_media.sql",
   "20261125180000_enforce_stock_import_uniqueness.sql",
   "20261125200000_create_image_generations.sql",
+  "20261125210000_add_image_generation_cost_capture.sql",
+  "20261125220000_one_pending_image_generation.sql",
 ];
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "supabase", "migrations");
 
@@ -421,6 +423,34 @@ check("image_generations: the service role stores a generation",
   (await count("image_generations", "model_key = 'cloudflare:flux-1-schnell'", [])) === 1);
 check("image_generations: authenticated reads are refused (42501)",
   (await errorCode(() => as("authenticated", USER_A, "select count(*) from public.image_generations"))) === "42501");
+await as("service_role", null,
+  `update public.image_generations
+      set actual_neurons = 57.6, actual_usd = 0.000634, cost_source = 'rate'
+    where model_key = 'cloudflare:flux-1-schnell'`);
+check("image_generations: actual cost is stored with its source",
+  (await count("image_generations", "actual_usd = 0.000634 and cost_source = 'rate'", [])) === 1);
+check("image_generations: an unknown cost source is rejected (23514)",
+  (await errorCode(() => as("service_role", null,
+    `update public.image_generations set cost_source = 'imaginary'
+      where model_key = 'cloudflare:flux-1-schnell'`))) === "23514");
+check("image_generations: a second pending row for the owner is rejected (23505)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.image_generations
+       (id, owner_id, project_id, provider, model_key, prompt, settings, status, rate_version)
+     values (gen_random_uuid(), $1, $2, 'cloudflare', 'cloudflare:flux-1-schnell', 'second', '{"width":1024,"height":1024,"steps":4}'::jsonb, 'pending', 'rate-v1')`,
+    [USER_A, PROJECT_A]))) === "23505");
+await as("service_role", null,
+  `update public.image_generations set status = 'succeeded'
+    where owner_id = $1 and status = 'pending'`,
+  [USER_A]);
+const pendingFollowup = await errorCode(() => as("service_role", null,
+  `insert into public.image_generations
+     (id, owner_id, project_id, provider, model_key, prompt, settings, status, rate_version)
+   values (gen_random_uuid(), $1, $2, 'cloudflare', 'cloudflare:flux-1-schnell', 'next', '{"width":1024,"height":1024,"steps":4}'::jsonb, 'pending', 'rate-v1')`,
+  [USER_A, PROJECT_A]));
+check("image_generations: a pending row is allowed after the first settles",
+  pendingFollowup === "NO_ERROR", String(pendingFollowup));
+
 check("image_generations: an unknown provider is rejected (23514)",
   (await errorCode(() => as("service_role", null,
     `insert into public.image_generations

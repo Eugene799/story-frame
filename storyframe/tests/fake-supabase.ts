@@ -624,6 +624,17 @@ export async function startFakeSupabase(
             const created: Record<string, unknown>[] = [];
 
             for (const body of bodies) {
+              // Mirrors the partial unique index: one pending image generation
+              // per owner, across instances.
+              if (
+                table === "image_generations" &&
+                body.status === "pending" &&
+                data.some((row) => row.owner_id === body.owner_id && row.status === "pending")
+              ) {
+                sendJson(response, 409, { code: "23505", message: "duplicate pending generation" });
+                return;
+              }
+
               // Uniqueness the server relies on for idempotent media writes.
               if (
                 table === "media_metadata" &&

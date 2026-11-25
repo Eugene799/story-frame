@@ -56,6 +56,8 @@ export interface ImageEstimateResponse {
   estimate: ImageEstimate;
 }
 
+export type ImageCostSource = "provider" | "rate" | "credits";
+
 export interface ImageGenerationRecord {
   id: string;
   projectId: string;
@@ -68,6 +70,10 @@ export interface ImageGenerationRecord {
   mediaId: string | null;
   estimatedUsd: number | null;
   estimatedNeurons: number | null;
+  /** Billed or provider-reported cost; null until the provider settles. */
+  actualUsd: number | null;
+  actualNeurons: number | null;
+  costSource: ImageCostSource | null;
   rateVersion: string;
   providerCost: Record<string, unknown> | null;
   errorCode: string | null;
@@ -85,4 +91,20 @@ export interface ImageGenerationResponse {
 export interface ImageGenerationListResponse {
   ok: true;
   generations: ImageGenerationRecord[];
+}
+
+/** The caller's image cost ledger over the guard's rolling window. */
+export interface ImageUsageSummary {
+  windowHours: number;
+  attempts: number;
+  spentUsd: number;
+  actualUsd: number;
+  estimatedUsd: number;
+  limits: { images: number | null; usd: number | null };
+  resetAt: string | null;
+}
+
+export interface ImageUsageResponse {
+  ok: true;
+  usage: ImageUsageSummary;
 }
