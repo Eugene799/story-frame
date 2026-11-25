@@ -52,31 +52,64 @@ function listOf<T>(value: T[] | undefined): T[] {
 const PENDING_KEY_PREFIX = "storyframe.planning.pendingKey.";
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 
+/** The request identity a key was minted for; the server hashes route and prompt. */
+interface PendingPlanningAttempt {
+  key: string;
+  route: PlanningRoute;
+  instruction: string;
+  baseVersion: number;
+}
+
 function pendingKeyStorageName(projectId: string): string {
   return `${PENDING_KEY_PREFIX}${projectId}`;
 }
 
+function isSameRequest(attempt: PendingPlanningAttempt, route: PlanningRoute, instruction: string, baseVersion: number) {
+  return attempt.route === route && attempt.instruction === instruction && attempt.baseVersion === baseVersion;
+}
+
 /** Survives a reload in this tab, so Retry can still replay an unsettled attempt. */
-function readPendingKey(projectId: string): string | null {
+function readPendingAttempt(projectId: string): PendingPlanningAttempt | null {
   if (typeof window === "undefined") return null;
   try {
-    const value = window.sessionStorage.getItem(pendingKeyStorageName(projectId));
-    return value && IDEMPOTENCY_KEY_PATTERN.test(value) ? value : null;
+    const raw = window.sessionStorage.getItem(pendingKeyStorageName(projectId));
+    if (!raw) return null;
+    const value: unknown = JSON.parse(raw);
+    if (!value || typeof value !== "object") return null;
+    const record = value as Record<string, unknown>;
+    if (
+      typeof record.key !== "string" ||
+      !IDEMPOTENCY_KEY_PATTERN.test(record.key) ||
+      typeof record.route !== "string" ||
+      !PLANNING_ROUTES.includes(record.route as PlanningRoute) ||
+      typeof record.instruction !== "string" ||
+      typeof record.baseVersion !== "number" ||
+      !Number.isInteger(record.baseVersion) ||
+      record.baseVersion < 1
+    ) {
+      return null;
+    }
+    return {
+      key: record.key,
+      route: record.route as PlanningRoute,
+      instruction: record.instruction,
+      baseVersion: record.baseVersion,
+    };
   } catch {
     return null;
   }
 }
 
-function storePendingKey(projectId: string, key: string): void {
+function storePendingAttempt(projectId: string, attempt: PendingPlanningAttempt): void {
   if (typeof window === "undefined") return;
   try {
-    window.sessionStorage.setItem(pendingKeyStorageName(projectId), key);
+    window.sessionStorage.setItem(pendingKeyStorageName(projectId), JSON.stringify(attempt));
   } catch {
     // Storage can be unavailable (private mode); the attempt still works in memory.
   }
 }
 
-function clearPendingKey(projectId: string): void {
+function clearPendingAttempt(projectId: string): void {
   if (typeof window === "undefined") return;
   try {
     window.sessionStorage.removeItem(pendingKeyStorageName(projectId));
@@ -197,11 +230,16 @@ export function PlanningPanel({
   const [acting, setActing] = useState(false);
   const [error, setError] = useState<AiRequestError | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  // Reused only while an attempt's outcome is unknown (a network failure), so a
-  // retry replays the recorded proposal instead of paying for another one.
-  const pendingKey = useRef<string | null>(null);
+  // Reused only while an attempt's outcome is unknown, so a retry replays the
+  // recorded proposal instead of paying for another one.
+  const pendingAttempt = useRef<PendingPlanningAttempt | null>(null);
 
   const busy = generating || acting;
+
+  // A different project is a different attempt; never carry a key across it.
+  useEffect(() => {
+    pendingAttempt.current = null;
+  }, [projectId]);
 
   useEffect(() => {
     onBusyChange?.(busy);
@@ -235,9 +273,15 @@ export function PlanningPanel({
     setGenerating(true);
     setError(null);
     setNotice(null);
-    const key = pendingKey.current ?? readPendingKey(projectId) ?? newIdempotencyKey();
-    pendingKey.current = key;
-    storePendingKey(projectId, key);
+    const previous = pendingAttempt.current ?? readPendingAttempt(projectId);
+    const key =
+      previous && isSameRequest(previous, route, instruction, baseVersion)
+        ? previous.key
+        : newIdempotencyKey();
+    // A changed request can never replay the old attempt (the server hashes the
+    // exact prompt), so keeping the old key would only produce a 409 reuse.
+    pendingAttempt.current = { key, route, instruction, baseVersion };
+    storePendingAttempt(projectId, pendingAttempt.current);
     try {
       const created = await generatePlanningProposal(
         await getAccessToken(),
@@ -245,9 +289,15 @@ export function PlanningPanel({
         { route, instruction, baseVersion },
         key,
       );
-      pendingKey.current = null;
-      clearPendingKey(projectId);
-      setProposals((current) => [...(current ?? []), created]);
+      pendingAttempt.current = null;
+      clearPendingAttempt(projectId);
+      // A replayed attempt may already be in the list loaded after a reload.
+      setProposals((current) => {
+        const list = current ?? [];
+        return list.some((proposal) => proposal.id === created.id)
+          ? list.map((proposal) => (proposal.id === created.id ? created : proposal))
+          : [...list, created];
+      });
       setSelectedId(created.id);
       setNotice(
         created.modelId === "none" || payloadOf(created).insufficientEvidence
@@ -259,8 +309,8 @@ export function PlanningPanel({
       // Keep the key when no response arrived, the attempt is still running, or
       // the ledger is temporarily unavailable: retrying may replay a paid reply.
       if (!keepsKeyOnRetry(requestError)) {
-        pendingKey.current = null;
-        clearPendingKey(projectId);
+        pendingAttempt.current = null;
+        clearPendingAttempt(projectId);
       }
       setError(requestError);
     } finally {

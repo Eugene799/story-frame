@@ -291,6 +291,84 @@ describe("PlanningPanel", () => {
     expect(keys[1]).not.toBe(keys[0]);
   });
 
+  it("starts a new key when the request changes after an unsettled attempt", async () => {
+    const keys: (string | null)[] = [];
+    const bodies: { instruction?: string }[] = [];
+    let attempts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input), "http://localhost").pathname;
+        if (path.endsWith("/proposals")) return jsonResponse({ ok: true, proposals: [] });
+        if (path.endsWith("/planning")) {
+          keys.push(new Headers(init?.headers).get("Idempotency-Key"));
+          bodies.push(JSON.parse(String(init?.body ?? "{}")) as { instruction?: string });
+          attempts += 1;
+          if (attempts === 1) {
+            return jsonResponse(
+              { ok: false, error: { code: "IDEMPOTENCY_IN_PROGRESS", message: "Still running." } },
+              409,
+            );
+          }
+          return jsonResponse({ ok: true, proposal: proposalFixture() }, 201);
+        }
+        return jsonResponse({ ok: false, error: { code: "NOT_FOUND", message: "not found" } }, 404);
+      }),
+    );
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("No proposals yet.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText("IDEMPOTENCY_IN_PROGRESS")).toBeTruthy();
+
+    fireEvent.change(document.getElementById("planning-instruction") as HTMLTextAreaElement, {
+      target: { value: "A different request" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText("Accept and save")).toBeTruthy();
+
+    expect(keys).toHaveLength(2);
+    expect(keys[1]).not.toBe(keys[0]);
+    expect(bodies[1].instruction).toBe("A different request");
+  });
+
+  it("does not duplicate a proposal already listed after a reload", async () => {
+    const proposal = proposalFixture();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input), "http://localhost").pathname;
+        if (path.endsWith("/proposals")) return jsonResponse({ ok: true, proposals: [proposal] });
+        if (path.endsWith("/planning")) return jsonResponse({ ok: true, proposal }, 201);
+        return jsonResponse({ ok: false, error: { code: "NOT_FOUND", message: "not found" } }, 404);
+      }),
+    );
+    render(
+      <PlanningPanel
+        projectId={PROJECT_ID}
+        baseVersion={1}
+        scenes={[sceneFixture()]}
+        dirty={false}
+        getAccessToken={async () => "token"}
+        onAccepted={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("Proposed · v1 · gemma")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate proposal" }));
+    expect(await screen.findByText("Accept and save")).toBeTruthy();
+    expect(screen.getAllByText("Proposed · v1 · gemma")).toHaveLength(1);
+  });
+
   it("blocks generation and acceptance while the draft is dirty", async () => {
     installBackend();
     render(
