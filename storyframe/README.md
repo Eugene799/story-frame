@@ -127,6 +127,94 @@ NODE_ENV=production HOST=0.0.0.0 PORT=8080 npm start
   are in-process timers, so a sleeping instance advances nothing. A second instance is safe to run — each sweep takes a
   stored lease first — and a restart resumes the paid work (see [Durable job advancement](#durable-job-advancement)).
 
+### Hosting decision: one always-on Node instance
+
+StoryFrame stays on a single always-on Node process. It is not ported to Cloudflare Workers.
+
+- **Why this shape.** The browser calls relative `/api` paths and the API sends no CORS headers, so one origin is
+  required, and that origin is this process serving `dist` from disk. The media, image, video, and lip sync sweeps are
+  in-process timers, and the Supabase service-role REST calls, the R2 SigV4 signer (`node:crypto`), and the static file
+  handler are Node code a Worker would have to replace.
+- **Why always-on.** The sweeps are the clock that advances paid work. On a sleeping instance a submitted render, lip
+  sync, or image generation stops moving until a request wakes the process, and a render that finishes meanwhile is not
+  copied until it does. `plan: starter` in [`render.yaml`](render.yaml) is the paid, always-on plan, and
+  [Instance size](#instance-size) sets the media caps that keep it inside 512 MB. The free instance sleeps after
+  15 minutes of idle time and is not usable for this app.
+- **Why not Workers.** Using Cron Triggers for the sweeps means giving up the in-process timers and the per-process
+  in-flight guards: Workers has a one-minute Cron floor, so the lip sync sweep would drop from every 10 s to every 60 s,
+  and the account-level guards would need a durable replacement. That port was scoped at 8–12 engineering days against
+  a $0–5/month hosting difference, so it buys nothing while the always-on instance costs $7–8/month. Revisit it
+  only if hosting becomes the dominant cost or the instance has to scale beyond one process for load rather than uptime.
+- **What is already safe about one process.** A second instance can run beside the first without double-paying: every
+  sweep claims `job_leases` first, and a restart resumes the same rows (see
+  [Durable job advancement](#durable-job-advancement)).
+
+### Instance size
+
+Peak memory is set by the two paths that hold a whole file in memory: a video copy (streamed render, concatenation,
+and the bucket PUT body) and a lip sync submit (both inputs, their base64 Data URIs, and the serialized body).
+`npm run measure:memory -- <lipsync|video-copy> [MiB]` drives the real service code against in-memory stores and a
+fake provider — no network and no paid call — and reports the kernel's `maxRSS` high-water mark. Run one scenario per
+process, because the peaks would otherwise add up. The harness baseline is 80–90 MiB (a `tsx` process, like `npm start`).
+
+| Path | Held in memory | Peak RSS |
+| --- | --- | --- |
+| Video copy | 10 MiB render | 127 MiB |
+| Video copy | 32 MiB render | 208 MiB |
+| Video copy | 64 MiB render | 311 MiB |
+| Video copy | 128 MiB render | 599 MiB |
+| Video copy | 256 MiB render (the `VIDEO_MAX_BYTES` default) | 640 MiB |
+| Lip sync output copy | 64 MiB MP4 | 343 MiB |
+| Lip sync output copy | 128 MiB MP4 | 599 MiB |
+| Lip sync submit | 5 MiB source + 5 MiB audio | 153 MiB |
+| Lip sync submit | 16 MiB source + 16 MiB audio | 314–327 MiB |
+| Lip sync submit | 25 MiB source + 25 MiB audio (the `LIPSYNC_MAX_INPUT_BYTES` default) | 457 MiB |
+
+A copy peaks at roughly two to three times the file size (the download chunks, the concatenation, and the `Uint8Array`
+handed to the PUT); a submit holds both inputs, one base64 Data URI per input, and the serialized body all at once. Both
+scale with the configured caps rather than with a typical render, so the caps are the sizing case — and the deployed caps
+are chosen from these numbers.
+
+**The deployment is Starter (512 MB) with caps that fit it.** At the defaults, one copy at `VIDEO_MAX_BYTES=256 MiB`
+peaks at 640 MiB — more than the whole instance — and a submit at the 25 MiB input cap peaks at 457 MiB, leaving almost
+no headroom. [`render.yaml`](render.yaml) therefore sets the three caps the two copy paths and the submit are bounded by:
+
+| Variable | Deployed value | Peak with it |
+| --- | --- | --- |
+| `VIDEO_MAX_BYTES` | `67108864` (64 MiB) | 311 MiB (video copy) |
+| `LIPSYNC_MAX_INPUT_BYTES` | `16777216` (16 MiB) | 314–327 MiB (submit, 16 MiB + 16 MiB inputs) |
+| `LIPSYNC_MAX_OUTPUT_BYTES` | `67108864` (64 MiB) | 343 MiB (output copy) |
+
+Every peak stays under 350 MiB, which leaves over 150 MiB for the process, the built client, and a concurrent request.
+The trade is a refusal instead of a crash: media above these caps fails as `VIDEO_OUTPUT_INVALID`,
+`LIPSYNC_OUTPUT_TOO_LARGE`, or `LIPSYNC_INPUT_TOO_LARGE` rather than killing the instance mid-copy. A long 1080p render
+can exceed 64 MiB, so check `npm run measure:memory -- video-copy <MiB>` before raising `VIDEO_MAX_BYTES` on 512 MB —
+128 MiB already peaks at ~600 MiB. On a 1 GB instance the three can go back to their defaults: Render's next tier is
+Standard, 2 GB at $25/month, and Fly.io's 1 GB shared-cpu-2x is $7.39/month (prices checked 2026-11-26).
+
+### Runtime configuration
+
+Eighteen values must be provided by the host; every other server variable has a default. Each is `sync: false` in
+[`render.yaml`](render.yaml), so the values are entered in the dashboard and never committed.
+
+| Feature | Names |
+| --- | --- |
+| Request origin | `APP_ORIGIN` |
+| Supabase (auth, ledger, projects) | `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SERVICE_ROLE_KEY` |
+| Private media bucket | `R2_ENDPOINT`, `R2_BUCKET_NAME`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` |
+| Planning and the AI connection test | `OLLAMA_API_KEY` |
+| Narration | `DEEPGRAM_API_KEY` |
+| Video export | `JSON2VIDEO_API_KEY` |
+| Lip sync | `EVERYPIXEL_CLIENT_ID`, `EVERYPIXEL_SECRET_ID` |
+| Stock search | `PEXELS_API_KEY`, `PIXABAY_API_KEY` |
+| Image generation | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_AI_API_TOKEN`, `LEONARDO_API_KEY` |
+
+[`render.yaml`](render.yaml) also pins `NODE_ENV=production`, `HOST=0.0.0.0`, and the three measured caps
+(`VIDEO_MAX_BYTES`, `LIPSYNC_MAX_INPUT_BYTES`, `LIPSYNC_MAX_OUTPUT_BYTES` — see [Instance size](#instance-size)), and
+the platform supplies `PORT` (default 8080). `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` are build-time values that `npm run build`
+inlines into the browser bundle: they are not read by the server, but the build step needs them or the deployed client
+cannot sign in.
+
 A real deployment still needs its own Supabase project with every migration applied, its own R2 bucket with a CORS rule
 for the production origin (`npm run cors:preview -- https://<origin>`), `APP_ORIGIN` set to that origin, and accounts
 created through the admin API: there is no sign-up or password-reset flow.

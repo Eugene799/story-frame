@@ -30,6 +30,7 @@
     "preflight:deploy": "tsx scripts/preflight-deploy.ts",
     "verify:sql": "tsx scripts/verify-sql.ts",
     "audit:media": "tsx scripts/audit-media.ts",
+    "measure:memory": "tsx scripts/measure-memory.ts",
     "start:server": "tsx server/index.ts",
     "start": "node --import tsx server/index.ts",
     "verify:lipsync-live": "tsx scripts/verify-lipsync-live.ts"

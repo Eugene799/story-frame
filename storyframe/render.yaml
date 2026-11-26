@@ -3,7 +3,9 @@ services:
     name: storyframe
     runtime: node
     # A free instance sleeps, and the media, image, video, and lip sync sweeps
-    # only run while this process is alive. Confirm the plan slug in the dashboard.
+    # only run while this process is alive. `starter` is 512 MB; the three caps at
+    # the bottom of envVars are the measured values that keep one copy inside it
+    # (see "Instance size" in the README). Raise them only on a 1 GB instance.
     plan: starter
     buildCommand: npm ci && npm run build
     startCommand: npm start
@@ -14,6 +16,11 @@ services:
         value: production
       - key: HOST
         value: 0.0.0.0
+      # Build-time only: `npm run build` inlines these into the browser bundle.
+      - key: VITE_SUPABASE_URL
+        sync: false
+      - key: VITE_SUPABASE_PUBLISHABLE_KEY
+        sync: false
       - key: APP_ORIGIN
         sync: false
       - key: SUPABASE_URL
@@ -50,3 +57,12 @@ services:
         sync: false
       - key: LEONARDO_API_KEY
         sync: false
+      # Measured caps for a 512 MB instance: the defaults (256 MiB render, 25 MiB
+      # lip sync input, 256 MiB lip sync output) peak above the instance's total
+      # memory. Peaks at these values: 311 MiB, 327 MiB, and 343 MiB.
+      - key: VIDEO_MAX_BYTES
+        value: "67108864"
+      - key: LIPSYNC_MAX_INPUT_BYTES
+        value: "16777216"
+      - key: LIPSYNC_MAX_OUTPUT_BYTES
+        value: "67108864"
