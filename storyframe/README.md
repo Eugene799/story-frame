@@ -1,4 +1,4 @@
-# StoryFrame — Phase 4: dashboard, brief, script, and storyboard
+# StoryFrame — Phase 9: dashboard, image, narration, video export, and lip sync
 
 This repository state keeps the Phase 2 pieces — a **server-verified Supabase session boundary**, a **durable,
 idempotent usage ledger**, and the **project data model** with owner-scoped access — and the Phase 3 **private media
@@ -6,10 +6,12 @@ storage in Cloudflare R2**. It adds Phase 4: a signed-in **workspace** with a da
 media panel, honest preview, and editable project/script export. Phase 5 adds configurable one-model-per-task planning:
 validated JSON proposals for angles, scripts, storyboards, ad concepts, and transcript analysis, kept separate from
 accepted content. Phase 6 adds protected Pexels and Pixabay stock search with normalized previews, a durable shared
-cache, credited attribution, and server-mediated imports into project media.
+cache, credited attribution, and server-mediated imports into project media. Phase 7 adds image generation (Cloudflare
+Workers AI or Leonardo), Phase 8 adds Deepgram narration with uploaded audio, Phase 9 adds JSON2Video export, and lip
+sync through Everypixel Labs renders a talking clip or portrait against an audio track.
 
 The connection-test screen still uses real Supabase email/password sign-in and remains a development harness only.
-No host is configured in this repository state; [Production](#production) covers the deployable slice.
+[Production](#production) covers the deployed Render slice.
 
 ## Architecture
 
@@ -1297,7 +1299,7 @@ owner still cascades the ledger with the account.
 
 | Criterion | Status | Evidence |
 | --- | --- | --- |
-| Real Deepgram response becomes playable persisted narration | **PASS** | `npm run verify:narration-live` on 2026-11-25 against real Deepgram, hosted Supabase, and the `story-frame` R2 bucket: 35/35, including a real voice sample, a persisted measured track, the script fingerprint and voice settings, the verified per-character cost, a CORS preflight from the `cors.json` preview origin, MP3/WAV/M4A/OGG/AAC uploads and private playback byte-for-byte, and cleanup |
+| Real Deepgram response becomes playable persisted narration | **PASS** | `npm run verify:narration-live` on 2026-11-25 against real Deepgram, hosted Supabase, and the `story-frame` R2 bucket: 35/35, including a real voice sample, a persisted measured track, the script fingerprint and voice settings, the verified per-character cost, a CORS preflight from the `cors.json` preview origin, MP3/WAV/M4A/OGG/AAC uploads and private playback byte-for-byte, and cleanup. A repeat run on 2026-11-26 passed 35/35 with 147 billed characters (an 80-character preview plus a 67-character scene), **$0.00441** at $0.030/1,000, and the same project and ledger cleanup |
 | Verified endpoint, auth, voice ids, output, billing, and limits | **PASS** | Deepgram docs read 2026-11-25: `/v1/speak`, `Token` auth, Aura-2 model ids, MP3 default, 2,000-character REST bound, $0.030/1k Aura-2 rate, 15 concurrent requests. `tests/deepgram.test.ts` asserts the request shape, `Token` header, audio validation, 2,000-character refusal, derived cost, and sanitized errors |
 | Script fingerprint and staleness | **PASS** | `tests/narration.test.ts`: generation records a 64-character fingerprint and per-scene approval; changing an approved scene makes GET report stale while the track id and provider call count stay unchanged, proving no silent regeneration |
 | Measured duration and explicit mismatch handling | **PASS** | The stored WAV/MP3 duration is parsed from the file; a 1-second track against 20 seconds of scene timing reports `TIMING_MISMATCH`, and the UI states that speech is not sped up or cut. `verify:narration-live` records a real Deepgram duration > 0 |
@@ -1407,7 +1409,7 @@ unsaved changes, no scenes exist, or an export is already running. A refusal fro
 | Provider contract, movie builder, and credit math | **PASS (offline)** | `tests/json2video.test.ts`: request shape, `x-api-key` never echoed, every documented error class mapped (`400` validation vs bad key, `401` quota, `403` suspended, `404`, `413`, `500` retryable), status parsing, the movie JSON for image/video/text-card scenes, narration overflow refusal, and the estimate |
 | Export lifecycle, copy retry, and guard | **PASS (offline, fake provider)** | `tests/video-exports.test.ts` (18 tests): submit → `running` → `done` → byte-identical copy → `ready`; one live export per project; idempotent replay; a failed copy stays `pending` and is retried from the stored provider URL on the next pass — finishing the render after the provider forgets the job — and only the third transient failure settles it `failed` with the provider copy and its cost kept, while a render that fails the container check or size cap fails on the first attempt with one download; an ambiguous submit failure records the estimate on both the row and the ledger; provider error and unknown job; unapproved/cross-revision/stale-narration refusals with no provider call; deletion of row, object, and provider copy |
 | Hosted schema | **PASS** | `20261126090000_add_video_render_jobs.sql` and `20261126100000_create_video_usage.sql` applied through the Supabase management API on 2026-11-25; a PostgREST probe then returned `200` for `render_snapshots.kind`, `render_snapshots.media_id`, and `video_usage`, where the same reads returned `400` and `404` before. `verify:sql` reports 133/133 locally |
-| Live render | **PASS** | `npm run verify:video-live` on 2026-11-25 against real JSON2Video, hosted Supabase, and the `story-frame` bucket: **18/18**. A two-scene 6-second movie rendered in about a minute: **6 s**, **34 690 bytes**, **1920×1080**, **6 credits consumed**, stored as a ready `video/mp4` asset and played back byte-for-byte from private R2, with the reservation, the ledger settlement, export deletion, and project cleanup all verified. The first run scored 12/18 and found a real bug: JSON2Video delivered from `json2video-cdn1.s3.amazonaws.com`, not the documented `assets.json2video.com`, so the host guard refused the download; it now accepts the provider's CDN buckets and nothing else, with `tests/video-exports.test.ts` covering both the accepted CDN host and a refused foreign host |
+| Live render | **PASS** | `npm run verify:video-live` on 2026-11-25 against real JSON2Video, hosted Supabase, and the `story-frame` bucket: **18/18**. A two-scene 6-second movie rendered in about a minute: **6 s**, **34 690 bytes**, **1920×1080**, **6 credits consumed**, stored as a ready `video/mp4` asset and played back byte-for-byte from private R2, with the reservation, the ledger settlement, export deletion, and project cleanup all verified. The first run scored 12/18 and found a real bug: JSON2Video delivered from `json2video-cdn1.s3.amazonaws.com`, not the documented `assets.json2video.com`, so the host guard refused the download; it now accepts the provider's CDN buckets and nothing else, with `tests/video-exports.test.ts` covering both the accepted CDN host and a refused foreign host. A repeat run on 2026-11-26 passed 18/18: **6 s**, **34 008 bytes**, **1920×1080**, **6 credits consumed**, byte-identical playback, and the same export and project cleanup |
 | Preview-tab UI | **PASS (DOM + live browser)** | `tests/video-panel.test.tsx`: the credit window and estimate, one `POST` with the saved revision and an idempotency key, the live status, playback of the stored MP4 from a private URL, the failure reason for a failed export, the disabled-with-reason states for unapproved scenes and unsaved changes, and deleting the latest export only after a confirmation that re-reads the list (a pending render cannot be deleted). A disposable hosted account was also driven through the real Preview tab on 2026-11-25: approve two scenes, submit one 6-second render, watch `PENDING · RUNNING` become `READY · DONE` (6 credits used, 0:06, 28 KiB, 1920×1080), play the stored MP4, then delete the project and account |
 | Whole suite | **PASS** | `npm run check` clean, `npm test` 358/358, `npm run verify:sql` 133/133 on 2026-11-25 |
 | Cancel, subtitles, USD price | **NOT PROVIDED** | There is no provider cancel endpoint, no word timings are requested or inferred, and no credits-to-dollars rate is published; the UI states that a started render cannot be cancelled |
@@ -1458,8 +1460,13 @@ output, the disabled reasons, polling to playback and the confirmed delete.
 project: it creates a disposable account and project, uploads the clip and voice track through private R2, submits one
 720p lip sync, and lets the server's own sweep copy the result. On 2026-11-25 it settled the output's own length
 rather than the 20-second reservation, playback of the stored bytes re-measured exactly the settled value, and cleanup
-removed the export, both inputs, their objects, the project and the user. The panel itself is still covered by DOM
-tests only.
+removed the export, both inputs, their objects, the project and the user. A second run on 2026-11-26 passed 20/20 with a
+720×1280 face clip and a 3.16 s voice track: it settled at **3.16 s**, **$0.0237** at the documented $0.0075/s rate,
+stored and played back the 1 238 466-byte MP4, and completed the same cleanup. The script needs a **720p-or-better face
+clip**: the same run with a 540×960 clip was rejected by Everypixel with `502 LIPSYNC_PROVIDER_FAILED` before a task
+existed, settled **0 seconds**, and cost **$0**, so use a clear, larger face and read the rejection as a source problem
+before suspecting the pipeline. A failed submission now prints the server's error code and provider message instead of
+only the HTTP status, which is what makes that 502 diagnosable. The panel itself is still covered by DOM tests only.
 
 That run also found a sweep race: a pending row exists before the task-id write, so a sweep landing in that window
 failed a request the provider had already been paid for. Rows younger than `LIPSYNC_TASK_ID_GRACE_MS` (5 minutes) are
@@ -1757,9 +1764,12 @@ ticket's CORS preflight from the `cors.json` preview origin, the document-delete
   missing.
 - The workspace is single-user per project and has no conflict merging: a stale save is refused, the draft is kept,
   and the caller must load the latest version. Revision history is read-only; restoring an old version is future work.
-- Scene generation and video rendering are not implemented. Phase 5 plans angles, scripts, storyboards, ad concepts, and
-  transcript clips as proposals; the planning budget is recorded in the brief but nothing spends or enforces it, and
-  Preview/Export remain storyboard and editable-document outputs.
+- Automatic scene generation is not implemented: scenes are authored by hand and use uploaded or generated media. Video
+  rendering is implemented in Phase 9: the Preview tab submits the saved scene timeline to JSON2Video and stores the
+  finished MP4 as a private media asset, and the lip-sync route renders a talking clip or portrait against an audio track
+  the same way. Phase 5 still only plans angles, scripts, storyboards, ad concepts, and transcript clips as proposals; the
+  planning budget is recorded in the brief but nothing spends or enforces it, and Preview/Export otherwise remain
+  storyboard and editable-document outputs.
 - A planning attempt is one ledger row even when the disclosed repair makes two provider calls: token counts are summed
   and latency covers both, so per-call cost cannot be reconstructed from that row. A provider failure during the repair
   records the attempt with unknown token counts, and the no-evidence short-circuit writes no ledger row at all.

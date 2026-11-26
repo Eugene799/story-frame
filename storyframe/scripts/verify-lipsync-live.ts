@@ -9,6 +9,7 @@ import { createR2Client } from "../server/r2";
 import { sceneFingerprint } from "../shared/scene-fingerprint";
 import { LIPSYNC_RATE_VERSION } from "../shared/lipsync-contract";
 import type { ProjectDocumentV2, ProjectScene } from "../shared/project-contract";
+import { formatSubmitFailure } from "./lipsync-submit-failure";
 
 /**
  * Opt-in live lip sync check against real Everypixel, Supabase, and R2.
@@ -292,6 +293,9 @@ async function main(): Promise<number> {
       { "Idempotency-Key": idempotencyKey },
     );
     exportId = submitted.body?.export?.id ?? null;
+    if (submitted.status !== 202) {
+      console.error(`Lip sync submission failed: ${formatSubmitFailure(submitted.status, submitted.body)}`);
+    }
     check(
       "the lip sync is accepted as pending at the reserved 20-second ceiling",
       submitted.status === 202 &&
