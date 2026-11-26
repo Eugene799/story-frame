@@ -10,8 +10,9 @@ cache, credited attribution, and server-mediated imports into project media. Pha
 Workers AI or Leonardo), Phase 8 adds Deepgram narration with uploaded audio, Phase 9 adds JSON2Video export, and lip
 sync through Everypixel Labs renders a talking clip or portrait against an audio track.
 
-The connection-test screen still uses real Supabase email/password sign-in and remains a development harness only.
-[Production](#production) covers the deployed Render slice.
+The account screens use real Supabase email/password sign-in, sign-up, and password recovery, and the signed-in
+workspace handles projects, media, planning, and exports. The Phase 1–2 connection-test screen remains a development
+harness below the workspace. [Production](#production) covers the deployed Render slice.
 
 ## Architecture
 
@@ -178,7 +179,8 @@ handed to the PUT); a submit holds both inputs, one base64 Data URI per input, a
 scale with the configured caps rather than with a typical render, so the caps are the sizing case — and the deployed caps
 are chosen from these numbers.
 
-**The deployment is Starter (512 MB) with caps that fit it.** At the defaults, one copy at `VIDEO_MAX_BYTES=256 MiB`
+**The paid production target is Starter (512 MB), and the current hosted service is Free (also 512 MB) with the same
+three caps.** At the defaults, one copy at `VIDEO_MAX_BYTES=256 MiB`
 peaks at 640 MiB — more than the whole instance — and a submit at the 25 MiB input cap peaks at 457 MiB, leaving almost
 no headroom. [`render.yaml`](render.yaml) therefore sets the three caps the two copy paths and the submit are bounded by:
 
@@ -197,8 +199,9 @@ Standard, 2 GB at $25/month, and Fly.io's 1 GB shared-cpu-2x is $7.39/month (pri
 
 ### Runtime configuration
 
-Eighteen values must be provided by the host; every other server variable has a default. Each is `sync: false` in
-[`render.yaml`](render.yaml), so the values are entered in the dashboard and never committed.
+Eighteen server values must be provided by the host; every other server variable has a default. Together with the two
+build-time browser values below, all twenty are `sync: false` in [`render.yaml`](render.yaml), so the values are entered
+in the dashboard and never committed.
 
 | Feature | Names |
 | --- | --- |
@@ -214,7 +217,7 @@ Eighteen values must be provided by the host; every other server variable has a 
 
 [`render.yaml`](render.yaml) also pins `NODE_ENV=production`, `HOST=0.0.0.0`, and the three measured caps
 (`VIDEO_MAX_BYTES`, `LIPSYNC_MAX_INPUT_BYTES`, `LIPSYNC_MAX_OUTPUT_BYTES` — see [Instance size](#instance-size)), and
-the platform supplies `PORT` (default 8080). `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` are build-time values that `npm run build`
+the platform supplies `PORT`; when it is unset, `server/index.ts` falls back to `8787`. `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` are build-time values that `npm run build`
 inlines into the browser bundle: they are not read by the server, but the build step needs them or the deployed client
 cannot sign in.
 
@@ -344,7 +347,7 @@ route and storage layers, not the Render instance. Do **not** run `verify:video-
 
 **7. What Free cannot prove.** The instance sleeps after 15 minutes without traffic and takes roughly a minute to wake,
 and while it is asleep no sweep runs — submitted renders, lip-sync jobs, pending images and media metadata stop
-advancing. That is the reason production runs Starter, and it is the one property this pass cannot verify. A real 64 MiB
+advancing. That is the reason the paid production target is Starter, and it is the one property this pass cannot verify. A real 64 MiB
 render copy cannot be exercised for free either; its peak is covered by `npm run measure:memory`, not by this deploy.
 
 Render does report memory for a Free instance, even though it reports no memory limit. On 2026-11-26 its metrics API
@@ -466,7 +469,8 @@ where table_schema = 'public'
     'ai_usage', 'projects', 'project_revisions', 'scenes', 'media_metadata',
     'media_references', 'sources', 'claims', 'generation_proposals',
     'provider_jobs', 'render_snapshots', 'profiles', 'model_health', 'stock_search_cache',
-    'video_usage'
+    'image_generations', 'narration_tracks', 'narration_usage', 'video_usage',
+    'lipsync_exports', 'lipsync_usage', 'job_leases'
   );
 ```
 
@@ -507,7 +511,7 @@ exists with RLS enabled, one `select` policy for `authenticated`, and only `sele
 obsolete `public` schema in
 `myrohtkfsuppcabedwmn` (16 tables from an earlier project, plus `public.handle_new_user()` attached
 to `auth.users`) was exported first — six `model_registry` rows and a catalog snapshot — and then
-replaced with the first five migrations (the sixth followed on 2026-11-24). The hosted schema now has
+replaced with the first five migrations (the sixth followed on 2026-11-24). The hosted schema then had
 the 12 tables the first six migrations define, RLS and one select-own policy on each, and the `projects_record_revision`
 trigger; the old `auth.users` trigger is gone. `GET /api/ai/status` reports `ledger.ready: true`. Live profile, project, child, and
 two-user isolation routes were then exercised with disposable users; those users and their rows were
@@ -1107,7 +1111,7 @@ so it writes no ledger row and does not consume the key.
 | Planning without a key is refused | **PASS** | A request with no `Idempotency-Key` is `400 IDEMPOTENCY_KEY_REQUIRED` before the provider or the ledger is touched |
 | Evidence can be supplied in-app | **PASS** | `tests/sources-panel.test.tsx`: add a source with kind, title, URL, and excerpt, see it listed, flag an excerpt-less source as unusable evidence, require a title, and delete; the Sources tab is wired into the editor and reads the existing owner-scoped routes |
 | Source text is treated as data | **PASS** | `tests/planning-prompt.test.ts` places an excerpt inside `<<<SOURCE ... SOURCE>>>` and asserts the prompt calls it untrusted data that must not be followed as instructions |
-| Route instructions match the validator | **PASS** | `tests/planning-prompt.test.ts` (6 tests) asserts every route names its exact root keys, counts, scene/clip fields, and duration bounds under "only these keys", keeps factual claims available to script/ad-concept/transcript-analysis, and withholds them from angles/storyboard; the tightened `angles` instruction then passed a live call with no repair |
+| Route instructions match the validator | **PASS** | `tests/planning-prompt.test.ts` (7 tests) asserts every route names its exact root keys, counts, scene/clip fields, and duration bounds under "only these keys", keeps factual claims available to script/ad-concept/transcript-analysis, and withholds them from angles/storyboard; the tightened `angles` instruction then passed a live call with no repair |
 | Hosted schema and live routes | **PASS** | Migrations 7 and 8 are applied to the hosted project (2026-11-25); probes for every new column, `model_health`, and `ai_usage.project_id` return `200`, and the partial unique pending-attempt index is present. `verify:live-routes` passes 51/51, including `ledger.ready: true` and the owner-scoped planning-status route reporting a seeded pending attempt then clearing after settlement |
 | One real hosted planning call | **PASS** | 2026-11-25, first call before tightening: `angles` → `gemma4:31b`, `201`, 3 angles, but `repairAttempted=true` (ledger tokens 715/514, latency 2311 ms). After tightening, a second call with no caller instruction: `201` in 1932 ms, `repairAttempted=false`, 3 angles; ledger `success`/`201`, tokens 301/266, latency 1144 ms, stored proposal id; same-key replay `201` in 493 ms with the same proposal and still one ledger row; proposal, project, ledger row, profile, and user deleted, cleanup read back zero rows |
 | Plan tab behavior | **PASS (DOM)** | `tests/planning-panel.test.tsx`: list, generate, review, and accept through the panel, with nothing applied before acceptance and both actions disabled while the draft is dirty; Stop waiting aborts the browser request while keeping the key and recording a `stopped` attempt; expired keys are replaced; a second tab's lease disables generation, while an expired lease and a duplicated tab that inherits the lease are handled; a reload restores the pending route and instruction and replays the same key. `tests/workspace.test.tsx` drives the real Workspace from the Plan tab through generate, a full remount that replays the `sessionStorage` key, and accept; the provider is stubbed, so it spends nothing. Not exercised in a real browser in this environment |
@@ -1568,8 +1572,8 @@ record of provider/model availability; latency and output counts vary between ru
 Phase 2’s authenticated path was verified with a local fake Supabase (real HTTP auth + PostgREST calls) because no
 user session token was available in this environment. On 2026-11-24 the configured `story-frame` project’s obsolete
 `public` schema was exported and replaced with the migrations (six in total, the last added for Phase 3; see
-[Applying the migrations](#applying-the-migrations)). The hosted catalog now matches this code: 12 tables, RLS and a
-select-own policy on each, the revision trigger, no `auth.users` trigger, and `/api/ai/status` reporting
+[Applying the migrations](#applying-the-migrations)). The hosted catalog then matched those six migrations: 12 tables,
+RLS and a select-own policy on each, the revision trigger, no `auth.users` trigger, and `/api/ai/status` reporting
 `ledger.ready: true`. Live routes were then exercised with two disposable users (38/38 checks,
 including two-user isolation), and `smoke:live` exited 0 with 5/5 model families and an identical
 stored replay. The test users and rows were deleted; the project is empty again.
@@ -1812,8 +1816,9 @@ end, and never deletes an account that existed before the run.
   server-side throttle of our own.
 - All migrations and RLS policies are applied to the configured Supabase project (Phase 6 on 2026-11-25,
   including the ready-import uniqueness index). The
-  hosted catalog was checked (12 tables, RLS, policies, grants, revision trigger), and live profile/project/child
-  routes, two-user isolation, ledger readiness, and the planning-status route passed 51/51 checks; the disposable users
+  catalog was checked after Phase 6 (12 tables at that point, RLS, policies, grants, revision trigger), and live
+  profile/project/child routes, two-user isolation, ledger readiness, and the planning-status route passed 51/51
+  checks; the disposable users
   were deleted afterwards. Rerun these checks with `npm run verify:live-routes`. The Phase 6 live route check
   (`verify:stock-routes-live`, 23/23) also passed, including a real import, a deduplicated re-import, a credited export, and full cleanup.
   `smoke:live` exposed a live-only missing-column bug; after the fix a clean five-call run exited 0 with 5/5 families
