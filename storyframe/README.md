@@ -226,6 +226,25 @@ keep that run at \$0: create the service **by hand on the Free plan** (`render.y
 deploy creates the paid instance), and leave every paid provider key unset — a missing key disables that feature rather
 than spending on it, and `/api/health` does not depend on any provider.
 
+**0. Prove the probe and the caps line on this machine.** Free removes the bill, not the mistakes, so run the same
+production shape on loopback before a service exists. Build once, then start the server with the deploy's mode, bind and
+caps and point `preflight` at it:
+
+```bash
+npm run build
+NODE_ENV=production PORT=8788 HOST=0.0.0.0 \
+  VIDEO_MAX_BYTES=67108864 LIPSYNC_MAX_INPUT_BYTES=16777216 LIPSYNC_MAX_OUTPUT_BYTES=67108864 \
+  npm start
+# in another shell
+APP_ORIGIN=http://127.0.0.1:8788 npm run preflight:deploy -- http://127.0.0.1:8788
+```
+
+Exit `0` with 13/13 means the probe itself works — the client and its bundle are served, `/api/health` is ready, an
+unknown `/api` path is the JSON `404` — and the startup line already shows the three caps, so the evidence you will rely
+on in step 4 has been seen once before it matters. This step cannot speak for the host: `dist/` here is built by the
+command above, and every value it checks comes from this shell or this `.env`. Stop the server (`Ctrl-C`, or kill its
+PID) before moving on.
+
 **1. Create the service.** *New → Web Service*, this repository and branch, then set by hand what `render.yaml` would:
 
 | Setting | Value |
@@ -270,6 +289,10 @@ Exit `0` with every line `PASS`: the eight required values, `APP_ORIGIN` naming 
 built client and its referenced bundle, `/api/health` at `200` with `ok:true` and no false `ready` flags, and an unknown
 `/api` path returning the JSON `404`. Readiness failures name the group to fix: `auth` → `SUPABASE_URL` or the
 publishable key, `ledger` → the service-role key, `storage` → one of the four `R2_*` values.
+
+Those eight value checks read the environment of the shell running `preflight` (falling back to its `.env`), **not** the
+deployed host: they catch a value you are about to paste wrong, while the host's own configuration is visible only
+through `/api/health`'s `ready` flags. A host missing those values answers `503`, which fails this check.
 
 The startup line also proves the caps in force on the host. Render's *Logs* tab shows:
 
