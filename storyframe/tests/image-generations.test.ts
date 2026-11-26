@@ -149,6 +149,18 @@ function seedGeneration(app: TestApp, overrides: Record<string, unknown> = {}): 
   });
 }
 
+/** Holds a row claim as a second instance would, so this one has to stand down. */
+const OTHER_INSTANCE = "6f1a7d1e-0000-4000-8000-000000000000";
+function seedRowClaim(app: TestApp, generationId: string): string {
+  const name = `image-settle:${generationId}`;
+  app.supabase.jobLeases.push({
+    name,
+    holder: OTHER_INSTANCE,
+    expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+  });
+  return name;
+}
+
 async function createProject(app: TestApp, token = USER_A.token): Promise<string> {
   const response = await api(app, token, "POST", "/api/projects", {
     projectType: "story",
@@ -686,6 +698,66 @@ describe("image generation", () => {
     expect(app.supabase.imageGenerations[0]).toMatchObject({ status: "pending", media_id: null });
     expect(app.supabase.media).toHaveLength(0);
     expect(app.r2.puts).toBe(0);
+  });
+
+  it("leaves a row another instance has claimed", async () => {
+    const state: ProviderState = { leonardoPolls: 0 };
+    const app = await startImageApp(state, { ...PROVIDER_ENV, IMAGE_PENDING_SWEEP_INTERVAL_MS: "50" });
+    const projectId = await createProject(app);
+    seedGeneration(app, {
+      project_id: projectId,
+      provider: "leonardo",
+      status: "pending",
+      media_id: null,
+      job_id: "job-claimed",
+      created_at: new Date(Date.now() - 60_000).toISOString(),
+    });
+    const claim = seedRowClaim(app, app.supabase.imageGenerations[0].id as string);
+
+    // The sweep sees the completed job, but a live claim keeps it out of the store.
+    await eventually(() =>
+      app.supabase.jobLeaseClaims.some((entry) => entry.name === claim && !entry.granted),
+    );
+
+    expect(state.leonardoPolls).toBeGreaterThan(0);
+    expect(app.supabase.imageGenerations[0]).toMatchObject({ status: "pending", media_id: null });
+    expect(app.supabase.media).toHaveLength(0);
+    expect(app.r2.puts).toBe(0);
+    // Standing down must not release the holder's claim.
+    expect(
+      app.supabase.jobLeases.some((row) => row.name === claim && row.holder === OTHER_INSTANCE),
+    ).toBe(true);
+  });
+
+  it("reports a row as pending while another instance settles it", async () => {
+    const app = await startImageApp();
+    const projectId = await createProject(app);
+    seedGeneration(app, {
+      project_id: projectId,
+      provider: "leonardo",
+      status: "pending",
+      media_id: null,
+      job_id: "job-elsewhere",
+    });
+    const generationId = app.supabase.imageGenerations[0].id as string;
+    const path = `/api/projects/${projectId}/image-generations/${generationId}/refresh`;
+    seedRowClaim(app, generationId);
+
+    const refused = await api(app, USER_A.token, "POST", path);
+    expect(refused.status).toBe(202);
+    expect(refused.body.generation).toMatchObject({ status: "pending", mediaId: null });
+    expect(refused.body.media).toBeNull();
+    expect(app.supabase.media).toHaveLength(0);
+    expect(app.r2.puts).toBe(0);
+
+    // Once the holder lets go, the same refresh claims the row and settles it,
+    // answering only after its claim is released.
+    app.supabase.jobLeases.length = 0;
+    const settled = await api(app, USER_A.token, "POST", path);
+    expect(settled.status).toBe(200);
+    expect(settled.body.generation.status).toBe("succeeded");
+    expect(settled.body.media.status).toBe("ready");
+    expect(app.supabase.jobLeases.some((row) => row.name === `image-settle:${generationId}`)).toBe(false);
   });
 
   it("refuses a second generation while the first is still in flight", async () => {

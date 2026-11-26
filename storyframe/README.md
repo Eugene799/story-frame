@@ -159,8 +159,11 @@ the stored job id of any pending row older than that window and settles it throu
 instance that dies mid-image therefore finishes the paid job on the next pass instead of waiting for
 `IMAGE_PENDING_ABANDON_AFTER_MS`, and a result that cannot be stored yet keeps its row and job id for the next attempt.
 
-Still in-process by design: a pass advances a batch of rows rather than claiming each row, so two instances are separated
-by the sweep lease and not by a per-row claim. Per-row claims are the next slice.
+An image settlement is claimed per row too. Before a poll result is stored, the instance that will store it claims
+`image-settle:<generation id>` in the same `job_leases` table, so a refresh on one instance and a sweep on another cannot
+both download and store the same paid result; the loser reports the row as still pending. The claim is released when the
+settlement ends, and its TTL lets the next pass take over if that instance dies mid-settlement. The video, lip sync, and
+media sweeps still advance a batch of rows under their own lease alone.
 
 ## Applying the migrations
 
@@ -904,7 +907,7 @@ the provider is not configured the route refuses with `503 IMAGE_PROVIDER_DISABL
 | `/api/image-models` | GET | Signed-in catalog with prompt/step/size limits, per-provider `configured`, and the verified billing view. Listing works while a provider is disabled. |
 | `/api/projects/:id/image-generations/estimate` | POST | Validates the input, returns dimensions, steps, estimated neurons, estimated USD (or `null` for Leonardo), the rate version, and the billing note. No provider call, no row. |
 | `/api/projects/:id/image-generations` | POST | Re-checks credentials, creates a `pending` row (prompt, provider, model, settings, estimate, rate version), generates, persists the image as `image`, and returns `201` with the settled record and media. A Leonardo job still pending at the poll deadline returns `202` with its job id. |
-| `/api/projects/:id/image-generations/:generationId/refresh` | POST | Polls the stored Leonardo job id; `202` while pending, then stores the image and settles the row. |
+| `/api/projects/:id/image-generations/:generationId/refresh` | POST | Polls the stored Leonardo job id; `202` while pending or while another instance holds the row claim, then stores the image and settles the row. |
 | `/api/projects/:id/image-generations/:generationId/settle` | POST | Settles a pending job as `failed` with `IMAGE_GENERATION_ABANDONED`, releasing the account; settling an already settled job returns its current state. |
 | `/api/projects/:id/image-generations` | GET | Most recent 50 generations for the project. |
 | `/api/image-usage` | GET | The caller's image cost ledger for the guard window: attempts, actual/estimated/charged USD, limits, and reset time. |

@@ -492,9 +492,9 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
   // One image generation per account at a time, so a double submit cannot
   // spend provider credit twice before the usage check sees the first row.
   const imageInFlight = new Set<string>();
-  // One settlement per generation, shared rather than repeated: the sweep that
-  // resumes a job and a client refresh must not store the same paid result twice.
-  const imageAdvancing = new Map<string, Promise<ImageSettlement>>();
+  // One settlement per generation inside this process; the stored row claim
+  // taken by advancePendingImage covers a second instance.
+  const imageAdvancing = new Map<string, Promise<ImageSettlement | null>>();
   let lastRateLimitSweep = 0;
   let ledgerReadiness: { value: boolean; checkedAt: number } | null = null;
 
@@ -750,9 +750,9 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
   });
 
   /**
-   * One stored lease per sweep, so a second instance cannot advance the same
-   * work while the first is running it. Every pass renews its lease, so a
-   * restarted instance takes over as soon as a crashed holder's lease expires.
+   * One stored lease per unit of work, so a second instance cannot advance the
+   * same work while the first is running it. A sweep renews its lease every
+   * pass, so a restarted instance takes over as soon as a dead holder's expires.
    */
   function jobLeaseFor(name: string): JobLease | null {
     if (!config.supabaseUrl || !config.supabaseServiceRoleKey) return null;
@@ -1648,34 +1648,51 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
 
   /**
    * Settles a pending generation whose provider job left PENDING. The polling
-   * request and the resuming sweep share this, so a resumed job is stored like a
-   * polled one and a second caller joins the settlement instead of repeating the
-   * download and the media write.
+   * request and the resuming sweep share this, and the stored row claim makes it
+   * exclusive across instances, so one paid result is downloaded, stored, and
+   * marked once. Null means another caller is settling it.
    */
   function advancePendingImage(
     generation: ImageGenerationRecord,
     ownerId: string,
     polled: LeonardoGenerationStatus,
-  ): Promise<ImageSettlement> {
+  ): Promise<ImageSettlement | null> {
     const inFlight = imageAdvancing.get(generation.id);
     if (inFlight) return inFlight;
-    const settlement = (async (): Promise<ImageSettlement> => {
+    const settlement = (async (): Promise<ImageSettlement | null> => {
       const store = requireImageStore();
-      if (polled.status !== "succeeded" || polled.imageUrls.length === 0) {
-        const failed = await store.update(ownerId, generation.projectId, generation.id, {
-          status: "failed",
-          errorCode: "IMAGE_PROVIDER_FAILED",
-        });
-        return { generation: failed ?? generation, media: null };
+      // One claim per generation, so a refresh and a sweep on different
+      // instances cannot store the same paid result twice.
+      const lease = jobLeaseFor(`image-settle:${generation.id}`);
+      if (lease) {
+        try {
+          if (!(await lease.claim())) return null;
+        } catch {
+          // A lease store that is briefly down must not fail a paid generation:
+          // the row stays pending and the next pass or refresh tries again.
+          log.error("[image] IMAGE_SETTLE_LEASE_UNAVAILABLE");
+          return null;
+        }
       }
-      const download = await downloadGeneratedImage(polled.imageUrls[0]);
-      const media = await persistGeneratedImage(ownerId, generation.projectId, download.bytes, download.contentType);
-      const updated = await store.update(ownerId, generation.projectId, generation.id, {
-        status: "succeeded",
-        mediaId: media.id,
-        ...leonardoCost(null, polled.apiCreditCost, polled.cost, generation.providerCost),
-      });
-      return { generation: updated ?? generation, media };
+      try {
+        if (polled.status !== "succeeded" || polled.imageUrls.length === 0) {
+          const failed = await store.update(ownerId, generation.projectId, generation.id, {
+            status: "failed",
+            errorCode: "IMAGE_PROVIDER_FAILED",
+          });
+          return { generation: failed ?? generation, media: null };
+        }
+        const download = await downloadGeneratedImage(polled.imageUrls[0]);
+        const media = await persistGeneratedImage(ownerId, generation.projectId, download.bytes, download.contentType);
+        const updated = await store.update(ownerId, generation.projectId, generation.id, {
+          status: "succeeded",
+          mediaId: media.id,
+          ...leonardoCost(null, polled.apiCreditCost, polled.cost, generation.providerCost),
+        });
+        return { generation: updated ?? generation, media };
+      } finally {
+        await lease?.release().catch(() => undefined);
+      }
     })().finally(() => imageAdvancing.delete(generation.id));
     imageAdvancing.set(generation.id, settlement);
     return settlement;
@@ -1703,6 +1720,12 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     }
     try {
       const settled = await advancePendingImage(generation, user.id, polled);
+      if (!settled) {
+        // Another instance holds the row claim and is settling it, so the row is
+        // still pending for the next poll rather than stored twice.
+        sendJson(response, 202, { ok: true, generation, media: null });
+        return;
+      }
       sendJson(response, 200, { ok: true, generation: settled.generation, media: settled.media });
     } catch (error) {
       const code =
