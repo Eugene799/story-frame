@@ -1359,7 +1359,14 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
       const message =
         error instanceof ApiError ? error.message : "The finished render could not be copied into storage.";
       const attempts = (numberField(cursor.job?.result?.copyAttempts) ?? 0) + 1;
-      if (cursor.job === null || attempts >= COPY_ATTEMPT_LIMIT) {
+      // A render that fails the container check or the size cap will never copy,
+      // and an account with no storage room cannot free any while this row is
+      // pending: retrying either only spends more downloads on the same failure.
+      // Everything else (network, bucket, state conflicts) can clear on a later
+      // pass.
+      const permanent =
+        error instanceof ApiError && (error.code === "VIDEO_OUTPUT_INVALID" || error.status === 413);
+      if (cursor.job === null || permanent || attempts >= COPY_ATTEMPT_LIMIT) {
         await failExport(cursor, code, message, "estimate", {
           providerStatus: "done",
           providerCopy: finished,

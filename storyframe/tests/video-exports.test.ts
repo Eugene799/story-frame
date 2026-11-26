@@ -44,6 +44,8 @@ interface FakeProvider {
   submitStatus: number;
   /** Where the finished movie claims to live. */
   outputUrl: string;
+  /** The bytes that URL serves, when a test needs something other than an MP4. */
+  outputBytes?: Buffer;
   /** Every output download the server attempted, so a refusal is visible. */
   outputDownloads: string[];
 }
@@ -74,7 +76,7 @@ function fakeProvider(initial: Partial<FakeProvider> = {}): {
       if (provider.outputFails) {
         return new Response("output unavailable", { status: 500 });
       }
-      return new Response(new Uint8Array(MP4), {
+      return new Response(new Uint8Array(provider.outputBytes ?? MP4), {
         status: 200,
         headers: { "Content-Type": "video/mp4" },
       });
@@ -483,6 +485,73 @@ describe("video exports", () => {
     await sleep(80);
     const settled = app.supabase.videoUsage.at(-1) as Record<string, unknown>;
     expect(settled).toMatchObject({ status: "failed", credits_counted: 10 });
+  });
+
+  it("fails a render that can never copy on the first attempt", async () => {
+    // Bytes that fail the magic-byte check: another download of the same bytes
+    // cannot make them a video, so the first attempt settles the export.
+    const garbage = await startExportApp({ mode: "done", outputBytes: Buffer.from("not a video at all") });
+    const garbageProject = await createProject(garbage.app, exportDocument([approvedScene()]));
+    const garbageAccepted = (
+      await (await exportRequest(garbage.app, garbageProject.id, garbageProject.version)).json()
+    ) as ExportBody;
+    const garbageFailed = await awaitStatus(
+      garbage.app,
+      garbageProject.id,
+      garbageAccepted.export.id,
+      ["failed"],
+      8000,
+    );
+    expect(garbageFailed.export.failureCode).toBe("VIDEO_OUTPUT_INVALID");
+    // Long enough for several passes at the 25 ms cadence.
+    await sleep(200);
+    expect(garbage.provider.outputDownloads).toHaveLength(1);
+
+    // A render over VIDEO_MAX_BYTES: the cap will never accept it either.
+    const oversized = Buffer.alloc(2 * 1024 * 1024, 1);
+    oversized.writeUInt32BE(24, 0);
+    oversized.write("ftyp", 4);
+    oversized.write("isom", 8);
+    oversized.write("isomiso2mp41", 12);
+    const capped = await startExportApp(
+      { mode: "done", outputBytes: oversized },
+      { VIDEO_MAX_BYTES: "1048576" },
+    );
+    const cappedProject = await createProject(capped.app, exportDocument([approvedScene()]));
+    const cappedAccepted = (
+      await (await exportRequest(capped.app, cappedProject.id, cappedProject.version)).json()
+    ) as ExportBody;
+    const cappedFailed = await awaitStatus(
+      capped.app,
+      cappedProject.id,
+      cappedAccepted.export.id,
+      ["failed"],
+      8000,
+    );
+    expect(cappedFailed.export.failureCode).toBe("VIDEO_OUTPUT_INVALID");
+    await sleep(200);
+    expect(capped.provider.outputDownloads).toHaveLength(1);
+
+    // A valid MP4 with no room in the account: the row cannot free space while
+    // it is pending, so this is the first and only attempt.
+    const tooBig = Buffer.alloc(2048, 1);
+    tooBig.writeUInt32BE(24, 0);
+    tooBig.write("ftyp", 4);
+    tooBig.write("isom", 8);
+    tooBig.write("isomiso2mp41", 12);
+    const full = await startExportApp(
+      { mode: "done", outputBytes: tooBig },
+      { MEDIA_OWNER_STORAGE_BYTES: "1024" },
+    );
+    const fullProject = await createProject(full.app, exportDocument([approvedScene()]));
+    const fullAccepted = (
+      await (await exportRequest(full.app, fullProject.id, fullProject.version)).json()
+    ) as ExportBody;
+    const fullFailed = await awaitStatus(full.app, fullProject.id, fullAccepted.export.id, ["failed"], 8000);
+    expect(fullFailed.export.failureCode).toBe("VIDEO_OUTPUT_COPY_FAILED");
+    await sleep(200);
+    expect(full.provider.outputDownloads).toHaveLength(1);
+    expect(full.app.r2.objects.size).toBe(0);
   });
 
   it("copies a deferred render from the stored URL when the provider no longer knows the job", async () => {
