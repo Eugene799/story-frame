@@ -1,7 +1,6 @@
 // Browser end-to-end check for the account flows. Run with `npm run e2e:account`
 // after starting the dev server; it creates and removes its own Supabase users.
 // See the README section "Browser account end-to-end check".
-import { chromium } from "playwright";
 import { randomBytes } from "node:crypto";
 
 const baseURL = process.env.SMOKE_BASE_URL ?? "http://127.0.0.1:3000";
@@ -64,7 +63,10 @@ async function admin(path, init = {}) {
 
 async function findUser(email) {
   const { status, body } = await admin(`/auth/v1/admin/users?filter=${encodeURIComponent(email)}&per_page=50`);
-  if (status !== 200) return null;
+  // A failed lookup is not the same as "no such user": callers assert that an
+  // account is absent, so an unreadable list must fail the run instead of
+  // passing it.
+  if (status !== 200) throw new Error(`could not list users for ${email}: status=${status}`);
   return (body?.users ?? []).find((user) => user.email === email) ?? null;
 }
 
@@ -82,22 +84,36 @@ async function createUser(email, password, confirm) {
 
 async function deleteUsers() {
   const report = [];
-  const emails = [...created.map((user) => user.email), liveSignUpEmail];
+  // Include every address the run may have created even if its creation
+  // response was lost, so a malformed reply cannot leave an account behind.
+  const emails = [...new Set([...created.map((user) => user.email), accountEmail, unconfirmedEmail, liveSignUpEmail])];
   for (const email of emails) {
-    const user = await findUser(email);
-    if (!user) {
-      report.push(`${email.split("@")[0]}=absent`);
-      continue;
+    const label = email.split("@")[0];
+    try {
+      // A failed lookup must not look like "absent": that would report a
+      // leaked account as cleaned up.
+      const listing = await admin(`/auth/v1/admin/users?filter=${encodeURIComponent(email)}&per_page=50`);
+      if (listing.status !== 200) {
+        report.push(`${label}=lookup failed (${listing.status})`);
+        continue;
+      }
+      const user = (listing.body?.users ?? []).find((candidate) => candidate.email === email) ?? null;
+      if (!user) {
+        report.push(`${label}=absent`);
+        continue;
+      }
+      // E2E_SIGNUP_EMAIL may point at an inbox the operator already uses: never
+      // delete an account this run did not create.
+      if (email === liveSignUpEmail && new Date(user.created_at) < startedAt) {
+        report.push(`${label}=pre-existing (left alone)`);
+        continue;
+      }
+      const { status } = await admin(`/auth/v1/admin/users/${user.id}`, { method: "DELETE" });
+      const probe = await admin(`/auth/v1/admin/users/${user.id}`);
+      report.push(`${label}=${status}/${probe.status}`);
+    } catch (cause) {
+      report.push(`${label}=error (${cause instanceof Error ? cause.message : String(cause)})`);
     }
-    // E2E_SIGNUP_EMAIL may point at an inbox the operator already uses: never
-    // delete an account this run did not create.
-    if (email === liveSignUpEmail && new Date(user.created_at) < startedAt) {
-      report.push(`${email.split("@")[0]}=pre-existing (left alone)`);
-      continue;
-    }
-    const { status } = await admin(`/auth/v1/admin/users/${user.id}`, { method: "DELETE" });
-    const probe = await admin(`/auth/v1/admin/users/${user.id}`);
-    report.push(`${email.split("@")[0]}=${status}/${probe.status}`);
   }
   return report.join(", ");
 }
@@ -106,67 +122,77 @@ const settings = await fetch(`${supabaseUrl}/auth/v1/settings`, { headers: { api
   response.json(),
 );
 
-await createUser(accountEmail, initialPassword, true);
-await createUser(unconfirmedEmail, unconfirmedPassword, false);
-
-// Supabase rewrites `redirect_to` to the project's Site URL when the origin is
-// not allowlisted, so an emailed recovery link would never reach this app. Ask
-// first, so a hosted run says why instead of looking like a broken flow.
-async function preflightRedirect(origin) {
-  const { status, body } = await admin("/auth/v1/admin/generate_link", {
-    method: "POST",
-    body: JSON.stringify({ type: "recovery", email: accountEmail, redirect_to: origin }),
-  });
-  if (status !== 200) {
-    console.log(`PREFLIGHT WARN generate_link failed with status=${status}; redirect target unknown`);
-    return false;
-  }
-  const effective = typeof body?.redirect_to === "string" ? body.redirect_to : "(none)";
-  if (effective === origin) {
-    console.log(`PREFLIGHT redirect target ${effective} (allowlisted)`);
-    return true;
-  }
-  console.log(`PREFLIGHT WARN redirect target ${effective} -- Supabase rewrote ${origin}`);
-  console.log(
-    `PREFLIGHT WARN recovery and confirmation emails for this origin would land on ${effective}. ` +
-      `Allowlist ${origin} under Authentication -> URL Configuration -> Redirect URLs. ` +
-      "This run still exercises the app by opening the session fragment directly.",
-  );
-  return false;
-}
-
-const redirectAllowlisted = await preflightRedirect(baseOrigin);
-
-const browser = await chromium.launch({
-  executablePath: process.env.CHROME_BIN,
-  args: ["--no-sandbox", "--disable-dev-shm-usage"],
-});
-const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-const page = await context.newPage();
 const consoleErrors = [];
 const recoverStatuses = [];
 const aiRequestUrls = [];
-
-page.on("console", (message) => {
-  if (message.type() === "error") consoleErrors.push(message.text());
-});
-page.on("pageerror", (error) => consoleErrors.push(`pageerror: ${error.message}`));
-page.on("response", (response) => {
-  if (response.url().includes("/auth/v1/recover")) recoverStatuses.push(response.status());
-});
-page.on("request", (request) => {
-  if (request.url().includes("/api/ai/test")) aiRequestUrls.push(request.url());
-});
-
-async function signOutIfPossible() {
-  const button = page.getByRole("button", { name: "Sign out" });
-  if ((await button.count()) > 0) {
-    await button.click();
-    await page.getByRole("heading", { name: "Sign in" }).waitFor({ timeout: 20000 });
-  }
-}
+let browser = null;
+let page = null;
+let redirectAllowlisted = null;
 
 try {
+  // Everything that creates state runs inside this single try: the finally
+  // below is the only cleanup path, so a missing Playwright install or a
+  // browser that cannot launch still removes the accounts this run created.
+  await createUser(accountEmail, initialPassword, true);
+  await createUser(unconfirmedEmail, unconfirmedPassword, false);
+
+  // Supabase rewrites `redirect_to` to the project's Site URL when the origin is
+  // not allowlisted, so an emailed recovery link would never reach this app. Ask
+  // first, so a hosted run says why instead of looking like a broken flow.
+  async function preflightRedirect(origin) {
+    const { status, body } = await admin("/auth/v1/admin/generate_link", {
+      method: "POST",
+      body: JSON.stringify({ type: "recovery", email: accountEmail, redirect_to: origin }),
+    });
+    if (status !== 200) {
+      console.log(`PREFLIGHT WARN generate_link failed with status=${status}; redirect target unknown`);
+      return false;
+    }
+    const effective = typeof body?.redirect_to === "string" ? body.redirect_to : "(none)";
+    if (effective === origin) {
+      console.log(`PREFLIGHT redirect target ${effective} (allowlisted)`);
+      return true;
+    }
+    console.log(`PREFLIGHT WARN redirect target ${effective} -- Supabase rewrote ${origin}`);
+    console.log(
+      `PREFLIGHT WARN recovery and confirmation emails for this origin would land on ${effective}. ` +
+        `Allowlist ${origin} under Authentication -> URL Configuration -> Redirect URLs. ` +
+        "This run still exercises the app by opening the session fragment directly.",
+    );
+    return false;
+  }
+
+  redirectAllowlisted = await preflightRedirect(baseOrigin);
+
+  // Imported after the users exist so an unavailable browser reaches the same
+  // cleanup instead of leaving them behind.
+  const { chromium } = await import("playwright");
+  browser = await chromium.launch({
+    executablePath: process.env.CHROME_BIN,
+    args: ["--no-sandbox", "--disable-dev-shm-usage"],
+  });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  page = await context.newPage();
+
+  page.on("console", (message) => {
+    if (message.type() === "error") consoleErrors.push(message.text());
+  });
+  page.on("pageerror", (error) => consoleErrors.push(`pageerror: ${error.message}`));
+  page.on("response", (response) => {
+    if (response.url().includes("/auth/v1/recover")) recoverStatuses.push(response.status());
+  });
+  page.on("request", (request) => {
+    if (request.url().includes("/api/ai/test")) aiRequestUrls.push(request.url());
+  });
+
+  async function signOutIfPossible() {
+    const button = page.getByRole("button", { name: "Sign out" });
+    if ((await button.count()) > 0) {
+      await button.click();
+      await page.getByRole("heading", { name: "Sign in" }).waitFor({ timeout: 20000 });
+    }
+  }
+
   await page.goto(baseURL, { waitUntil: "networkidle" });
   await page.getByRole("heading", { name: "Sign in" }).waitFor({ timeout: 20000 });
   record(
@@ -312,7 +338,7 @@ try {
     await page.getByRole("heading", { name: "Choose a new password" }).waitFor({ timeout: 30000 });
     record(
       "a recovery link opens the new-password screen, not the workspace",
-      (await page.getByRole("heading", { name: "Server configuration" }).count()) === 0,
+      (await page.locator(".session-bar").count()) === 0,
       "workspace hidden while recovering",
     );
 
@@ -329,7 +355,7 @@ try {
 
     await confirmField.fill(newPassword);
     await page.getByRole("button", { name: "Update password" }).click();
-    await page.getByRole("heading", { name: "Server configuration" }).waitFor({ timeout: 30000 });
+    await page.locator(".session-bar").waitFor({ timeout: 30000 });
     record(
       "the new password is saved with the recovery session",
       (await page.getByText("Password updated.").count()) === 1,
@@ -357,6 +383,10 @@ try {
       "Signed in as sf-e2e-account-…",
     );
 
+    // The Phase 1-2 configuration view lives in a collapsed <details> below the
+    // workspace now, so open it before using the billable test button.
+    await page.locator("details.dev-harness summary").click();
+
     // 6. Expired session: drop storage, then a request must send the user back.
     await page.waitForFunction(
       () => {
@@ -378,7 +408,7 @@ try {
     record(
       "an expired session returns to the sign-in form with an explanation",
       /session expired/i.test(await page.getByRole("alert").innerText()) &&
-        (await page.getByRole("heading", { name: "Server configuration" }).count()) === 0,
+        (await page.locator(".session-bar").count()) === 0,
       "workspace closed, message shown",
     );
     record(
@@ -396,10 +426,22 @@ try {
   );
 } catch (error) {
   record("account flow script completed", false, error instanceof Error ? error.message : String(error));
-  await page.screenshot({ path: process.env.E2E_FAILURE_SCREENSHOT ?? "e2e-account-failure.png", fullPage: true }).catch(() => {});
+  if (page) {
+    await page
+      .screenshot({ path: process.env.E2E_FAILURE_SCREENSHOT ?? "e2e-account-failure.png", fullPage: true })
+      .catch(() => {});
+  }
 } finally {
-  await browser.close();
-  const cleanup = await deleteUsers();
+  // A browser that never launched has nothing to close, and a close failure
+  // must not skip the user cleanup below.
+  if (browser) await browser.close().catch(() => {});
+
+  let cleanup;
+  try {
+    cleanup = await deleteUsers();
+  } catch (cause) {
+    cleanup = `cleanup failed: ${cause instanceof Error ? cause.message : String(cause)}`;
+  }
   const cleanupOk = cleanup.split(", ").every((entry) => {
     const value = entry.split("=")[1] ?? "";
     return value === "absent" || value === "pre-existing (left alone)" || /^(200|204)\/404$/.test(value);
@@ -410,7 +452,7 @@ try {
 const failed = results.filter((result) => !result.ok);
 const blocked = results.filter((result) => result.blocked);
 const passed = results.length - failed.length - blocked.length;
-const warnings = redirectAllowlisted ? 0 : 1;
+const warnings = redirectAllowlisted === false ? 1 : 0;
 console.log(
   `\nSUMMARY ${passed}/${results.length - blocked.length} passed, ${blocked.length} blocked` +
     (warnings ? ", 1 warning (base origin is not allowlisted for redirects)" : ""),

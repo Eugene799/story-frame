@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "StoryFrame - Phase 1 Ollama Cloud development connection test",
+  "description": "StoryFrame - AI video planning, media, narration, and export workspace",
   "engines": {
     "node": ">=22 <27"
   },

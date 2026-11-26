@@ -45,8 +45,8 @@ verified user id.
 
 **The development loop is loopback-only.** `npm run dev` binds the API to `127.0.0.1` and reaches it through the Vite
 proxy. In production the same process serves the built client and `/api` from one origin (see [Production](#production)).
-Durable cross-instance quotas (the per-account in-flight guards are per process, unlike the sweeps' stored leases) and
-broader account flows (sign-up, password reset, MFA, OAuth) remain future work.
+Durable cross-instance quotas (the per-account in-flight guards are per process, unlike the sweeps' stored leases),
+MFA, OAuth, email change, and account settings remain future work.
 
 ## Run locally
 
@@ -487,11 +487,11 @@ Afterwards, check the running server rather than assuming the schema is ready:
 3. Set `SMOKE_SUPABASE_ACCESS_TOKEN` to a session token and run `npm run smoke:live` (five
    billable calls, described under Tests).
 
-**The nineteen migrations through Phase 9 are applied to the configured project (`myrohtkfsuppcabedwmn`): the sixth on
+**The migration set through Phase 9 is applied to the configured project (`myrohtkfsuppcabedwmn`): the sixth on
 2026-11-24, the seventh and eighth (Phase 5) on 2026-11-25, the ninth through seventeenth (Phases 6–8) on 2026-11-25, and
-the eighteenth and nineteenth (Phase 9) on 2026-11-25 through the management API. `npm run verify:sql` still proves every
-one locally first, and after applying the last two a PostgREST probe returned `200` for `render_snapshots.kind`,
-`render_snapshots.media_id`, and `video_usage`.** The Phase 6 catalog was
+the eighteenth through twenty-first (Phase 9) through the management API, the last on 2026-11-26. `npm run verify:sql`
+still proves every one locally first, and after applying the first two Phase 9 migrations a PostgREST probe returned
+`200` for `render_snapshots.kind`, `render_snapshots.media_id`, and `video_usage`.** The Phase 6 catalog was
 checked directly after applying it: `media_metadata.provenance` and its object constraint exist,
 `media_metadata_ready_stock_import_key` is a partial unique index on the owner, project, provider, asset id, and
 rendition where `status = 'ready'`, and `stock_search_cache` exists with RLS enabled, no `authenticated` grants, and
@@ -618,8 +618,14 @@ concurrent refreshes, so the app never starts a second refresh of its own. `onAu
 sign-in, token refresh, and sign-out. Sign-out uses `scope: "local"`: it clears this browser's stored session and leaves
 the account's other sessions active. Sign-out is paused while a billable request is in flight so its reply is not lost.
 
-There is no sign-up, password-reset, MFA, or OAuth flow yet. The test screen remains a development harness, not a
-production account-management UI.
+The sign-in screen links to account creation and password reset. Sign-up posts to Supabase Auth with
+`emailRedirectTo` set to the current origin; when the project requires confirmation, the screen says a link was sent
+instead of signing the person in, and an address that already has an account is reported so they can sign in or reset
+rather than wait for a mail that will not arrive. "Forgot your password?" calls `resetPasswordForEmail` and always
+shows the same neutral message. Opening a recovery link emits `PASSWORD_RECOVERY`, which keeps the workspace hidden
+behind the new-password screen until the password is saved or recovery is cancelled; cancelling drops the recovery
+session. There is no MFA, OAuth, email-change, or account-settings UI yet, and the connection-test screen remains a
+development harness, not a production account-management UI.
 
 ## API
 
@@ -1568,7 +1574,7 @@ select-own policy on each, the revision trigger, no `auth.users` trigger, and `/
 including two-user isolation), and `smoke:live` exited 0 with 5/5 model families and an identical
 stored replay. The test users and rows were deleted; the project is empty again.
 
-`npm run verify:sql` applies all ten migrations to a real PostgreSQL engine (PGlite, PostgreSQL compiled to
+`npm run verify:sql` applies every migration to a real PostgreSQL engine (PGlite, PostgreSQL compiled to
 WebAssembly) with Supabase-like `anon`, `authenticated`, and `service_role` roles plus an `auth.uid()` stub, then
 asserts what the server relies on: the revision trigger, owner-only reads on every table, refused browser writes, the
 conditional version update, constraint and foreign-key rejections, and the cascades from both `projects` and
@@ -1774,8 +1780,10 @@ the recovery step opens the session fragment directly rather than depending on t
 
 The script creates disposable users, exercises sign-up, the reset request, a recovery link minted with the admin API
 (so no inbox is needed), the password change (the old password must stop working), an unconfirmed account, and the
-expired-session path, then deletes every user it created and verifies the deletion. It never calls the billing route:
-requests to `/api/ai/test` are counted and must stay at zero once the session is gone.
+expired-session path, then deletes every user it created and verifies the deletion. The users are created before the
+browser starts and removed in a `finally` block, so a missing Playwright install, a browser that cannot launch, or a
+failed flow still runs cleanup; `tests/e2e-account-cleanup.test.ts` pins that ordering. It never calls the billing
+route: requests to `/api/ai/test` are counted and must stay at zero once the session is gone.
 
 Projects with `mailer_autoconfirm=false` send a confirmation mail, and Supabase rate-limits those sends. When the
 project's mail quota is exhausted (`over_email_send_rate_limit`), the sign-up and reset-request checks are reported
@@ -1802,7 +1810,7 @@ end, and never deletes an account that existed before the run.
   message naming the remaining time. The count lives in the mounted app, so a reload clears it. This is a usability
   guard, not the security boundary; Supabase's server-side limits remain the enforcement point, and there is no
   server-side throttle of our own.
-- All ten migrations and RLS policies are applied to the configured Supabase project (Phase 6 on 2026-11-25,
+- All migrations and RLS policies are applied to the configured Supabase project (Phase 6 on 2026-11-25,
   including the ready-import uniqueness index). The
   hosted catalog was checked (12 tables, RLS, policies, grants, revision trigger), and live profile/project/child
   routes, two-user isolation, ledger readiness, and the planning-status route passed 51/51 checks; the disposable users
