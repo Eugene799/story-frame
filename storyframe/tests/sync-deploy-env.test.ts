@@ -1,4 +1,6 @@
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   buildPlan,
@@ -57,6 +59,45 @@ describe("deploy env source", () => {
   it("rejects an origin with a path or a non-http scheme", () => {
     expect(() => normalizeOrigin("https://storyframe.test/api")).toThrow(/without a path/);
     expect(() => normalizeOrigin("ftp://storyframe.test")).toThrow(/http or https/);
+  });
+});
+
+describe("deploy env CLI", () => {
+  const cwd = fileURLToPath(new URL("..", import.meta.url));
+
+  function run(args: string[], env: Record<string, string> = {}): ReturnType<typeof spawnSync> {
+    return spawnSync(process.execPath, ["--import", "tsx", "scripts/sync-deploy-env.ts", ...args], {
+      cwd,
+      env: { ...process.env, RENDER_API_KEY: "", ...env },
+      encoding: "utf8",
+    });
+  }
+
+  it("exits 2 with a usage message rather than a stack trace", () => {
+    // A path in APP_ORIGIN is a configuration mistake, not a crash: the run must
+    // stop before any request and say so.
+    const badOrigin = run(["--service", "srv-test", "--origin", "https://storyframe.test/api", "--dry-run"]);
+    expect(badOrigin.status).toBe(2);
+    expect(badOrigin.stderr).toContain("nothing was written");
+    expect(badOrigin.stderr).not.toContain("    at ");
+
+    const noService = run(["--origin", "https://storyframe.test", "--dry-run"]);
+    expect(noService.status).toBe(2);
+    expect(noService.stderr).toContain("Pass --service");
+  });
+
+  it("prints the plan and writes nothing on a dry run", () => {
+    const dryRun = run([
+      "--service",
+      "srv-test",
+      "--origin",
+      "https://storyframe.test",
+      "--dry-run",
+    ]);
+    expect(dryRun.status).toBe(0);
+    expect(dryRun.stdout).toContain("PLAN  APP_ORIGIN=https://storyframe.test");
+    expect(dryRun.stdout).toContain("20 keys left alone");
+    expect(dryRun.stdout).not.toContain("SET  ");
   });
 });
 
