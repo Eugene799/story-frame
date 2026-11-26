@@ -283,6 +283,11 @@ Save these **before the first deploy reads its environment**: Render snapshots t
 created without them brings its first instance up on the code defaults — `256 MiB` caps and a `127.0.0.1` bind, which the
 startup line and its loopback warning both show — and only the next deploy runs the values above.
 
+`npm run deploy:env -- --service <srv-id>` writes those non-secret values for you: it reads the literal `value:` entries
+from [`render.yaml`](render.yaml), derives `APP_ORIGIN` from the service's own URL, and PUTs each key separately, so a
+credential already on the service is never replaced. It needs `RENDER_API_KEY` (shell or `.env`), and Render does not
+deploy env changes by itself, so deploy afterwards.
+
 Deliberately unset on this pass: `OLLAMA_API_KEY`, `DEEPGRAM_API_KEY`, `JSON2VIDEO_API_KEY`, `EVERYPIXEL_CLIENT_ID`,
 `EVERYPIXEL_SECRET_ID`, `LEONARDO_API_KEY`, `CLOUDFLARE_AI_API_TOKEN`. Those features stay disabled (`…_PROVIDER_DISABLED`)
 and `preflight` prints a `WARN` for each one, which is expected here, not a failure. `PEXELS_API_KEY` and `PIXABAY_API_KEY`

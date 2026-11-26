@@ -28,6 +28,7 @@
     "verify:r2-live": "tsx scripts/verify-r2-live.ts",
     "cors:preview": "tsx scripts/set-preview-cors.ts",
     "preflight:deploy": "tsx scripts/preflight-deploy.ts",
+    "deploy:env": "tsx scripts/sync-deploy-env.ts",
     "verify:sql": "tsx scripts/verify-sql.ts",
     "audit:media": "tsx scripts/audit-media.ts",
     "measure:memory": "tsx scripts/measure-memory.ts",
