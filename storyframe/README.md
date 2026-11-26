@@ -167,7 +167,10 @@ that loses the claim on a still-pending row reports it as pending. The claim is 
 its TTL lets the next pass take over if that instance dies mid-settlement. The video, lip sync, and media sweeps claim
 per row the same way (`video-row:<id>`, `lipsync-row:<id>`, `media-row:<id>`): the pass holding a row claim is the only
 one that may advance or remove that row, so a pass that takes over a lapsed sweep lease leaves a row another instance
-is working on, and a refused claim is retried on the next pass.
+is working on, and a refused claim is retried on the next pass. A row claim is renewed every third of its TTL for as
+long as its advance runs, so a slow provider poll or copy keeps the row instead of handing it to the next pass. The
+renewal lasts as long as the process that holds it, so a hung advance keeps its row until that process dies: only the
+provider and download timeouts the pass already applies bound it, not the lease TTL.
 
 `npm run verify:claim-live` exercises the claims across two local instances against the hosted project. In the image
 race one sweeps the job and the other serves `…/refresh`, and only one of them stores the result. In the lip sync race

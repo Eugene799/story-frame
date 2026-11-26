@@ -1423,19 +1423,18 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
       try {
         const live = await deps.store.live(25);
         for (const cursor of live) {
-          // The pass holding the row claim advances it. A sweep pass can outlive
-          // its lease, so a second instance may take the sweep over mid-pass and
+          // The pass holding the row claim advances it, and keeps renewing that
+          // claim while the poll and the copy run. A sweep pass can outlive its
+          // lease, so a second instance may take the sweep over mid-pass and
           // must leave a row another one is already advancing.
-          const release = await deps.claimRow(cursor.id);
-          if (!release) continue;
-          try {
-            await advance(cursor);
-          } catch {
-            // One bad row must not stop the rest of the pass.
-            log.error("[video] VIDEO_EXPORT_ADVANCE_FAILED");
-          } finally {
-            await release();
-          }
+          await deps.claimRow(cursor.id, async () => {
+            try {
+              await advance(cursor);
+            } catch {
+              // One bad row must not stop the rest of the pass.
+              log.error("[video] VIDEO_EXPORT_ADVANCE_FAILED");
+            }
+          });
         }
       } finally {
         sweeping = null;

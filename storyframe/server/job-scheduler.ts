@@ -1,4 +1,4 @@
-import type { JobLease } from "./job-lease";
+import { leaseHeartbeatMs, type JobLease } from "./job-lease";
 
 export interface JobSchedulerOptions {
   /** Log prefix, e.g. `media`. */
@@ -39,8 +39,7 @@ export function startJobScheduler(options: JobSchedulerOptions): JobScheduler {
   const log = options.logger ?? console;
   const prefix = `[${options.label}] ${options.code}`;
   const lease = options.lease ?? null;
-  // A third of the TTL leaves room for a slow round trip before the lease lapses.
-  const heartbeatMs = lease ? Math.max(1_000, Math.floor(lease.ttlMs / 3)) : 0;
+  const heartbeatMs = lease ? leaseHeartbeatMs(lease.ttlMs) : 0;
   let running: Promise<void> | null = null;
 
   async function pass(): Promise<void> {

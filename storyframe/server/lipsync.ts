@@ -869,23 +869,20 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
       for (const row of rows) {
         const lastPolled = row.lastPolledAt ? Date.parse(row.lastPolledAt) : 0;
         if (lastPolled !== 0 && now() - lastPolled < limits.pollIntervalMs) continue;
-        // The pass holding the row claim advances it. A sweep pass can outlive
-        // its lease, so a second instance may take the sweep over mid-pass and
+        // The pass holding the row claim advances it, and keeps renewing that
+        // claim while the poll and the copy run. A sweep pass can outlive its
+        // lease, so a second instance may take the sweep over mid-pass and
         // must leave a row another one is already advancing.
-        const release = await deps.claimRow(row.id);
-        if (!release) continue;
-        try {
+        await deps.claimRow(row.id, async () => {
           const age = now() - Date.parse(row.createdAt);
           if (age > limits.abandonAfterMs) {
             await fail(row, "LIPSYNC_ABANDONED", "This lip sync was abandoned before the provider finished it.", 0);
-            continue;
+            return;
           }
           await advance(row).catch((error: unknown) => {
             log.error(`[lipsync] LIPSYNC_ADVANCE_FAILED ${error instanceof Error ? error.name : "unknown"}`);
           });
-        } finally {
-          await release();
-        }
+        });
       }
     })().finally(() => {
       sweeping = null;

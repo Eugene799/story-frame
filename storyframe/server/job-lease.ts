@@ -19,10 +19,37 @@ export interface JobLease {
 
 /**
  * Claims one row for one sweep step, named by its family and row id, e.g.
- * `video-row:<id>`. Resolves to the release call, or null when another holder
- * has the row, so a sweep can skip that row instead of advancing it twice.
+ * `video-row:<id>`, and runs `work` under that claim. The claim is renewed while
+ * the work runs, so an advance that outlives the TTL keeps its row. Resolves to
+ * the work's result, or null when another holder has the row, so a sweep skips
+ * that row instead of advancing it twice.
  */
-export type RowClaim = (rowId: string) => Promise<(() => Promise<void>) | null>;
+export type RowClaim = <T>(rowId: string, work: () => Promise<T>) => Promise<T | null>;
+
+/** Renewal cadence: a third of the TTL leaves room for a slow round trip. */
+export function leaseHeartbeatMs(ttlMs: number): number {
+  return Math.max(1_000, Math.floor(ttlMs / 3));
+}
+
+/**
+ * Runs `work` while keeping `lease` alive, renewing every third of its TTL.
+ * Without the renewal a claim taken once would lapse mid-advance, and the next
+ * pass on another instance could take the same row. A failed renewal is ignored
+ * here exactly as in a sweep pass: the lease runs out and the next claim takes
+ * over. The lease is released when the work ends, however it ends.
+ */
+export async function withLeaseRenewal<T>(lease: JobLease, work: () => Promise<T>): Promise<T> {
+  const heartbeat = setInterval(() => {
+    void lease.renew().catch(() => undefined);
+  }, leaseHeartbeatMs(lease.ttlMs));
+  heartbeat.unref?.();
+  try {
+    return await work();
+  } finally {
+    clearInterval(heartbeat);
+    await lease.release().catch(() => undefined);
+  }
+}
 
 export interface SupabaseJobLeaseOptions {
   url: string;

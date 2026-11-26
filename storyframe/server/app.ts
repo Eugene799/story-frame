@@ -120,7 +120,7 @@ import {
   type NarrationTrack,
 } from "../shared/narration-contract";
 import { startJobScheduler } from "./job-scheduler";
-import { createSupabaseJobLease, type JobLease, type RowClaim } from "./job-lease";
+import { createSupabaseJobLease, withLeaseRenewal, type JobLease, type RowClaim } from "./job-lease";
 import { serveStatic } from "./static";
 import { createSupabaseModelHealthStore, type ModelHealthStore } from "./model-health";
 import {
@@ -772,18 +772,20 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
    * A claim on one row of a sweep family, e.g. `media-row:<id>`: the pass holding
    * it is the only one that may advance or remove that row. A refused or
    * unreachable claim skips the row for this pass, so the next one retries it.
+   * The claim is renewed for as long as the advance runs, so a provider poll or
+   * a copy that outlives the TTL does not hand the row to the next pass.
    */
   function rowClaimer(prefix: string, code: string): RowClaim {
-    return async (rowId) => {
+    return async (rowId, work) => {
       const lease = jobLeaseFor(`${prefix}:${rowId}`);
-      if (!lease) return async () => undefined;
+      if (!lease) return work();
       try {
         if (!(await lease.claim())) return null;
       } catch {
         log.error(`[${prefix.split("-")[0]}] ${code}_LEASE_UNAVAILABLE`);
         return null;
       }
-      return () => lease.release().catch(() => undefined);
+      return withLeaseRenewal(lease, work);
     };
   }
 

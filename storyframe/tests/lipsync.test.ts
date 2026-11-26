@@ -300,7 +300,7 @@ function service(options: {
     fetchImpl: options.fetchImpl,
     now: () => NOW,
     logger: { error: () => undefined },
-    claimRow: options.claimRow ?? (async () => async () => undefined),
+    claimRow: options.claimRow ?? (async (_rowId, work) => work()),
   });
 }
 
@@ -452,7 +452,7 @@ describe("lipsync sweep", () => {
     const media = fakeMedia(objects);
     const { fetchImpl, calls } = fakeFetch({ objects });
     const held = new Set([store.rows[0].id]);
-    const claimRow: RowClaim = async (id) => (held.has(id) ? null : async () => undefined);
+    const claimRow: RowClaim = async (id, work) => (held.has(id) ? null : work());
     const sweeper = service({
       store: store.store,
       mediaStore: media.media,

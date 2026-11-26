@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { ApiError } from "../server/api-error";
-import { createSupabaseJobLease } from "../server/job-lease";
+import { createSupabaseJobLease, withLeaseRenewal } from "../server/job-lease";
 
 const SERVICE_ROLE_KEY = "test-service-role-key";
 
@@ -50,6 +50,33 @@ async function startLeaseServer(answer: (recorded: Recorded) => { status: number
         server.closeAllConnections();
         server.close(() => resolve());
       }),
+  };
+}
+
+/** The claim, renew, and release rules of `job_leases`, without a database. */
+function leaseTable() {
+  let held: { holder: string; expiresAt: number } | null = null;
+  return {
+    answer(recorded: Recorded): { status: number; body: unknown } {
+      const body = (recorded.body ?? {}) as { p_holder?: string; p_ttl_seconds?: number };
+      const now = Date.now();
+      if (recorded.path === "/rest/v1/rpc/claim_job_lease") {
+        if (held && held.expiresAt > now) return { status: 200, body: false };
+        held = { holder: String(body.p_holder), expiresAt: now + Number(body.p_ttl_seconds) * 1000 };
+        return { status: 200, body: true };
+      }
+      if (recorded.path === "/rest/v1/rpc/renew_job_lease") {
+        if (!held || held.holder !== body.p_holder) return { status: 200, body: false };
+        held.expiresAt = now + Number(body.p_ttl_seconds) * 1000;
+        return { status: 200, body: true };
+      }
+      if (recorded.method === "DELETE") {
+        const holder = recorded.query.get("holder")?.replace(/^eq\./, "");
+        if (held && held.holder === holder) held = null;
+        return { status: 204, body: undefined };
+      }
+      return { status: 404, body: null };
+    },
   };
 }
 
@@ -121,6 +148,50 @@ describe("stored job lease", () => {
       p_name: "lipsync-sweep",
       p_holder: "22222222-2222-4222-8222-222222222222",
     });
+  });
+
+  it("keeps a row claim alive past its TTL so a second instance cannot take it mid-advance", async () => {
+    const table = leaseTable();
+    const fake = await startLeaseServer(table.answer);
+    close = fake.close;
+
+    // A 3 s TTL renews every second: the advance below runs past the expiry the
+    // claim was taken with, so only the renewal keeps the row.
+    const row = { url: fake.url, serviceRoleKey: SERVICE_ROLE_KEY, timeoutMs: 1000, name: "lipsync-row:row-1", ttlMs: 3_000 };
+    const first = createSupabaseJobLease({ ...row, holder: "11111111-1111-4111-8111-111111111111" });
+    const second = createSupabaseJobLease({ ...row, holder: "22222222-2222-4222-8222-222222222222" });
+
+    expect(await first.claim()).toBe(true);
+    const advanced = await withLeaseRenewal(first, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 3_600));
+      // Past the expiry the claim was taken with: a lease nobody renews would be
+      // free by now, and this claim is what a second pass would make.
+      expect(await second.claim()).toBe(false);
+      return "advanced";
+    });
+
+    expect(advanced).toBe("advanced");
+    expect(fake.requests.some((request) => request.path.endsWith("/renew_job_lease"))).toBe(true);
+    // Released when the advance ended, so the next pass takes the row at once.
+    expect(await second.claim()).toBe(true);
+  });
+
+  it("releases a row claim when the advance throws", async () => {
+    const table = leaseTable();
+    const fake = await startLeaseServer(table.answer);
+    close = fake.close;
+
+    const row = { url: fake.url, serviceRoleKey: SERVICE_ROLE_KEY, timeoutMs: 1000, name: "video-row:row-1", ttlMs: 90_000 };
+    const first = createSupabaseJobLease({ ...row, holder: "11111111-1111-4111-8111-111111111111" });
+    const second = createSupabaseJobLease({ ...row, holder: "22222222-2222-4222-8222-222222222222" });
+
+    expect(await first.claim()).toBe(true);
+    await expect(
+      withLeaseRenewal(first, async () => {
+        throw new Error("copy failed");
+      }),
+    ).rejects.toThrow("copy failed");
+    expect(await second.claim()).toBe(true);
   });
 
   it("releases only its own row, so a stale holder cannot delete the new owner's lease", async () => {

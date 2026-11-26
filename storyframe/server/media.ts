@@ -938,19 +938,17 @@ export async function sweepMedia(options: SweepOptions): Promise<void> {
 
   /**
    * One instance removes one row: the claim keeps another pass from touching it
-   * while the object goes and the row follows. False means the claim was refused
-   * or the object removal failed, so the row stays for a later pass.
+   * while the object goes and the row follows, and is renewed until both are
+   * done. False means the claim was refused or the object removal failed, so the
+   * row stays for a later pass.
    */
   async function removeClaimed(row: StoredObjectRow): Promise<boolean> {
-    const release = await options.claimRow(row.id);
-    if (!release) return false;
-    try {
+    const removed = await options.claimRow(row.id, async () => {
       if (!(await removeObject(row.objectKey))) return false;
       await options.store.removeRow(row.id).catch(() => log.error("[media] MEDIA_ROW_DELETE_FAILED"));
       return true;
-    } finally {
-      await release();
-    }
+    });
+    return removed === true;
   }
 
   const pending = await options.store.stalePending(new Date(now()).toISOString(), options.limits.sweepBatch);
