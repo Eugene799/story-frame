@@ -212,6 +212,8 @@ export interface PollLipsyncOptions {
   taskId: string;
   fetchImpl?: typeof fetch;
   timeoutMs: number;
+  /** A sweep's row deadline; aborts this read when the row's time is up. */
+  signal?: AbortSignal;
 }
 
 export interface LipsyncTaskState {
@@ -241,7 +243,9 @@ export async function pollLipsync(options: PollLipsyncOptions): Promise<LipsyncT
     response = await (options.fetchImpl ?? fetch)(url, {
       method: "GET",
       headers: { Authorization: authorization(options.settings) },
-      signal: AbortSignal.timeout(options.timeoutMs),
+      signal: options.signal
+        ? AbortSignal.any([AbortSignal.timeout(options.timeoutMs), options.signal])
+        : AbortSignal.timeout(options.timeoutMs),
     });
   } catch {
     throw new EverypixelError(502, "LIPSYNC_PROVIDER_FAILED", "Everypixel could not be reached.", true);

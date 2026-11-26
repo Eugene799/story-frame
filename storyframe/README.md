@@ -168,9 +168,9 @@ its TTL lets the next pass take over if that instance dies mid-settlement. The v
 per row the same way (`video-row:<id>`, `lipsync-row:<id>`, `media-row:<id>`): the pass holding a row claim is the only
 one that may advance or remove that row, so a pass that takes over a lapsed sweep lease leaves a row another instance
 is working on, and a refused claim is retried on the next pass. A row claim is renewed every third of its TTL for as
-long as its advance runs, so a slow provider poll or copy keeps the row instead of handing it to the next pass. The
-renewal lasts as long as the process that holds it, so a hung advance keeps its row until that process dies: only the
-provider and download timeouts the pass already applies bound it, not the lease TTL.
+long as its advance runs, so a slow provider poll or copy keeps the row instead of handing it to the next pass. Each
+advance also runs under a row deadline (`JOB_ROW_DEADLINE_MS`, default 5 minutes): when it passes, the in-flight poll
+or copy is aborted, the claim is released, and the row stays pending for the next pass to retry.
 
 `npm run verify:claim-live` exercises the claims across two local instances against the hosted project. In the image
 race one sweeps the job and the other serves `…/refresh`, and only one of them stores the result. In the lip sync race
@@ -323,6 +323,7 @@ anon) key; never the service-role key.
 | `VIDEO_TIMING_TOLERANCE_SECONDS` | Rounding margin allowed when measured narration is compared with the scene timeline before `409 VIDEO_NARRATION_OVERFLOW` (default 0.5; 0–5). |
 | `VIDEO_DAILY_CREDITS_PER_USER` | Rolling 24-hour per-account credit guard (default 600 credits = ten rendered minutes). `0` disables that dimension. |
 | `JOB_LEASE_TTL_MS` | How long a sweep's stored lease survives without a renewal (default 90000; 30000–3600000). A running pass renews it every third of this value, so it bounds takeover after a crash, not pass length. Without Supabase service-role configuration there is no lease and each sweep runs only in its own process. |
+| `JOB_ROW_DEADLINE_MS` | How long one row's advance may run before it is aborted and its claim released (default 300000; 10000–3600000). The aborted row stays pending and the next pass retries it, so a wedged provider poll or copy cannot hold the row until the process dies. |
 
 `.env` is git-ignored; `.env.example` contains placeholders only. Only public Supabase auth configuration uses a
 `VITE_` name; no secret is prefixed with `VITE_`, returned by the API, logged, or placed in a URL. The Supabase client

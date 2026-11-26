@@ -9,7 +9,7 @@ import {
 } from "../server/lipsync";
 import type { MediaLimits, MediaStore } from "../server/media";
 import type { R2Client } from "../server/r2";
-import type { RowClaim } from "../server/job-lease";
+import { withLeaseRenewal, type RowClaim } from "../server/job-lease";
 import { MAX_MP4_DURATION_SECONDS, readMp4DurationSeconds } from "../server/mp4";
 import type { MediaRecord } from "../shared/media-contract";
 
@@ -289,18 +289,19 @@ function service(options: {
   fetchImpl: typeof fetch;
   configured?: boolean;
   claimRow?: RowClaim;
+  limits?: Partial<LipsyncLimits>;
 }) {
   return createLipsyncService({
     store: options.store,
     media: options.mediaStore,
     objects: options.objects,
     settings: options.configured === false ? { clientId: null, clientSecret: null } : { clientId: "id", clientSecret: "secret" },
-    limits: LIMITS,
+    limits: { ...LIMITS, ...options.limits },
     mediaLimits: MEDIA_LIMITS,
     fetchImpl: options.fetchImpl,
     now: () => NOW,
     logger: { error: () => undefined },
-    claimRow: options.claimRow ?? (async (_rowId, work) => work()),
+    claimRow: options.claimRow ?? (async (_rowId, work) => work(new AbortController().signal)),
   });
 }
 
@@ -446,13 +447,119 @@ describe("lipsync sweep", () => {
     }
   });
 
+  it("aborts a stuck poll at the row deadline and retries the row on the next pass", async () => {
+    const store = memoryStore([row()]);
+    const objects = new Map<string, Buffer>();
+    const media = fakeMedia(objects);
+    // A provider that answers only when the row deadline aborts the read.
+    const hanging = ((_url: string | URL | Request, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        const stop = () => reject(signal?.reason ?? new Error("aborted"));
+        if (signal?.aborted) {
+          stop();
+          return;
+        }
+        signal?.addEventListener("abort", stop);
+      })) as typeof fetch;
+    // The claimer the server wires in: a claim held under a renewal deadline.
+    const claimRow: RowClaim = async (_rowId, work) =>
+      withLeaseRenewal(
+        { ttlMs: 60_000, claim: async () => true, renew: async () => true, release: async () => undefined },
+        work,
+        25,
+      );
+    const sweeper = service({
+      store: store.store,
+      mediaStore: media.media,
+      objects: fakeObjects(objects),
+      fetchImpl: hanging,
+      claimRow,
+      // Far past the deadline, so only the row deadline can end the read.
+      limits: { timeoutMs: 60_000 },
+    });
+
+    await sweeper.sweep();
+    // Cut off, not failed: the task is still pending at the provider, so the row
+    // keeps its reservation and waits for the next pass.
+    expect(store.rows[0]?.status).toBe("pending");
+    expect(store.rows[0]?.failureCode).toBeNull();
+    expect(store.settled).toHaveLength(0);
+
+    // The released claim lets the next pass advance the same row to ready.
+    const { fetchImpl } = fakeFetch({ objects });
+    const next = service({ store: store.store, mediaStore: media.media, objects: fakeObjects(objects), fetchImpl, claimRow });
+    await next.sweep();
+    expect(store.rows[0]?.status).toBe("ready");
+    expect(store.settled.at(-1)).toMatchObject({ status: "succeeded", seconds: 6 });
+  });
+
+  it("leaves a row pending, not failed, when the deadline aborts the output copy", async () => {
+    const store = memoryStore([row()]);
+    const objects = new Map<string, Buffer>();
+    const media = fakeMedia(objects);
+    const { fetchImpl: provider } = fakeFetch({ objects });
+    let copyAttempts = 0;
+    // The provider reports SUCCESS, but its output download never finishes.
+    const stalledCopy: typeof fetch = (input, init) => {
+      if (!String(input).startsWith("https://cdn.everypixel.com/")) return provider(input, init);
+      copyAttempts += 1;
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        const stop = () => reject(signal?.reason ?? new Error("aborted"));
+        if (signal?.aborted) {
+          stop();
+          return;
+        }
+        signal?.addEventListener("abort", stop);
+      });
+    };
+    const claimRow: RowClaim = async (_rowId, work) =>
+      withLeaseRenewal(
+        { ttlMs: 60_000, claim: async () => true, renew: async () => true, release: async () => undefined },
+        work,
+        200,
+      );
+    const sweeper = service({
+      store: store.store,
+      mediaStore: media.media,
+      objects: fakeObjects(objects),
+      fetchImpl: stalledCopy,
+      claimRow,
+    });
+
+    await sweeper.sweep();
+
+    // The provider already finished and billed this task, so an aborted copy
+    // must not settle the row as failed: it waits for the next pass.
+    expect(copyAttempts).toBe(1);
+    expect(store.rows[0]).toMatchObject({ status: "pending", failureCode: null });
+    expect(store.rows[0]?.secondsCounted).toBeNull();
+    expect(store.settled).toHaveLength(0);
+    expect(media.created).toHaveLength(0);
+
+    // The released claim lets the next pass copy and settle the same row.
+    const { fetchImpl } = fakeFetch({ objects });
+    const next = service({
+      store: store.store,
+      mediaStore: media.media,
+      objects: fakeObjects(objects),
+      fetchImpl,
+      claimRow,
+    });
+    await next.sweep();
+    expect(store.rows[0]?.status).toBe("ready");
+    expect(store.settled.at(-1)).toMatchObject({ status: "succeeded", seconds: 6 });
+    expect(media.created).toHaveLength(1);
+  });
+
   it("skips a row another instance has claimed until the claim is free", async () => {
     const store = memoryStore([row()]);
     const objects = new Map<string, Buffer>();
     const media = fakeMedia(objects);
     const { fetchImpl, calls } = fakeFetch({ objects });
     const held = new Set([store.rows[0].id]);
-    const claimRow: RowClaim = async (id, work) => (held.has(id) ? null : work());
+    const claimRow: RowClaim = async (id, work) => (held.has(id) ? null : work(new AbortController().signal));
     const sweeper = service({
       store: store.store,
       mediaStore: media.media,

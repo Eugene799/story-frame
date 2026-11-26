@@ -1059,13 +1059,13 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
   }
 
   /** Streams the MP4 with a hard byte cap, not a Content-Length promise. */
-  async function downloadOutput(url: string): Promise<Buffer> {
+  async function downloadOutput(url: string, signal: AbortSignal): Promise<Buffer> {
     const target = outputUrl(url);
     let response: Response;
     try {
       response = await fetchImpl(target, {
         redirect: "error",
-        signal: AbortSignal.timeout(limits.downloadTimeoutMs),
+        signal: AbortSignal.any([AbortSignal.timeout(limits.downloadTimeoutMs), signal]),
       });
     } catch {
       throw new ApiError(502, "VIDEO_OUTPUT_COPY_FAILED", "The provider output could not be downloaded.");
@@ -1107,6 +1107,7 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
     projectId: string,
     bytes: Buffer,
     contentType: string,
+    signal: AbortSignal,
   ): Promise<{ mediaId: string; objectKey: string; byteSize: number }> {
     const used = await deps.media.usedBytes(ownerId);
     if (used + bytes.length > deps.mediaLimits.ownerStorageBytes) {
@@ -1139,7 +1140,7 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
         method: "PUT",
         headers: { "Content-Type": contentType },
         body: new Uint8Array(bytes),
-        signal: AbortSignal.timeout(limits.downloadTimeoutMs),
+        signal: AbortSignal.any([AbortSignal.timeout(limits.downloadTimeoutMs), signal]),
       });
       if (!put.ok) {
         throw new ApiError(502, "VIDEO_OUTPUT_COPY_FAILED", "Private storage rejected the finished render.");
@@ -1235,8 +1236,9 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
     cursor: VideoExportCursor,
     status: Json2VideoMovieStatus,
     url: string,
+    signal: AbortSignal,
   ): Promise<void> {
-    const bytes = await downloadOutput(url);
+    const bytes = await downloadOutput(url, signal);
     const detected = detectMediaType(bytes);
     if (!detected || !mediaTypeMatches("video", detected)) {
       throw new ApiError(
@@ -1246,7 +1248,7 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
       );
     }
 
-    const stored = await storeOutput(cursor.ownerId, cursor.projectId, bytes, detected.contentType);
+    const stored = await storeOutput(cursor.ownerId, cursor.projectId, bytes, detected.contentType, signal);
     const credits =
       status.consumedCredits !== null
         ? status.consumedCredits
@@ -1291,7 +1293,7 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
     await deleteProviderCopy(cursor.job?.externalId ?? null);
   }
 
-  async function advance(cursor: VideoExportCursor): Promise<void> {
+  async function advance(cursor: VideoExportCursor, signal: AbortSignal): Promise<void> {
     const job = cursor.job;
     const startedAt = Date.parse(job?.createdAt ?? cursor.createdAt);
     const age = Number.isFinite(startedAt) ? now() - startedAt : 0;
@@ -1328,8 +1330,11 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
 
     let status: Json2VideoMovieStatus;
     try {
-      status = await getMovie(providerOptions(), job.externalId, now());
+      status = await getMovie({ ...providerOptions(), signal }, job.externalId, now());
     } catch (error) {
+      // The row deadline aborted the status read: the render itself is
+      // untouched, so the next pass polls it again.
+      if (signal.aborted) return;
       if (!(error instanceof Json2VideoError)) throw error;
       if (error.code === "VIDEO_PROVIDER_DISABLED") return;
       if (error.code === "VIDEO_JOB_NOT_FOUND") {
@@ -1401,8 +1406,12 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
     }
 
     try {
-      await copyFinished(cursor, status, status.url);
+      await copyFinished(cursor, status, status.url, signal);
     } catch (error) {
+      // The deadline aborted the copy of output the provider already finished
+      // and billed, so leave the row pending for the next pass to retry instead
+      // of settling a copy a later pass could complete.
+      if (signal.aborted) return;
       const code =
         error instanceof ApiError && isFailureCode(error.code) ? error.code : "VIDEO_OUTPUT_COPY_FAILED";
       const message =
@@ -1427,9 +1436,9 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
           // claim while the poll and the copy run. A sweep pass can outlive its
           // lease, so a second instance may take the sweep over mid-pass and
           // must leave a row another one is already advancing.
-          await deps.claimRow(cursor.id, async () => {
+          await deps.claimRow(cursor.id, async (signal) => {
             try {
-              await advance(cursor);
+              await advance(cursor, signal);
             } catch {
               // One bad row must not stop the rest of the pass.
               log.error("[video] VIDEO_EXPORT_ADVANCE_FAILED");

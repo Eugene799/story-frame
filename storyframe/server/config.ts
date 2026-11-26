@@ -57,8 +57,8 @@ export interface AppConfig {
   video: VideoLimits & { sweepIntervalMs: number };
   /** Lip sync bounds, output-host allowlist, and the seconds guard. */
   lipsync: LipsyncLimits;
-  /** Durable advancement leases shared by every background sweep. */
-  jobs: { leaseTtlMs: number };
+  /** Durable advancement leases and row deadlines shared by every background sweep. */
+  jobs: { leaseTtlMs: number; rowAdvanceDeadlineMs: number };
 }
 
 function intEnv(
@@ -219,9 +219,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       dailyCreditsLimit: intEnv(env, "VIDEO_DAILY_CREDITS_PER_USER", 600, 0, 100_000),
       spendWindowMs: 24 * 60 * 60 * 1000,
     },
-    // How long a crashed holder's lease survives. Each pass renews its lease,
-    // so this bounds recovery after a crash, not the length of a pass.
-    jobs: { leaseTtlMs: intEnv(env, "JOB_LEASE_TTL_MS", 90_000, 30_000, 3_600_000) },
+    jobs: {
+      // How long a crashed holder's lease survives. Each pass renews its lease,
+      // so this bounds recovery after a crash, not the length of a pass.
+      leaseTtlMs: intEnv(env, "JOB_LEASE_TTL_MS", 90_000, 30_000, 3_600_000),
+      // Bounds one row's advance (poll, download, copy). Past it the advance is
+      // aborted and its claim released, so the next pass retries the row instead
+      // of it being held until the process dies.
+      rowAdvanceDeadlineMs: intEnv(env, "JOB_ROW_DEADLINE_MS", 300_000, 10_000, 3_600_000),
+    },
     lipsync: {
       timeoutMs: intEnv(env, "LIPSYNC_TIMEOUT_MS", 60_000, 5_000, 180_000),
       // The provider queues sequentially, so a status read every few seconds is plenty.

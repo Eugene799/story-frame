@@ -505,7 +505,7 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
    * Downloads the provider's output, re-checking the host on every redirect hop
    * and refusing anything bigger than the configured cap.
    */
-  async function downloadOutput(url: string): Promise<{ bytes: Buffer; contentType: string }> {
+  async function downloadOutput(url: string, signal: AbortSignal): Promise<{ bytes: Buffer; contentType: string }> {
     let target = url;
     for (let hop = 0; hop <= limits.redirectLimit; hop += 1) {
       let parsed: URL;
@@ -528,7 +528,7 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
       const response = await fetchImpl(parsed, {
         method: "GET",
         redirect: "manual",
-        signal: AbortSignal.timeout(limits.downloadTimeoutMs),
+        signal: AbortSignal.any([AbortSignal.timeout(limits.downloadTimeoutMs), signal]),
       }).catch(() => {
         throw new ApiError(502, "LIPSYNC_OUTPUT_COPY_FAILED", "The finished lip sync could not be downloaded.");
       });
@@ -569,6 +569,7 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
     projectId: string,
     bytes: Buffer,
     contentType: string,
+    signal: AbortSignal,
   ): Promise<{ mediaId: string; objectKey: string; byteSize: number }> {
     const used = await deps.media.usedBytes(ownerId);
     if (used + bytes.length > deps.mediaLimits.ownerStorageBytes) {
@@ -597,7 +598,7 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
         method: "PUT",
         headers: { "Content-Type": contentType },
         body: new Uint8Array(bytes),
-        signal: AbortSignal.timeout(limits.downloadTimeoutMs),
+        signal: AbortSignal.any([AbortSignal.timeout(limits.downloadTimeoutMs), signal]),
       });
       if (!put.ok) {
         throw new ApiError(502, "LIPSYNC_OUTPUT_COPY_FAILED", "Private storage rejected the finished lip sync.");
@@ -621,7 +622,7 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
     }
   }
 
-  async function advance(row: LipsyncExportRow): Promise<void> {
+  async function advance(row: LipsyncExportRow, signal: AbortSignal): Promise<void> {
     if (!row.providerTaskId) {
       // The row is written before the provider call, so the sweep can see it
       // mid-submit with no task id yet. Failing it here would kill a request the
@@ -647,8 +648,12 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
         taskId: row.providerTaskId,
         fetchImpl,
         timeoutMs: limits.timeoutMs,
+        signal,
       });
     } catch (error) {
+      // The row deadline aborted the poll: the task is still pending at the
+      // provider, so the next pass asks again.
+      if (signal.aborted) return;
       // A success reported without a usable URL will never become usable, so it
       // fails now; every other status error is transient and retried.
       if (error instanceof ApiError && error.code === "LIPSYNC_RESULT_INVALID") {
@@ -679,7 +684,7 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
     // arrives but cannot be stored still bills what it measured.
     let counted = row.secondsEstimate;
     try {
-      const download = await downloadOutput(state.resultUrl ?? "");
+      const download = await downloadOutput(state.resultUrl ?? "", signal);
       // Bill the seconds the file actually holds, not the ceiling reserved for it.
       const measured = readMp4DurationSeconds(download.bytes);
       if (measured === null) {
@@ -691,7 +696,7 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
         log.error("[lipsync] LIPSYNC_DURATION_OUT_OF_RANGE");
       }
       counted = measured === null || measured > row.secondsEstimate ? row.secondsEstimate : measured;
-      const stored = await storeOutput(row.ownerId, row.projectId, download.bytes, download.contentType);
+      const stored = await storeOutput(row.ownerId, row.projectId, download.bytes, download.contentType, signal);
       await deps.store.update(row.ownerId, row.id, {
         status: "ready",
         providerStatus: state.providerStatus,
@@ -702,6 +707,10 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
       });
       await deps.store.settleUsage(row.ownerId, row.id, { status: "succeeded", secondsCounted: counted });
     } catch (error) {
+      // The deadline aborted a download or copy of output the provider has
+      // already finished and billed, so keep the row pending for a retry rather
+      // than settling it as a failure the next pass could not undo.
+      if (signal.aborted) return;
       const code = error instanceof ApiError && error.code.startsWith("LIPSYNC_") ? (error.code as LipsyncFailureCode) : "LIPSYNC_OUTPUT_COPY_FAILED";
       const message = error instanceof ApiError ? error.message : "The finished lip sync could not be stored.";
       // Reached only after the provider reported SUCCESS, so it has billed the
@@ -873,13 +882,13 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
         // claim while the poll and the copy run. A sweep pass can outlive its
         // lease, so a second instance may take the sweep over mid-pass and
         // must leave a row another one is already advancing.
-        await deps.claimRow(row.id, async () => {
+        await deps.claimRow(row.id, async (signal) => {
           const age = now() - Date.parse(row.createdAt);
           if (age > limits.abandonAfterMs) {
             await fail(row, "LIPSYNC_ABANDONED", "This lip sync was abandoned before the provider finished it.", 0);
             return;
           }
-          await advance(row).catch((error: unknown) => {
+          await advance(row, signal).catch((error: unknown) => {
             log.error(`[lipsync] LIPSYNC_ADVANCE_FAILED ${error instanceof Error ? error.name : "unknown"}`);
           });
         });

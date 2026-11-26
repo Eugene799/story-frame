@@ -383,6 +383,8 @@ export interface Json2VideoRequestOptions {
   settings: Json2VideoSettings;
   fetchImpl?: typeof fetch;
   timeoutMs: number;
+  /** A sweep's row deadline; aborts this read when the row's time is up. */
+  signal?: AbortSignal;
 }
 
 export interface Json2VideoMovieStatus {
@@ -456,7 +458,9 @@ async function request(
   try {
     response = await (options.fetchImpl ?? fetch)(url, {
       ...init,
-      signal: AbortSignal.timeout(options.timeoutMs),
+      signal: options.signal
+        ? AbortSignal.any([AbortSignal.timeout(options.timeoutMs), options.signal])
+        : AbortSignal.timeout(options.timeoutMs),
     });
   } catch {
     throw new Json2VideoError(

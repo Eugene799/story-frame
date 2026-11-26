@@ -20,11 +20,12 @@ export interface JobLease {
 /**
  * Claims one row for one sweep step, named by its family and row id, e.g.
  * `video-row:<id>`, and runs `work` under that claim. The claim is renewed while
- * the work runs, so an advance that outlives the TTL keeps its row. Resolves to
- * the work's result, or null when another holder has the row, so a sweep skips
- * that row instead of advancing it twice.
+ * the work runs, so an advance that outlives the TTL keeps its row, and the
+ * signal aborts the work once the claim's deadline passes. Resolves to the
+ * work's result, or null when another holder has the row, so a sweep skips that
+ * row instead of advancing it twice.
  */
-export type RowClaim = <T>(rowId: string, work: () => Promise<T>) => Promise<T | null>;
+export type RowClaim = <T>(rowId: string, work: (signal: AbortSignal) => Promise<T>) => Promise<T | null>;
 
 /** Renewal cadence: a third of the TTL leaves room for a slow round trip. */
 export function leaseHeartbeatMs(ttlMs: number): number {
@@ -36,16 +37,28 @@ export function leaseHeartbeatMs(ttlMs: number): number {
  * Without the renewal a claim taken once would lapse mid-advance, and the next
  * pass on another instance could take the same row. A failed renewal is ignored
  * here exactly as in a sweep pass: the lease runs out and the next claim takes
- * over. The lease is released when the work ends, however it ends.
+ * over. With a deadline the work's signal aborts when it passes, and the lease
+ * is released as soon as the work settles, so a wedged advance frees its row for
+ * the next pass instead of holding it until the process dies.
  */
-export async function withLeaseRenewal<T>(lease: JobLease, work: () => Promise<T>): Promise<T> {
+export async function withLeaseRenewal<T>(
+  lease: JobLease,
+  work: (signal: AbortSignal) => Promise<T>,
+  deadlineMs?: number,
+): Promise<T> {
   const heartbeat = setInterval(() => {
     void lease.renew().catch(() => undefined);
   }, leaseHeartbeatMs(lease.ttlMs));
   heartbeat.unref?.();
+
+  const controller = new AbortController();
+  const deadline = deadlineMs === undefined ? null : setTimeout(() => controller.abort(), deadlineMs);
+  deadline?.unref?.();
+
   try {
-    return await work();
+    return await work(controller.signal);
   } finally {
+    if (deadline !== null) clearTimeout(deadline);
     clearInterval(heartbeat);
     await lease.release().catch(() => undefined);
   }

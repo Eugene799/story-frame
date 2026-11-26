@@ -185,6 +185,8 @@ const PROJECT_REVISIONS_LIMIT = 20;
 const USAGE_PAGE_SIZE = 20;
 const PLANNING_BODY_BYTES = 8 * 1024;
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
+/** Passed to an advance that holds no stored claim, so it has no deadline to hit. */
+const NO_ROW_DEADLINE = new AbortController().signal;
 
 /** A pending generation settled by the poll its request started, or by a sweep. */
 interface ImageSettlement {
@@ -773,19 +775,23 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
    * it is the only one that may advance or remove that row. A refused or
    * unreachable claim skips the row for this pass, so the next one retries it.
    * The claim is renewed for as long as the advance runs, so a provider poll or
-   * a copy that outlives the TTL does not hand the row to the next pass.
+   * a copy that outlives the TTL does not hand the row to the next pass. Past
+   * the row deadline the advance is aborted and the claim released, so a wedged
+   * row is retried by the next pass instead of being held until the process dies.
    */
   function rowClaimer(prefix: string, code: string): RowClaim {
     return async (rowId, work) => {
       const lease = jobLeaseFor(`${prefix}:${rowId}`);
-      if (!lease) return work();
+      // Without a lease store this process is the only one sweeping, so the
+      // advance still needs a signal: one that never aborts.
+      if (!lease) return work(NO_ROW_DEADLINE);
       try {
         if (!(await lease.claim())) return null;
       } catch {
         log.error(`[${prefix.split("-")[0]}] ${code}_LEASE_UNAVAILABLE`);
         return null;
       }
-      return withLeaseRenewal(lease, work);
+      return withLeaseRenewal(lease, work, config.jobs.rowAdvanceDeadlineMs);
     };
   }
 

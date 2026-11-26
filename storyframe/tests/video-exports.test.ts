@@ -352,6 +352,12 @@ describe("video exports", () => {
     const ready = await awaitStatus(app, project.id, accepted.export.id, ["ready", "failed"]);
     expect(ready.export.status).toBe("ready");
     expect(ready.media?.byteSize).toBe(MP4.length);
+    // The row turns ready inside the pass; the pass deletes its own sweep lease
+    // after that, so let the release land instead of requiring it in the same
+    // tick as the status write.
+    for (let attempt = 0; attempt < 100 && app.supabase.jobLeases.length > 0; attempt += 1) {
+      await sleep(20);
+    }
     expect(app.supabase.jobLeases).toHaveLength(0);
   });
 

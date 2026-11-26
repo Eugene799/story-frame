@@ -194,6 +194,37 @@ describe("stored job lease", () => {
     expect(await second.claim()).toBe(true);
   });
 
+  it("aborts an advance past its deadline and frees the row for the next pass", async () => {
+    const table = leaseTable();
+    const fake = await startLeaseServer(table.answer);
+    close = fake.close;
+
+    const row = { url: fake.url, serviceRoleKey: SERVICE_ROLE_KEY, timeoutMs: 1000, name: "lipsync-row:row-1", ttlMs: 90_000 };
+    const first = createSupabaseJobLease({ ...row, holder: "11111111-1111-4111-8111-111111111111" });
+    const second = createSupabaseJobLease({ ...row, holder: "22222222-2222-4222-8222-222222222222" });
+
+    expect(await first.claim()).toBe(true);
+    let aborted = false;
+    // An advance that would never finish on its own: only the deadline stops it.
+    const advance = withLeaseRenewal(
+      first,
+      (signal) =>
+        new Promise<never>((_resolve, reject) => {
+          signal.addEventListener("abort", () => {
+            aborted = true;
+            reject(signal.reason);
+          });
+        }),
+      40,
+    );
+
+    await expect(advance).rejects.toMatchObject({ name: "AbortError" });
+    expect(aborted).toBe(true);
+    // Released at the deadline, so the next pass takes the row at once instead
+    // of waiting for a process that may never exit.
+    expect(await second.claim()).toBe(true);
+  });
+
   it("releases only its own row, so a stale holder cannot delete the new owner's lease", async () => {
     const fake = await startLeaseServer(() => ({ status: 204, body: undefined }));
     close = fake.close;
