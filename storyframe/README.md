@@ -122,9 +122,10 @@ NODE_ENV=production HOST=0.0.0.0 PORT=8080 npm start
   and an unknown `/api` path that must be the JSON `404`. Exit `0` all passed, `1` something failed, `2` no usable
   origin.
 - [`render.yaml`](render.yaml) declares one always-on web service: `npm ci --include=dev && npm run build`, `npm start`,
-  `healthCheckPath: /api/health`, `HOST=0.0.0.0`, `NODE_ENV=production`, and every credential as `sync: false` so it is
-  entered in the dashboard. The instance has to stay awake on a paid plan: the media, image, video, and lip sync sweeps
-  are in-process timers, so a sleeping instance advances nothing. A second instance is safe to run — each sweep takes a
+  `healthCheckPath: /api/health`, `HOST=0.0.0.0`, `NODE_ENV=production`, `autoDeployTrigger: checksPass` so a deploy waits
+  for CI, and every credential as `sync: false` so it is entered in the dashboard. The instance has to stay awake on a
+  paid plan: the media, image, video, and lip sync sweeps are in-process timers, so a sleeping instance advances nothing.
+  A second instance is safe to run — each sweep takes a
   stored lease first — and a restart resumes the paid work (see [Durable job advancement](#durable-job-advancement)).
 
 ### Hosting decision: one always-on Node instance
@@ -253,10 +254,23 @@ PID) before moving on.
 | Build command | `npm ci --include=dev && npm run build` |
 | Start command | `npm start` |
 | Health check path | `/api/health` |
+| Repository link | This repository through Render's **GitHub App**, not the public URL |
+| Auto-deploy | **After CI Checks Pass** (dashboard only — see below) |
 
 Add `NODE_ENV=production` and `HOST=0.0.0.0`; the platform supplies `PORT`. That `NODE_ENV` is visible to the build
 as well, which makes `npm ci` skip devDependencies, so the build command keeps them with `--include=dev` — otherwise
 `npm run check` fails with `TS2688: Cannot find type definition file`.
+
+**Auto-deploy needs the GitHub App, and the CI gate is dashboard-only.** A service linked by a **public repository
+URL** never auto-deploys: Render only sends push events to services connected through a Git provider, so
+`autoDeploy`/`autoDeployTrigger` on such a service is inert — it still reads `yes`/`commit` with the right branch and
+nothing happens on a push. Connect the repository through Render's GitHub App for this service (*Settings → Build &
+Deploy → Repository*), authorizing the owner and granting this repository, before expecting a push to deploy anything.
+[`render.yaml`](render.yaml) pins `autoDeployTrigger: checksPass`, which makes Render wait until the branch's CI checks
+pass; a Blueprint applies that, but on a service created by hand the Render API integration cannot set it either — it
+accepts only the deprecated `autoDeploy: yes` (= `commit`) and silently drops `checksPass` — so it is one dashboard
+click: *Settings → Build & Deploy → Auto-Deploy → **After CI Checks Pass***. Render does not deploy a commit for which
+it detects no checks, so keep the CI workflow in place.
 
 **2. Set the environment.** Required, or `/api/health` answers `503`: `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`,
 `SUPABASE_SERVICE_ROLE_KEY`, `R2_ENDPOINT`, `R2_BUCKET_NAME`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and
@@ -264,6 +278,10 @@ as well, which makes `npm ci` skip devDependencies, so the build command keeps t
 [Instance size](#instance-size): `VIDEO_MAX_BYTES=67108864`, `LIPSYNC_MAX_INPUT_BYTES=16777216`,
 `LIPSYNC_MAX_OUTPUT_BYTES=67108864`. `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` must exist before the first
 build, because `npm run build` inlines them.
+
+Save these **before the first deploy reads its environment**: Render snapshots the env when a deploy starts, so a service
+created without them brings its first instance up on the code defaults — `256 MiB` caps and a `127.0.0.1` bind, which the
+startup line and its loopback warning both show — and only the next deploy runs the values above.
 
 Deliberately unset on this pass: `OLLAMA_API_KEY`, `DEEPGRAM_API_KEY`, `JSON2VIDEO_API_KEY`, `EVERYPIXEL_CLIENT_ID`,
 `EVERYPIXEL_SECRET_ID`, `LEONARDO_API_KEY`, `CLOUDFLARE_AI_API_TOKEN`. Those features stay disabled (`…_PROVIDER_DISABLED`)
