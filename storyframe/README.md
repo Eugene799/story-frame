@@ -363,6 +363,23 @@ top-level `plan` was accepted with `200` but ignored. Render's docs route a Free
 *Compute* page in the Dashboard, which also takes a payment method if the workspace has none; Save triggers the redeploy
 that applies the new plan. Add the paid provider keys only once the instance is on Starter.
 
+**8. After the switch to Starter.** Check the *instance* plan, not the build pipeline: `GET /v1/services/<id>` must
+report `serviceDetails.plan: "starter"`. *Build Pipeline* has its own Starter tier and can read Starter while the
+instance is still `free`. Wait for the deploy the switch triggers to reach `live`; its startup line must show the same
+three caps as `render.yaml` (`video.maxBytes=67108864`, `lipsync.maxInputBytes=16777216`,
+`lipsync.maxOutputBytes=67108864`). Re-run step 4 unchanged: 13/13 `PASS`, exit `0`, then `/api/health` `200` with
+`auth`, `ledger`, and `storage` true. To prove the instance stays awake, note the time of a successful health request,
+leave the service idle for at least 20 minutes, and request `/api/health` again: it should answer without the ~1 minute
+boot, the logs should show no new startup banner, and *Events* should show no spin-down. A pending image or render
+created before the idle window should advance during it, the sweep behavior Free cannot provide.
+
+Add provider keys cheapest first, one at a time, each on the service (env changes need a redeploy) and each followed by its
+matching script locally with the same key: `PEXELS_API_KEY` + `PIXABAY_API_KEY` → `verify:stock-live`;
+`CLOUDFLARE_ACCOUNT_ID` + `CF_API_TOKEN` → `verify:image-live`; `DEEPGRAM_API_KEY` → `verify:narration-live`;
+`EVERYPIXEL_CLIENT_ID` + `EVERYPIXEL_SECRET_ID` → `verify:lipsync-live`; `JSON2VIDEO_API_KEY` → `verify:video-live`;
+`LEONARDO_API_KEY` last and only with a real key (the one on hand is a 36-character UUID that answers `401`). Remove a key
+and redeploy if its check fails, so one bad provider cannot disable the rest.
+
 ## Durable job advancement
 
 The work itself is durable: `media_metadata`, `image_generations`, `render_snapshots`/`provider_jobs`, and
