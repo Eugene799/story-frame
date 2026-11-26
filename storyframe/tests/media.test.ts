@@ -627,12 +627,62 @@ describe("private media storage", () => {
       expect(app.r2.objects.size).toBe(0);
 
       // Every triggered pass claimed the durable lease before touching rows,
-      // and released it, so the next pass on any instance can start at once.
+      // and the row it removed before removing it; both were released, so the
+      // next pass on any instance can start at once.
       expect(app.supabase.jobLeaseClaims.length).toBeGreaterThan(0);
       expect(
-        app.supabase.jobLeaseClaims.every((claim) => claim.name === "media-sweep" && claim.granted),
+        app.supabase.jobLeaseClaims.every(
+          (claim) =>
+            (claim.name === "media-sweep" || claim.name.startsWith("media-row:")) && claim.granted,
+        ),
       ).toBe(true);
+      expect(app.supabase.jobLeaseClaims.some((claim) => claim.name.startsWith("media-row:"))).toBe(true);
       expect(app.supabase.jobLeases).toHaveLength(0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("leaves a row alone while another instance holds its claim", async () => {
+    let clock = Date.now();
+    // TTL 0 makes the interrupted upload stale, so only the claim can spare it.
+    const app = await startTestServer({
+      now: () => clock,
+      env: { MEDIA_SWEEP_INTERVAL_MS: "0", MEDIA_UPLOAD_TTL_MS: "0" },
+    });
+    try {
+      const projectId = await createProject(app.url);
+      const ticket = await initiateUpload(app.url, projectId, {
+        kind: "image",
+        contentType: "image/png",
+        byteSize: PNG.length,
+      });
+      await putObject(ticket, PNG);
+      const claim = `media-row:${ticket.media.id}`;
+      app.supabase.jobLeases.push({
+        name: claim,
+        holder: "another-instance",
+        expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+      });
+
+      clock += 1000;
+      expect((await apiRequest(app.url, `/api/projects/${projectId}/media`)).status).toBe(200);
+
+      // The refused claim kept the pass off both the object and the row, and
+      // standing down did not release the holder's claim.
+      expect(app.supabase.jobLeaseClaims.some((entry) => entry.name === claim && !entry.granted)).toBe(true);
+      expect(app.supabase.jobLeases.some((row) => row.name === claim && row.holder === "another-instance")).toBe(
+        true,
+      );
+      expect(app.supabase.media).toHaveLength(1);
+      expect(app.r2.objects.size).toBe(1);
+
+      // The next pass can remove the same row once the claim is gone.
+      app.supabase.jobLeases.splice(app.supabase.jobLeases.findIndex((row) => row.name === claim), 1);
+      clock += 1000;
+      expect((await apiRequest(app.url, `/api/projects/${projectId}/media`)).status).toBe(200);
+      expect(app.supabase.media).toHaveLength(0);
+      expect(app.r2.objects.size).toBe(0);
     } finally {
       await app.close();
     }

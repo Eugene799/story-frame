@@ -120,7 +120,7 @@ import {
   type NarrationTrack,
 } from "../shared/narration-contract";
 import { startJobScheduler } from "./job-scheduler";
-import { createSupabaseJobLease, type JobLease } from "./job-lease";
+import { createSupabaseJobLease, type JobLease, type RowClaim } from "./job-lease";
 import { serveStatic } from "./static";
 import { createSupabaseModelHealthStore, type ModelHealthStore } from "./model-health";
 import {
@@ -619,6 +619,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
           fetchImpl,
           now,
           logger: log,
+          claimRow: rowClaimer("video-row", "VIDEO_ROW"),
         })
       : null;
 
@@ -644,6 +645,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
           fetchImpl,
           now,
           logger: log,
+          claimRow: rowClaimer("lipsync-row", "LIPSYNC_ROW"),
         })
       : null;
 
@@ -686,6 +688,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
           limits: config.media,
           now,
           logger: log,
+          claimRow: rowClaimer("media-row", "MEDIA_ROW"),
         });
       } catch {
         log.error("[media] MEDIA_SWEEP_FAILED");
@@ -763,6 +766,25 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       name,
       ttlMs: config.jobs.leaseTtlMs,
     });
+  }
+
+  /**
+   * A claim on one row of a sweep family, e.g. `media-row:<id>`: the pass holding
+   * it is the only one that may advance or remove that row. A refused or
+   * unreachable claim skips the row for this pass, so the next one retries it.
+   */
+  function rowClaimer(prefix: string, code: string): RowClaim {
+    return async (rowId) => {
+      const lease = jobLeaseFor(`${prefix}:${rowId}`);
+      if (!lease) return async () => undefined;
+      try {
+        if (!(await lease.claim())) return null;
+      } catch {
+        log.error(`[${prefix.split("-")[0]}] ${code}_LEASE_UNAVAILABLE`);
+        return null;
+      }
+      return () => lease.release().catch(() => undefined);
+    };
   }
 
   // An idle server still expires interrupted uploads and retention rows. With a

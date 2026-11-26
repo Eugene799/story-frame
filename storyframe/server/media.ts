@@ -8,6 +8,7 @@ import type {
   MediaStatus,
 } from "../shared/media-contract";
 import { ApiError } from "./api-error";
+import type { RowClaim } from "./job-lease";
 import type { R2Client } from "./r2";
 
 /**
@@ -907,6 +908,8 @@ export interface SweepOptions {
   /** Saved documents are checked so an asset they list is never retained away. */
   projects: ProjectDocumentLookup;
   limits: MediaLimits;
+  /** One instance removes one row: a refused claim leaves it for a later pass. */
+  claimRow: RowClaim;
   now?: () => number;
   logger?: { error(message: string): void };
 }
@@ -933,18 +936,29 @@ export async function sweepMedia(options: SweepOptions): Promise<void> {
     }
   }
 
-  const pending = await options.store.stalePending(new Date(now()).toISOString(), options.limits.sweepBatch);
-  for (const row of pending) {
-    if (!(await removeObject(row.objectKey))) continue;
-    await options.store.removeRow(row.id).catch(() => log.error("[media] MEDIA_ROW_DELETE_FAILED"));
+  /**
+   * One instance removes one row: the claim keeps another pass from touching it
+   * while the object goes and the row follows. False means the claim was refused
+   * or the object removal failed, so the row stays for a later pass.
+   */
+  async function removeClaimed(row: StoredObjectRow): Promise<boolean> {
+    const release = await options.claimRow(row.id);
+    if (!release) return false;
+    try {
+      if (!(await removeObject(row.objectKey))) return false;
+      await options.store.removeRow(row.id).catch(() => log.error("[media] MEDIA_ROW_DELETE_FAILED"));
+      return true;
+    } finally {
+      await release();
+    }
   }
+
+  const pending = await options.store.stalePending(new Date(now()).toISOString(), options.limits.sweepBatch);
+  for (const row of pending) await removeClaimed(row);
 
   const deletedCutoff = new Date(now() - options.limits.deletedRetentionMs).toISOString();
   const deleted = await options.store.expiredDeleted(deletedCutoff, options.limits.sweepBatch);
-  for (const row of deleted) {
-    if (!(await removeObject(row.objectKey))) continue;
-    await options.store.removeRow(row.id).catch(() => log.error("[media] MEDIA_ROW_DELETE_FAILED"));
-  }
+  for (const row of deleted) await removeClaimed(row);
 
   const unreferencedCutoff = new Date(now() - options.limits.unreferencedRetentionMs).toISOString();
 
@@ -1010,8 +1024,7 @@ export async function sweepMedia(options: SweepOptions): Promise<void> {
         if ((counts.get(row.id) ?? 0) > 0) continue;
         const listed = await savedAssetIds(row);
         if (listed === null || listed.has(row.id)) continue;
-        if (!(await removeObject(row.objectKey))) continue;
-        await options.store.removeRow(row.id).catch(() => log.error("[media] MEDIA_ROW_DELETE_FAILED"));
+        if (!(await removeClaimed(row))) continue;
         removed += 1;
       }
     }

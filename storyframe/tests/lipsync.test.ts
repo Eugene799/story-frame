@@ -9,6 +9,7 @@ import {
 } from "../server/lipsync";
 import type { MediaLimits, MediaStore } from "../server/media";
 import type { R2Client } from "../server/r2";
+import type { RowClaim } from "../server/job-lease";
 import { MAX_MP4_DURATION_SECONDS, readMp4DurationSeconds } from "../server/mp4";
 import type { MediaRecord } from "../shared/media-contract";
 
@@ -287,6 +288,7 @@ function service(options: {
   objects: R2Client;
   fetchImpl: typeof fetch;
   configured?: boolean;
+  claimRow?: RowClaim;
 }) {
   return createLipsyncService({
     store: options.store,
@@ -298,6 +300,7 @@ function service(options: {
     fetchImpl: options.fetchImpl,
     now: () => NOW,
     logger: { error: () => undefined },
+    claimRow: options.claimRow ?? (async () => async () => undefined),
   });
 }
 
@@ -441,6 +444,35 @@ describe("lipsync sweep", () => {
       expect(store.settled.at(-1)?.seconds).toBe(20);
       expect(store.rows[0]?.secondsCounted).toBe(20);
     }
+  });
+
+  it("skips a row another instance has claimed until the claim is free", async () => {
+    const store = memoryStore([row()]);
+    const objects = new Map<string, Buffer>();
+    const media = fakeMedia(objects);
+    const { fetchImpl, calls } = fakeFetch({ objects });
+    const held = new Set([store.rows[0].id]);
+    const claimRow: RowClaim = async (id) => (held.has(id) ? null : async () => undefined);
+    const sweeper = service({
+      store: store.store,
+      mediaStore: media.media,
+      objects: fakeObjects(objects),
+      fetchImpl,
+      claimRow,
+    });
+
+    // The holder owns the provider poll, so this pass touches nothing.
+    await sweeper.sweep();
+    expect(calls).toHaveLength(0);
+    expect(store.rows[0]?.status).toBe("pending");
+    expect(store.settled).toHaveLength(0);
+
+    // Once it is free the same row advances again, from the same store.
+    held.clear();
+    await sweeper.sweep();
+    expect(store.rows[0]?.status).toBe("ready");
+    expect(store.settled.at(-1)).toMatchObject({ status: "succeeded", seconds: 6 });
+    expect(media.created).toHaveLength(1);
   });
 
   it("leaves a row that is still mid-submit alone instead of killing a paid request", async () => {

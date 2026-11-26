@@ -313,6 +313,48 @@ describe("video exports", () => {
     expect(app.supabase.renders.filter((row) => row.kind === undefined || row.kind === "snapshot")).toHaveLength(2);
   });
 
+  it("leaves an export alone while another instance holds its row claim", async () => {
+    const { app, provider } = await startExportApp({ mode: "running" });
+    const project = await createProject(app, exportDocument([approvedScene()]));
+
+    const submitted = await exportRequest(app, project.id, project.version);
+    expect(submitted.status).toBe(202);
+    const accepted = (await submitted.json()) as ExportBody;
+
+    // A stored claim stands the sweep down, so no pass may poll this row.
+    const claim = `video-row:${accepted.export.id}`;
+    app.supabase.jobLeases.push({
+      name: claim,
+      holder: "another-instance",
+      expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+    });
+
+    // Let a poll that was already in flight finish, then watch a full cadence.
+    await sleep(100);
+    const polls = provider.polls;
+    await sleep(250);
+    expect(provider.polls).toBe(polls);
+
+    const running = (await (
+      await apiRequest(app.url, `/api/projects/${project.id}/exports/video/${accepted.export.id}`)
+    ).json()) as ExportBody;
+    expect(running.export.status).toBe("pending");
+    expect(provider.outputDownloads).toHaveLength(0);
+    expect(app.supabase.jobLeaseClaims.some((entry) => entry.name === claim && !entry.granted)).toBe(true);
+    expect(app.supabase.jobLeases.some((row) => row.name === claim && row.holder === "another-instance")).toBe(
+      true,
+    );
+
+    // Releasing it lets the next pass poll the same row, and the render is now
+    // finished at the provider, so that pass copies and settles it.
+    app.supabase.jobLeases.splice(app.supabase.jobLeases.findIndex((row) => row.name === claim), 1);
+    provider.mode = "done";
+    const ready = await awaitStatus(app, project.id, accepted.export.id, ["ready", "failed"]);
+    expect(ready.export.status).toBe("ready");
+    expect(ready.media?.byteSize).toBe(MP4.length);
+    expect(app.supabase.jobLeases).toHaveLength(0);
+  });
+
   it("keeps one live export per project and makes the second refusal free", async () => {
     const { app, provider } = await startExportApp(
       { mode: "running" },

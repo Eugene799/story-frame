@@ -17,6 +17,13 @@ export interface JobLease {
   release(): Promise<void>;
 }
 
+/**
+ * Claims one row for one sweep step, named by its family and row id, e.g.
+ * `video-row:<id>`. Resolves to the release call, or null when another holder
+ * has the row, so a sweep can skip that row instead of advancing it twice.
+ */
+export type RowClaim = (rowId: string) => Promise<(() => Promise<void>) | null>;
+
 export interface SupabaseJobLeaseOptions {
   url: string;
   serviceRoleKey: string;

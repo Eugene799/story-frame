@@ -2,6 +2,7 @@ import { ApiError } from "./api-error";
 import { detectMediaType, mediaObjectKey, newMediaId, type MediaLimits, type MediaStore } from "./media";
 import { readMp4DurationSeconds } from "./mp4";
 import { R2Error, type R2Client } from "./r2";
+import type { RowClaim } from "./job-lease";
 import {
   EverypixelError,
   everypixelConfigured,
@@ -367,6 +368,8 @@ export interface LipsyncDeps {
   settings: EverypixelSettings;
   limits: LipsyncLimits;
   mediaLimits: MediaLimits;
+  /** One export at a time: a refused claim leaves the row to its holder. */
+  claimRow: RowClaim;
   fetchImpl?: typeof fetch;
   now?: () => number;
   logger?: { error(message: string): void };
@@ -865,15 +868,24 @@ export function createLipsyncService(deps: LipsyncDeps): LipsyncService {
       const rows = await deps.store.live(SWEEP_BATCH);
       for (const row of rows) {
         const lastPolled = row.lastPolledAt ? Date.parse(row.lastPolledAt) : 0;
-        const age = now() - Date.parse(row.createdAt);
-        if (age > limits.abandonAfterMs) {
-          await fail(row, "LIPSYNC_ABANDONED", "This lip sync was abandoned before the provider finished it.", 0);
-          continue;
-        }
         if (lastPolled !== 0 && now() - lastPolled < limits.pollIntervalMs) continue;
-        await advance(row).catch((error: unknown) => {
-          log.error(`[lipsync] LIPSYNC_ADVANCE_FAILED ${error instanceof Error ? error.name : "unknown"}`);
-        });
+        // The pass holding the row claim advances it. A sweep pass can outlive
+        // its lease, so a second instance may take the sweep over mid-pass and
+        // must leave a row another one is already advancing.
+        const release = await deps.claimRow(row.id);
+        if (!release) continue;
+        try {
+          const age = now() - Date.parse(row.createdAt);
+          if (age > limits.abandonAfterMs) {
+            await fail(row, "LIPSYNC_ABANDONED", "This lip sync was abandoned before the provider finished it.", 0);
+            continue;
+          }
+          await advance(row).catch((error: unknown) => {
+            log.error(`[lipsync] LIPSYNC_ADVANCE_FAILED ${error instanceof Error ? error.name : "unknown"}`);
+          });
+        } finally {
+          await release();
+        }
       }
     })().finally(() => {
       sweeping = null;
