@@ -604,6 +604,40 @@ describe("private media storage", () => {
     }
   });
 
+  it("advances a requested pass under the stored sweep lease and releases it", async () => {
+    let clock = Date.now();
+    // The timer is off, so the media request itself triggers the pass.
+    const app = await startTestServer({
+      now: () => clock,
+      env: { MEDIA_SWEEP_INTERVAL_MS: "0", MEDIA_UNREFERENCED_RETENTION_MS: "0" },
+    });
+    try {
+      const projectId = await createProject(app.url);
+      const ticket = await initiateUpload(app.url, projectId, {
+        kind: "image",
+        contentType: "image/png",
+        byteSize: PNG.length,
+      });
+      await putObject(ticket, PNG);
+      expect((await complete(app.url, projectId, ticket.media.id)).status).toBe(200);
+
+      clock += 1000;
+      const listed = await apiRequest(app.url, `/api/projects/${projectId}/media`);
+      expect(listed.status).toBe(200);
+      expect(app.r2.objects.size).toBe(0);
+
+      // Every triggered pass claimed the durable lease before touching rows,
+      // and released it, so the next pass on any instance can start at once.
+      expect(app.supabase.jobLeaseClaims.length).toBeGreaterThan(0);
+      expect(
+        app.supabase.jobLeaseClaims.every((claim) => claim.name === "media-sweep" && claim.granted),
+      ).toBe(true);
+      expect(app.supabase.jobLeases).toHaveLength(0);
+    } finally {
+      await app.close();
+    }
+  });
+
   it("purges an unreferenced ready asset after its retention window", async () => {
     let clock = Date.now();
     const app = await startTestServer({ now: () => clock, env: { MEDIA_UNREFERENCED_RETENTION_MS: "0" } });

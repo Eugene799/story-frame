@@ -119,7 +119,8 @@ import {
   type NarrationTiming,
   type NarrationTrack,
 } from "../shared/narration-contract";
-import { startMediaSweeper } from "./media-scheduler";
+import { startJobScheduler } from "./job-scheduler";
+import { createSupabaseJobLease, type JobLease } from "./job-lease";
 import { serveStatic } from "./static";
 import { createSupabaseModelHealthStore, type ModelHealthStore } from "./model-health";
 import {
@@ -712,46 +713,74 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     });
   });
 
+  /**
+   * One stored lease per sweep, so a second instance cannot advance the same
+   * work while the first is running it. Every pass renews its lease, so a
+   * restarted instance takes over as soon as a crashed holder's lease expires.
+   */
+  function jobLeaseFor(name: string): JobLease | null {
+    if (!config.supabaseUrl || !config.supabaseServiceRoleKey) return null;
+    return createSupabaseJobLease({
+      url: config.supabaseUrl,
+      serviceRoleKey: config.supabaseServiceRoleKey,
+      timeoutMs: config.authTimeoutMs,
+      name,
+      ttlMs: config.jobs.leaseTtlMs,
+    });
+  }
+
   // An idle server still expires interrupted uploads and retention rows. With a
   // zero interval the timer is off and media requests keep triggering a pass.
-  const mediaSweeper = startMediaSweeper({
+  const mediaJobs = startJobScheduler({
+    label: "media",
+    code: "MEDIA_SWEEP",
     intervalMs: config.media.sweepIntervalMs,
-    sweep: runMediaSweep,
+    run: runMediaSweep,
+    lease: mediaStore && mediaObjects ? jobLeaseFor("media-sweep") : null,
     logger: log,
   });
-  if (mediaSweeper) server.on("close", () => mediaSweeper.stop());
+  server.on("close", () => mediaJobs.stop());
 
   // A live video export is advanced by the sweep alone, so a restart resumes a
   // paid render and GET never triggers a provider call.
-  const videoSweeper =
-    videoExports && config.video.sweepIntervalMs > 0
-      ? setInterval(() => {
-          void videoExports.sweep().catch(() => log.error("[video] VIDEO_SWEEP_FAILED"));
-        }, config.video.sweepIntervalMs)
-      : null;
-  videoSweeper?.unref?.();
-  if (videoSweeper) server.on("close", () => clearInterval(videoSweeper));
+  const videoJobs = videoExports
+    ? startJobScheduler({
+        label: "video",
+        code: "VIDEO_SWEEP",
+        intervalMs: config.video.sweepIntervalMs,
+        run: () => videoExports.sweep(),
+        lease: jobLeaseFor("video-sweep"),
+        logger: log,
+      })
+    : null;
+  if (videoJobs) server.on("close", () => videoJobs.stop());
 
   // A lip sync is advanced by its sweep too, so a restart resumes a paid task
   // and a GET never triggers a provider call.
-  const lipsyncSweeper =
-    lipsync && config.lipsync.sweepIntervalMs > 0
-      ? setInterval(() => {
-          void lipsync.sweep().catch(() => log.error("[lipsync] LIPSYNC_SWEEP_FAILED"));
-        }, config.lipsync.sweepIntervalMs)
-      : null;
-  lipsyncSweeper?.unref?.();
-  if (lipsyncSweeper) server.on("close", () => clearInterval(lipsyncSweeper));
+  const lipsyncJobs = lipsync
+    ? startJobScheduler({
+        label: "lipsync",
+        code: "LIPSYNC_SWEEP",
+        intervalMs: config.lipsync.sweepIntervalMs,
+        run: () => lipsync.sweep(),
+        lease: jobLeaseFor("lipsync-sweep"),
+        logger: log,
+      })
+    : null;
+  if (lipsyncJobs) server.on("close", () => lipsyncJobs.stop());
 
   // Pending image jobs expire even if no request ever asks about them again.
-  const imageSweeper =
-    config.image.pendingSweepIntervalMs > 0
-      ? setInterval(() => {
-          void runImageSweep();
-        }, config.image.pendingSweepIntervalMs)
-      : null;
-  imageSweeper?.unref?.();
-  if (imageSweeper) server.on("close", () => clearInterval(imageSweeper));
+  const imageJobs = imageStore
+    ? startJobScheduler({
+        label: "image",
+        code: "IMAGE_SWEEP",
+        intervalMs: config.image.pendingSweepIntervalMs,
+        run: runImageSweep,
+        lease: jobLeaseFor("image-sweep"),
+        logger: log,
+      })
+    : null;
+  if (imageJobs) server.on("close", () => imageJobs.stop());
 
   async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const method = request.method ?? "GET";
@@ -1027,7 +1056,10 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
   async function maybeSweepMedia(): Promise<void> {
     if (!mediaStore || !mediaObjects) return;
     if (now() - lastMediaSweep < config.media.sweepIntervalMs) return;
-    await runMediaSweep();
+    // Stamped before the lease is claimed, so a pass another instance is
+    // running does not make every request try again.
+    lastMediaSweep = now();
+    await mediaJobs.runNow();
   }
 
   function requireProfile(): ProfileStore {

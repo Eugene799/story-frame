@@ -33,6 +33,7 @@ const MIGRATIONS = [
   "20261126090000_add_video_render_jobs.sql",
   "20261126100000_create_video_usage.sql",
   "20261126110000_create_lipsync_exports.sql",
+  "20261126120000_create_job_leases.sql",
 ];
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "supabase", "migrations");
 
@@ -652,6 +653,48 @@ check("video_usage: an unknown status is rejected (23514)",
   (await errorCode(() => as("service_role", null,
     `insert into public.video_usage (owner_id, status, credits_estimate, rate_version)
      values ($1, 'done', 1, 'rate-v1')`, [USER_A]))) === "23514");
+
+// 8f. Phase 9: each sweep has one durable holder, so a second instance cannot
+// advance the same paid work and a restart takes over when the lease expires.
+const LEASE_HOLDER_A = "77777777-7777-4777-8777-777777777777";
+const LEASE_HOLDER_B = "88888888-8888-4888-8888-888888888888";
+const claimLease = (holder: string): Promise<{ claim_job_lease: boolean }[]> =>
+  as("service_role", null, "select public.claim_job_lease('video-sweep', $1, 90) as claim_job_lease", [holder]);
+
+const freeClaim = await claimLease(LEASE_HOLDER_A);
+check("a free sweep name is claimed", freeClaim[0]?.claim_job_lease === true);
+
+const refusedClaim = await claimLease(LEASE_HOLDER_B);
+check("a live lease refuses a second instance", refusedClaim[0]?.claim_job_lease === false);
+check("the refused claim left the first holder in place",
+  (await count("job_leases", "name = $1 and holder = $2", ["video-sweep", LEASE_HOLDER_A])) === 1);
+
+const staleRenew = await as<{ renew_job_lease: boolean }>("service_role", null,
+  "select public.renew_job_lease('video-sweep', $1, 90) as renew_job_lease", [LEASE_HOLDER_B]);
+check("a stale holder cannot renew a lease another instance owns", staleRenew[0]?.renew_job_lease === false);
+
+const ownRenew = await as<{ renew_job_lease: boolean }>("service_role", null,
+  "select public.renew_job_lease('video-sweep', $1, 90) as renew_job_lease", [LEASE_HOLDER_A]);
+check("the holder renews its own lease", ownRenew[0]?.renew_job_lease === true);
+
+// A crashed holder never releases, so expiry is what hands the sweep over.
+// Moving the clock is owner work, not something the server role can do.
+const OWNER_ROLE = (await db.query<{ owner: string }>("select current_user as owner")).rows[0].owner;
+await as(OWNER_ROLE, null,
+  "update public.job_leases set expires_at = now() - interval '1 second' where name = 'video-sweep'");
+const takeover = await claimLease(LEASE_HOLDER_B);
+check("an expired lease is taken over after a restart", takeover[0]?.claim_job_lease === true);
+const afterTakeover = await as<{ n: number }>("service_role", null,
+  "select count(*)::int as n from public.job_leases where name = 'video-sweep'");
+check("takeover replaced the row instead of adding a second holder", afterTakeover[0]?.n === 1);
+check("the new instance owns the lease",
+  (await count("job_leases", "name = $1 and holder = $2", ["video-sweep", LEASE_HOLDER_B])) === 1);
+
+check("browsers cannot read the lease table",
+  (await errorCode(() => as("authenticated", USER_A, "select * from public.job_leases"))) === "42501");
+check("browsers cannot claim a lease",
+  (await errorCode(() => as("authenticated", USER_A,
+    "select public.claim_job_lease('video-sweep', $1, 90)", [LEASE_HOLDER_A]))) === "42501");
 
 // 9. Profiles are one workspace per user, with the same owner pattern.
 await as("service_role", null,

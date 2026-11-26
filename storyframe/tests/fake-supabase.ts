@@ -96,6 +96,10 @@ export interface FakeSupabase {
   narrationTracks: Record<string, unknown>[];
   narrationUsage: Record<string, unknown>[];
   videoUsage: Record<string, unknown>[];
+  /** One row per sweep name, mirroring `job_leases` and its claim RPC. */
+  jobLeases: Record<string, unknown>[];
+  /** Every claim that reached the fake, whether granted or refused. */
+  jobLeaseClaims: { name: string; holder: string; granted: boolean }[];
   close: () => Promise<void>;
 }
 
@@ -159,6 +163,8 @@ export async function startFakeSupabase(
   const narrationTracks: Record<string, unknown>[] = [];
   const narrationUsage: Record<string, unknown>[] = [];
   const videoUsage: Record<string, unknown>[] = [];
+  const jobLeases: Record<string, unknown>[] = [];
+  const jobLeaseClaims: { name: string; holder: string; granted: boolean }[] = [];
   const childTables: Record<string, Record<string, unknown>[]> = {
     scenes,
     sources,
@@ -687,6 +693,74 @@ export async function startFakeSupabase(
         return;
       }
 
+      if (
+        request.method === "POST" &&
+        (url.pathname === "/rest/v1/rpc/claim_job_lease" ||
+          url.pathname === "/rest/v1/rpc/renew_job_lease")
+      ) {
+        if (
+          request.headers.apikey !== SERVICE_ROLE_KEY ||
+          request.headers.authorization !== `Bearer ${SERVICE_ROLE_KEY}`
+        ) {
+          sendJson(response, 401, { message: "unauthorized" });
+          return;
+        }
+        const body = (await readJson(request)) as Record<string, unknown>;
+        const name = String(body.p_name);
+        const holder = String(body.p_holder);
+        const ttl = Math.max(1, Number(body.p_ttl_seconds));
+        const now = Date.now();
+        const existing = jobLeases.find((row) => row.name === name);
+        const expiresAt = new Date(now + ttl * 1000).toISOString();
+
+        if (url.pathname === "/rest/v1/rpc/renew_job_lease") {
+          if (!existing || existing.holder !== holder) {
+            sendJson(response, 200, false);
+            return;
+          }
+          existing.expires_at = expiresAt;
+          sendJson(response, 200, true);
+          return;
+        }
+
+        // Same rule as the SQL: a live lease refuses, an expired one is taken over.
+        if (existing && Date.parse(String(existing.expires_at)) > now) {
+          jobLeaseClaims.push({ name, holder, granted: false });
+          sendJson(response, 200, false);
+          return;
+        }
+        jobLeaseClaims.push({ name, holder, granted: true });
+        if (existing) {
+          existing.holder = holder;
+          existing.expires_at = expiresAt;
+        } else {
+          jobLeases.push({ name, holder, expires_at: expiresAt });
+        }
+        sendJson(response, 200, true);
+        return;
+      }
+
+      if (url.pathname === "/rest/v1/job_leases" && request.method === "DELETE") {
+        if (
+          request.headers.apikey !== SERVICE_ROLE_KEY ||
+          request.headers.authorization !== `Bearer ${SERVICE_ROLE_KEY}`
+        ) {
+          sendJson(response, 401, { message: "unauthorized" });
+          return;
+        }
+        const name = eqFilter(url.searchParams.get("name"));
+        const holder = eqFilter(url.searchParams.get("holder"));
+        for (let index = jobLeases.length - 1; index >= 0; index -= 1) {
+          const row = jobLeases[index];
+          if ((name === null || row.name === name) && (holder === null || row.holder === holder)) {
+            jobLeases.splice(index, 1);
+          }
+        }
+        response.writeHead(204);
+        response.end();
+        return;
+      }
+
       if (url.pathname.startsWith("/rest/v1/")) {
         const table = url.pathname.slice("/rest/v1/".length);
         const data = childTables[table];
@@ -1040,6 +1114,8 @@ export async function startFakeSupabase(
     narrationTracks,
     narrationUsage,
     videoUsage,
+    jobLeases,
+    jobLeaseClaims,
     close: () =>
       new Promise<void>((resolve, reject) => {
         server.closeAllConnections();

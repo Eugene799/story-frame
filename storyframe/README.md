@@ -43,7 +43,8 @@ verified user id.
 
 **The development loop is loopback-only.** `npm run dev` binds the API to `127.0.0.1` and reaches it through the Vite
 proxy. In production the same process serves the built client and `/api` from one origin (see [Production](#production)).
-Durable cross-instance quotas and broader account flows (sign-up, password reset, MFA, OAuth) remain future work.
+Durable cross-instance quotas (the per-account in-flight guards are per process, unlike the sweeps' stored leases) and
+broader account flows (sign-up, password reset, MFA, OAuth) remain future work.
 
 ## Run locally
 
@@ -123,11 +124,39 @@ NODE_ENV=production HOST=0.0.0.0 PORT=8080 npm start
 - [`render.yaml`](render.yaml) declares one always-on web service: `npm ci && npm run build`, `npm start`,
   `healthCheckPath: /api/health`, `HOST=0.0.0.0`, `NODE_ENV=production`, and every credential as `sync: false` so it is
   entered in the dashboard. The instance has to stay awake on a paid plan: the media, image, video, and lip sync sweeps
-  are in-process timers, so a sleeping or multi-instance deployment loses them.
+  are in-process timers, so a sleeping instance advances nothing. A second instance is safe to run — each sweep takes a
+  stored lease first — and a restart resumes the paid work (see [Durable job advancement](#durable-job-advancement)).
 
 A real deployment still needs its own Supabase project with every migration applied, its own R2 bucket with a CORS rule
 for the production origin (`npm run cors:preview -- https://<origin>`), `APP_ORIGIN` set to that origin, and accounts
 created through the admin API: there is no sign-up or password-reset flow.
+
+## Durable job advancement
+
+The work itself is durable: `media_metadata`, `image_generations`, `render_snapshots`/`provider_jobs`, and
+`lipsync_exports` are Postgres rows written before the provider call. The clock is not: each family advances on a timer
+inside the server (`server/job-scheduler.ts`), which is fine for one long-lived process and wrong for two.
+
+- **A second instance** would poll, copy, and settle the same paid job concurrently. Every pass now claims
+  `public.job_leases` through `claim_job_lease(...)` before doing any work; a live lease refuses the claim and that
+  instance skips the tick. The pass releases the lease when it ends, so the next tick — from either instance — can take
+  it.
+- **A restart** finds the same rows and resumes them without any crash handling of its own. A pass renews its lease
+  every third of the TTL, so the TTL bounds how long a dead holder can block takeover, not how long a pass may run:
+  `JOB_LEASE_TTL_MS` (default 90 s) is that bound.
+
+Apply `20261126120000_create_job_leases.sql` before deploying this: without the table and functions, every claim
+fails, each sweep logs `<FAMILY>_SWEEP_LEASE_UNAVAILABLE`, and nothing advances. It was applied to the hosted project
+on 2026-11-26; a PostgREST probe then claimed a test name, was refused for a second holder, refused a stale renewal,
+and answered a browser read with `42501`, and the probe row was released afterwards. A claim that cannot reach the store is
+logged the same way and that tick is skipped; the next one tries again. The sweeps therefore stop advancing during a database outage, which is the safe direction: every store
+they write through is that same database. `MEDIA_SWEEP_INTERVAL_MS=0` (or the video, image, or lip sync equivalent)
+still means "no timer", and media requests keep triggering an opportunistic pass.
+
+Still in-process by design: an image generation is advanced inline by the request that started it, with `…/refresh` and
+the pending sweep as the recovery paths, and a pass advances a batch of rows rather than claiming each row. Per-row
+claims and a resumable image poller are the next slice; until then an instance that dies mid-image leaves that row to
+`IMAGE_PENDING_ABANDON_AFTER_MS` or the user's refresh.
 
 ## Applying the migrations
 
@@ -155,6 +184,7 @@ these tables. Apply them in filename order:
 18. `20261126090000_add_video_render_jobs.sql` (Phase 9: export-scoped render/job kinds and their unique indexes)
 19. `20261126100000_create_video_usage.sql` (Phase 9: credits ledger and atomic per-account reservation)
 20. `20261126110000_create_lipsync_exports.sql` (Phase 9: lip sync exports and the provider-seconds ledger)
+21. `20261126120000_create_job_leases.sql` (Phase 9: one durable advancement lease per sweep name, with claim and renew functions)
 
 Run the compatibility check first. It must return no rows:
 
@@ -273,6 +303,7 @@ anon) key; never the service-role key.
 | `VIDEO_DOWNLOAD_TIMEOUT_MS`, `VIDEO_MAX_BYTES`, `VIDEO_MAX_SECONDS` | Output download timeout (default 60000), the streamed byte cap (default 256 MiB; 1 MiB–1 GiB), and the timeline bound before a document is refused (default 600 s). |
 | `VIDEO_TIMING_TOLERANCE_SECONDS` | Rounding margin allowed when measured narration is compared with the scene timeline before `409 VIDEO_NARRATION_OVERFLOW` (default 0.5; 0–5). |
 | `VIDEO_DAILY_CREDITS_PER_USER` | Rolling 24-hour per-account credit guard (default 600 credits = ten rendered minutes). `0` disables that dimension. |
+| `JOB_LEASE_TTL_MS` | How long a sweep's stored lease survives without a renewal (default 90000; 30000–3600000). A running pass renews it every third of this value, so it bounds takeover after a crash, not pass length. Without Supabase service-role configuration there is no lease and each sweep runs only in its own process. |
 
 `.env` is git-ignored; `.env.example` contains placeholders only. Only public Supabase auth configuration uses a
 `VITE_` name; no secret is prefixed with `VITE_`, returned by the API, logged, or placed in a URL. The Supabase client
@@ -654,7 +685,7 @@ license: the JSON includes a deduplicated credit list and the per-scene render p
 | A document-listed asset cannot be deleted | **PASS** | `tests/media.test.ts`: with no reference but the saved scene still listing the asset id, `DELETE` returns `409 MEDIA_ASSET_IN_DOCUMENT` and keeps the object and row; removing the id lets the same delete return `200`. `verify:media-live` checks the same guard against hosted Supabase and real R2 |
 | Retention spares a document-listed asset | **PASS** | `tests/media.test.ts`: an unreferenced ready asset past retention survives two sweeps while a saved scene lists it, then is removed once the id is gone; 30 protected rows (more than one 25-row batch) do not stop a later expired asset from being cleaned |
 | Saved scene asset ids must be ready media | **PASS** | `tests/media.test.ts`: a ready asset in the project saves; a malformed id is refused before the media lookup, as are an unknown id, a pending upload, an asset from another project, and a deleted asset (`422 MEDIA_ASSET_INVALID`), and the stored document keeps its previous ids; creating a project with any asset id is also refused; 101 UUID-shaped ids spanning two lookup chunks save, while a missing id in the second chunk is refused |
-| Expired media is cleaned without waiting for a media request | **PASS** | `tests/media.test.ts`: with a 40 ms interval and a zero upload window, an interrupted upload and its object are removed by the timer while no media route is called. `tests/media-scheduler.test.ts`: one pass per interval, no overlap while a pass runs, a failing pass is logged and the next tick still runs, and interval `0` disables the timer |
+| Expired media is cleaned without waiting for a media request | **PASS** | `tests/media.test.ts`: with a 40 ms interval and a zero upload window, an interrupted upload and its object are removed by the timer while no media route is called. `tests/job-scheduler.test.ts`: one pass per interval, no overlap while a pass runs, a failing pass is logged and the next tick still runs, interval `0` schedules no timer, a refused lease skips the tick, two instances sharing one lease advance one pass at a time, and a finished or failed pass releases it. `tests/media.test.ts` also proves a request-triggered pass claims and releases the stored `media-sweep` lease |
 | Bucket and database drift is detectable | **PASS** | `tests/media-audit.test.ts`: a matching pair reports no drift (a pending upload without an object is not drift); a bucket object with no row and a ready row with no object are each reported; the scan pages past 205 rows and 205 objects with page size 25; the audit leaves both sides untouched. `npm run audit:media` ran clean on 2026-11-25 against hosted Supabase and the real bucket (0 rows, 0 objects), and `verify:r2-live` proves the signed list it pages |
 
 The browser run on 2026-11-24 also exposed a double-counted media reference: the Media tab sent `sceneKey` at initiate
@@ -1328,6 +1359,12 @@ Coverage includes:
   sweep after the id is removed; the sweep pages by id past protected rows, so a full batch cannot starve other assets
 - Scheduled cleanup: the background sweeper runs one pass per interval, never overlaps a running pass, logs a failure
   and keeps scheduling, and stops with the server; an idle server removes an expired upload with no media request
+- Durable sweep leases: a free name is claimed, a live lease refuses a second instance and leaves the first holder in
+  place, only the holder renews its own row, an expired lease is taken over by exactly one new holder, and browsers
+  have neither table access nor execute on the claim functions
+- Scheduler and lease: a refused claim skips the tick without releasing another instance's lease, an unreachable lease
+  store is logged and retried, two schedulers sharing one lease advance one pass at a time, a long pass renews every
+  third of the TTL, a finished or failed pass releases it, and a release failure is logged without failing the pass
 - Bucket audit: an agreeing pair reports no drift, an object without a row and a ready row without its object are each
   reported (a pending upload without an object is not drift), both sides page past one page, and it changes nothing
 - Save validation: scene asset ids are checked for UUID shape, then against ready media in the same project, so
