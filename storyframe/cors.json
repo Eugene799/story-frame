@@ -5,7 +5,7 @@
       "allowed": {
         "origins": [
           "http://localhost:3000",
-          "https://pv-2ad413f7aefe-bdf3fdde-69d5-461c-a867-0beedaeea72e.style.dev"
+          "https://storyframe-nse9.onrender.com"
         ],
         "methods": [
           "GET",
