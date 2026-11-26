@@ -36,7 +36,11 @@ function send(response: ServerResponse, status: number, payload: unknown): void 
   response.end(JSON.stringify(payload));
 }
 
-async function startMockSupabase({ failListing = false }: { failListing?: boolean } = {}): Promise<MockSupabase> {
+async function startMockSupabase({
+  failure,
+}: {
+  failure?: "listing" | "delete-probe";
+} = {}): Promise<MockSupabase> {
   const users = new Map<string, FakeUser>();
   const deleted: string[] = [];
   let creates = 0;
@@ -49,7 +53,7 @@ async function startMockSupabase({ failListing = false }: { failListing?: boolea
       return;
     }
     if (url.pathname === "/auth/v1/admin/users" && request.method === "GET") {
-      if (failListing) {
+      if (failure === "listing") {
         // The cleanup lookup is the only listing this run reaches, so a 500 here
         // exercises the "could not verify deletion" path.
         send(response, 500, { msg: "user listing unavailable" });
@@ -90,6 +94,11 @@ async function startMockSupabase({ failListing = false }: { failListing?: boolea
       return;
     }
     if (request.method === "GET" && url.pathname.startsWith("/auth/v1/admin/users/")) {
+      if (failure === "delete-probe") {
+        // The delete succeeds, but the follow-up read cannot confirm it.
+        send(response, 500, { msg: "user probe unavailable" });
+        return;
+      }
       const id = url.pathname.split("/").pop() ?? "";
       const user = [...users.values()].find((candidate) => candidate.id === id) ?? null;
       send(response, user ? 200 : 404, user ?? { msg: "not found" });
@@ -182,7 +191,7 @@ describe("account E2E lifecycle", () => {
   it(
     "reports a failed cleanup lookup instead of claiming the users are absent",
     async () => {
-      const mock = await startMockSupabase({ failListing: true });
+      const mock = await startMockSupabase({ failure: "listing" });
       try {
         const result = await runScript(scriptEnv(mock));
 
@@ -196,6 +205,26 @@ describe("account E2E lifecycle", () => {
         expect(mock.createCount()).toBe(2);
         expect(mock.deleted).toHaveLength(0);
         expect(mock.users.size).toBe(2);
+      } finally {
+        await mock.close();
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "reports a failed deletion probe instead of claiming the account was removed",
+    async () => {
+      const mock = await startMockSupabase({ failure: "delete-probe" });
+      try {
+        const result = await runScript(scriptEnv(mock));
+
+        expect(result.code).toBe(1);
+        expect(result.text).toMatch(/FAIL account flow script completed/);
+        expect(result.text).toMatch(/FAIL disposable users removed/);
+        expect(result.text).toMatch(/sf-e2e-account-[^=]+=200\/500/);
+        expect(result.text).toMatch(/sf-e2e-unconfirmed-[^=]+=200\/500/);
+        expect(mock.deleted).toHaveLength(2);
       } finally {
         await mock.close();
       }
