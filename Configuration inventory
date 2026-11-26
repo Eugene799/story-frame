@@ -1,3 +1,7 @@
+# StoryFrame provider configuration inventory
+# Provider credentials for the current build. Optional bounds and defaults live
+# in storyframe/.env.example.
+
 # Server-side Ollama
 OLLAMA_API_KEY=
 OLLAMA_BASE_URL=https://ollama.com
@@ -26,14 +30,17 @@ R2_ACCESS_KEY_ID=
 R2_SECRET_ACCESS_KEY=
 
 # Image generation
-CLOUDFLARE_IMAGE_MODEL=
+CLOUDFLARE_AI_API_TOKEN=
+# CF_API_TOKEN is accepted for the same Workers AI token.
 LEONARDO_API_KEY=
-LEONARDO_MODEL_ID=
 
 # Speech
 DEEPGRAM_API_KEY=
-DEEPGRAM_TTS_MODEL=
-DEEPGRAM_STT_MODEL=
+
+# Lip sync
+EVERYPIXEL_CLIENT_ID=
+EVERYPIXEL_SECRET_ID=
+# EVERYPIXEL_CLIENT_SECRET is accepted for the same secret.
 
 # Rendering
 JSON2VIDEO_API_KEY=

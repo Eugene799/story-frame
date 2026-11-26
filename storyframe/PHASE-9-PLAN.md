@@ -1,7 +1,8 @@
 # Phase 9 plan — video export through JSON2Video
 
-**Status: draft, nothing implemented.** This file is the contract to build against. Every provider fact below was read
-from <https://json2video.com/docs/v2/> on 2026-11-25 and is cited so it can be re-checked rather than remembered.
+**Status: slice 1 implemented on 2026-11-26.** This file records the plan the implementation was built from; the
+checkboxes below are the original plan, not a live completion tracker. Every provider fact below was read from
+<https://json2video.com/docs/v2/> on 2026-11-25 and is cited so it can be re-checked rather than remembered.
 
 Phase 9 turns a saved project revision into a real MP4, stores that MP4 in the private `story-frame` bucket, and keeps
 the spend visible and bounded. It does not add templates, voice generation, or a second video provider.
