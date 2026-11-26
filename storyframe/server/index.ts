@@ -2,7 +2,7 @@ import { loadEnvFile } from "node:process";
 import { fileURLToPath } from "node:url";
 import { createStoryframeServer } from "./app";
 import { loadConfig } from "./config";
-import { formatLimits } from "./startup-log";
+import { formatBindWarning, formatLimits } from "./startup-log";
 
 const envPath = fileURLToPath(new URL("../.env", import.meta.url));
 try {
@@ -26,6 +26,8 @@ server.listen(port, host, () => {
   console.log(
     `[storyframe] ${production ? "Server" : "Development AI server"} listening on http://${host}:${port}`,
   );
+  const bindWarning = formatBindWarning(host, process.env.NODE_ENV);
+  if (bindWarning) console.warn(bindWarning);
   // The deploy config lowers these caps for a 512 MB instance. Printing them once
   // makes the running values visible in the host's logs instead of assumed.
   console.log(formatLimits(caps));

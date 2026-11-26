@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../server/config";
-import { formatLimits } from "../server/startup-log";
+import { formatBindWarning, formatLimits } from "../server/startup-log";
 
 // Pure: reads the deploy file, loads config from a literal env, formats a string.
 // No provider, Supabase, R2, or server request is made.
@@ -37,5 +37,34 @@ describe("startup limits line", () => {
     expect(formatLimits(loadConfig({}))).toBe(
       "[storyframe] Limits: video.maxBytes=268435456 (256 MiB) lipsync.maxInputBytes=26214400 (25 MiB) lipsync.maxOutputBytes=268435456 (256 MiB)",
     );
+  });
+});
+
+describe("deploy build command", () => {
+  it("installs devDependencies, which NODE_ENV=production makes npm ci skip", () => {
+    const buildCommand = /^\s+buildCommand:\s*(.+)$/m.exec(deployConfig)?.[1]?.trim();
+
+    // Without --include=dev the build fails with TS2688 for the type packages in
+    // devDependencies; the fix belongs in the deploy file, not in each job.
+    expect(buildCommand).toBe("npm ci --include=dev && npm run build");
+  });
+});
+
+describe("production bind warning", () => {
+  const defaultHost = "127.0.0.1";
+
+  it("warns when production is bound to loopback instead of the platform address", () => {
+    expect(formatBindWarning(defaultHost, "production")).toBe(
+      "[storyframe] WARNING: NODE_ENV=production but HOST=127.0.0.1 is a loopback address, so the platform cannot reach this server. Set HOST=0.0.0.0.",
+    );
+    for (const host of ["localhost", "::1", "[::1]"]) {
+      expect(formatBindWarning(host, "production")).not.toBeNull();
+    }
+  });
+
+  it("stays quiet for a routable bind and outside production", () => {
+    expect(formatBindWarning("0.0.0.0", "production")).toBeNull();
+    expect(formatBindWarning(defaultHost, "development")).toBeNull();
+    expect(formatBindWarning(defaultHost, undefined)).toBeNull();
   });
 });

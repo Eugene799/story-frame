@@ -121,7 +121,7 @@ NODE_ENV=production HOST=0.0.0.0 PORT=8080 npm start
   a built bundle and that the bundle is served, `/api/health` and asserts the instance is ready (naming any false flag),
   and an unknown `/api` path that must be the JSON `404`. Exit `0` all passed, `1` something failed, `2` no usable
   origin.
-- [`render.yaml`](render.yaml) declares one always-on web service: `npm ci && npm run build`, `npm start`,
+- [`render.yaml`](render.yaml) declares one always-on web service: `npm ci --include=dev && npm run build`, `npm start`,
   `healthCheckPath: /api/health`, `HOST=0.0.0.0`, `NODE_ENV=production`, and every credential as `sync: false` so it is
   entered in the dashboard. The instance has to stay awake on a paid plan: the media, image, video, and lip sync sweeps
   are in-process timers, so a sleeping instance advances nothing. A second instance is safe to run — each sweep takes a
@@ -250,11 +250,13 @@ PID) before moving on.
 | Setting | Value |
 | --- | --- |
 | Plan | **Free** |
-| Build command | `npm ci && npm run build` |
+| Build command | `npm ci --include=dev && npm run build` |
 | Start command | `npm start` |
 | Health check path | `/api/health` |
 
-Add `NODE_ENV=production` and `HOST=0.0.0.0`; the platform supplies `PORT`.
+Add `NODE_ENV=production` and `HOST=0.0.0.0`; the platform supplies `PORT`. That `NODE_ENV` is visible to the build
+as well, which makes `npm ci` skip devDependencies, so the build command keeps them with `--include=dev` — otherwise
+`npm run check` fails with `TS2688: Cannot find type definition file`.
 
 **2. Set the environment.** Required, or `/api/health` answers `503`: `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`,
 `SUPABASE_SERVICE_ROLE_KEY`, `R2_ENDPOINT`, `R2_BUCKET_NAME`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and

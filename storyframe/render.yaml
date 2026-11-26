@@ -7,7 +7,9 @@ services:
     # the bottom of envVars are the measured values that keep one copy inside it
     # (see "Instance size" in the README). Raise them only on a 1 GB instance.
     plan: starter
-    buildCommand: npm ci && npm run build
+    # NODE_ENV below is visible to the build too, so npm ci would skip
+    # devDependencies and `npm run check` would fail without its type packages.
+    buildCommand: npm ci --include=dev && npm run build
     startCommand: npm start
     healthCheckPath: /api/health
     autoDeploy: true
