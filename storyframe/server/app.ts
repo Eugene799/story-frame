@@ -1538,7 +1538,6 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     try {
       let bytes: Buffer;
       let contentType: string;
-      let jobId: string | null = null;
       let cost: {
         providerCost: Record<string, unknown> | null;
         actualUsd: number | null;
@@ -1580,12 +1579,14 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
           },
           { fetchImpl, timeoutMs: Math.min(30_000, config.image.pollTimeoutMs) },
         );
-        jobId = started.jobId;
+        const jobId = started.jobId;
+        const providerCost =
+          started.apiCreditCost === null
+            ? null
+            : { provider: "leonardo", apiCreditCost: started.apiCreditCost };
         await store.update(user.id, projectId, generation.id, {
           jobId,
-          ...(started.apiCreditCost === null
-            ? {}
-            : { providerCost: { provider: "leonardo", apiCreditCost: started.apiCreditCost } }),
+          ...(providerCost === null ? {} : { providerCost }),
         });
         const polled = await waitForLeonardo(jobId);
         if (polled.status === "pending") {
@@ -1596,17 +1597,23 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         if (polled.status !== "succeeded" || polled.imageUrls.length === 0) {
           throw new HttpError(502, "IMAGE_PROVIDER_FAILED", "The provider reported no completed image.");
         }
-        const download = await downloadGeneratedImage(polled.imageUrls[0]);
-        bytes = download.bytes;
-        contentType = download.contentType;
-        cost = leonardoCost(started.apiCreditCost, polled.apiCreditCost, polled.cost, null);
+        // This row is refreshable from any instance until the request returns, so
+        // its own settle takes the same row claim and reports a result another
+        // instance already stored rather than storing a second copy.
+        const settled = await advancePendingImage({ ...generation, providerCost }, user.id, polled);
+        if (!settled) {
+          const pending = await store.get(user.id, projectId, generation.id);
+          sendJson(response, 202, { ok: true, generation: pending ?? generation, media: null });
+          return;
+        }
+        sendJson(response, 201, { ok: true, generation: settled.generation, media: settled.media });
+        return;
       }
 
       const media = await persistGeneratedImage(user.id, projectId, bytes, contentType);
       const updated = await store.update(user.id, projectId, generation.id, {
         status: "succeeded",
         mediaId: media.id,
-        jobId,
         ...cost,
       });
       if (!updated) {
@@ -1647,10 +1654,10 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
   }
 
   /**
-   * Settles a pending generation whose provider job left PENDING. The polling
-   * request and the resuming sweep share this, and the stored row claim makes it
-   * exclusive across instances, so one paid result is downloaded, stored, and
-   * marked once. Null means another caller is settling it.
+   * Settles a pending generation whose provider job left PENDING. The request
+   * that started the job, `…/refresh`, and the resuming sweep all settle through
+   * it, and the row claim plus the row's own status keep one paid result stored
+   * once. Null means another caller is settling it.
    */
   function advancePendingImage(
     generation: ImageGenerationRecord,
@@ -1661,8 +1668,8 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     if (inFlight) return inFlight;
     const settlement = (async (): Promise<ImageSettlement | null> => {
       const store = requireImageStore();
-      // One claim per generation, so a refresh and a sweep on different
-      // instances cannot store the same paid result twice.
+      // One claim per generation, so the starting request, a refresh, and a
+      // sweep on different instances cannot store the same paid result twice.
       const lease = jobLeaseFor(`image-settle:${generation.id}`);
       if (lease) {
         try {
@@ -1675,6 +1682,18 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         }
       }
       try {
+        // The claim serializes settlements and the row says whether one is still
+        // needed, so a result settled while this poll ran is reported instead of
+        // being stored again. A failed media read only costs the preview.
+        const current = await store.get(ownerId, generation.projectId, generation.id);
+        if (current && current.status !== "pending") {
+          const stored = current.mediaId
+            ? await requireMediaStore()
+                .get(ownerId, current.projectId, current.mediaId)
+                .catch(() => null)
+            : null;
+          return { generation: current, media: stored?.media ?? null };
+        }
         if (polled.status !== "succeeded" || polled.imageUrls.length === 0) {
           const failed = await store.update(ownerId, generation.projectId, generation.id, {
             status: "failed",

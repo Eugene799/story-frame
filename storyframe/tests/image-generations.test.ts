@@ -31,6 +31,8 @@ interface ProviderState {
   leonardoPending?: boolean;
   /** Polls report FAILED while true. */
   leonardoFailed?: boolean;
+  /** Holds the first status poll, so a refresh can settle the job it is polling. */
+  leonardoFirstPollGate?: Promise<void>;
   /** Counts status polls, so a test can prove who called the provider. */
   leonardoPolls?: number;
   leonardoJobId?: string;
@@ -61,6 +63,7 @@ function providerFetch(state: ProviderState = {}): typeof fetch {
     }
     if (url.startsWith("https://cloud.leonardo.ai/api/rest/v1/generations/")) {
       state.leonardoPolls = (state.leonardoPolls ?? 0) + 1;
+      if (state.leonardoPolls === 1 && state.leonardoFirstPollGate) await state.leonardoFirstPollGate;
       return jsonResponse({
         generations_by_pk: state.leonardoPending
           ? { status: "PENDING" }
@@ -727,6 +730,42 @@ describe("image generation", () => {
     expect(
       app.supabase.jobLeases.some((row) => row.name === claim && row.holder === OTHER_INSTANCE),
     ).toBe(true);
+  });
+
+  it("stores one image when a refresh settles a job its request is still polling", async () => {
+    let releasePoll: () => void = () => undefined;
+    const pollGate = new Promise<void>((resolve) => {
+      releasePoll = resolve;
+    });
+    const state: ProviderState = { leonardoFirstPollGate: pollGate };
+    const app = await startImageApp(state, { ...PROVIDER_ENV, IMAGE_GENERATION_TIMEOUT_MS: "5000" });
+    const projectId = await createProject(app);
+
+    // The starting request is held inside its own poll of the job it started.
+    const inline = api(app, USER_A.token, "POST", `/api/projects/${projectId}/image-generations`, {
+      modelKey: "leonardo:phoenix-1.0",
+      prompt: "a lighthouse",
+    });
+    await eventually(() => (state.leonardoPolls ?? 0) === 1);
+    const generationId = app.supabase.imageGenerations[0].id as string;
+
+    // A refresh settles that job while the request is still polling it.
+    const refreshed = await api(
+      app,
+      USER_A.token,
+      "POST",
+      `/api/projects/${projectId}/image-generations/${generationId}/refresh`,
+    );
+    expect(refreshed.status).toBe(200);
+    expect(app.r2.puts).toBe(1);
+
+    // The starting request reports that stored image instead of storing it again.
+    releasePoll();
+    const finished = await inline;
+    expect(finished.status).toBe(201);
+    expect(finished.body.media.id).toBe(refreshed.body.media.id);
+    expect(app.r2.puts).toBe(1);
+    expect(app.supabase.media).toHaveLength(1);
   });
 
   it("reports a row as pending while another instance settles it", async () => {

@@ -160,10 +160,12 @@ instance that dies mid-image therefore finishes the paid job on the next pass in
 `IMAGE_PENDING_ABANDON_AFTER_MS`, and a result that cannot be stored yet keeps its row and job id for the next attempt.
 
 An image settlement is claimed per row too. Before a poll result is stored, the instance that will store it claims
-`image-settle:<generation id>` in the same `job_leases` table, so a refresh on one instance and a sweep on another cannot
-both download and store the same paid result; the loser reports the row as still pending. The claim is released when the
-settlement ends, and its TTL lets the next pass take over if that instance dies mid-settlement. The video, lip sync, and
-media sweeps still advance a batch of rows under their own lease alone.
+`image-settle:<generation id>` in the same `job_leases` table, so no two of a refresh, a resume sweep, and the request
+that started the job can store the same paid result. The claim serializes the settle and the row decides whether one is
+still needed, so a result another instance stored while a poll ran is reported back rather than duplicated, and a caller
+that loses the claim on a still-pending row reports it as pending. The claim is released when the settlement ends, and
+its TTL lets the next pass take over if that instance dies mid-settlement. The video, lip sync, and media sweeps still
+advance a batch of rows under their own lease alone.
 
 ## Applying the migrations
 
@@ -973,6 +975,7 @@ row itself is the generation record.
 | Cost ledger and actual-first guard | **PASS** | `GET /api/image-usage` returns the caller's attempts, actual/estimated/charged totals, limits, and reset time and refuses anonymous reads; a seeded settled cost of $0.01 blocks the next image under a $0.005 limit even though the estimates alone would fit; the DOM shows the last-24-hours spend on the Generate tab |
 | One pending generation across instances | **PASS** | `20261125220000_one_pending_image_generation.sql` adds a partial unique index; `verify:sql` rejects a second pending row for the owner (`23505`) and allows one after the first settles; the route returns `429 IMAGE_GENERATION_IN_FLIGHT` for a stored pending job without a provider call |
 | A pending job is recoverable from another project | **PASS** | `tests/image-generations.test.ts`: a pending job in another project returns `429` with `details.pending` naming its generation, project, job, provider, and model; refreshing that job through its own project settles it and frees the account; `POST .../settle` marks it `failed IMAGE_GENERATION_ABANDONED`, is idempotent, and unblocks generation. `tests/generate-panel.test.tsx`: the Generate tab shows the blocking project/job with **Refresh pending job** and **Settle and unblock** |
+| One stored image per paid job | **PASS** | `tests/image-generations.test.ts`: the request that started a Leonardo job claims `image-settle:<id>` for its own settle and reports the image a refresh stored while it was still polling (one R2 put, one media row, the same media id); a live foreign claim leaves the row `pending` with no R2 write for both the sweep and `…/refresh`, and a settlement releases its claim |
 | Abandoned pending jobs settle automatically | **PASS** | `tests/image-generations.test.ts`: a pending row older than `IMAGE_PENDING_ABANDON_AFTER_MS` is settled on the next generation, and a 50 ms sweep interval settles an old row with no request in flight |
 | Per-user spending guard | **PASS** | `tests/image-generations.test.ts`: two recorded attempts with a limit of 2 return `429 IMAGE_SPEND_LIMIT` without a row or provider write; a prior $0.001901 estimate with a $0.0035 limit refuses the next priced image; a 25-hour-old attempt and two other-account attempts do not count; a provider with no USD rate is still capped by image count; two simultaneous requests yield one `201` and one `429 IMAGE_GENERATION_IN_FLIGHT`. `verify:image-routes-live` runs with a limit of 1 and gets `429 IMAGE_SPEND_LIMIT` for a second generation with no new row or media |
 | Generation UI | **PASS (DOM)** | `tests/generate-panel.test.tsx`: the model picker marks a credential-less provider disabled; a prompt triggers the server estimate and shows $0.001901 / 172.8 neurons with its verified date and source; no generation request is made before **Generate image**; the result previews from a private playback URL and **Attach image to scene** writes the scene reference and saves the document; a `202` job shows **Refresh job** and only then completes; a provider failure shows the sanitized code without a preview; a pending job in another project names that project and job and settles from the panel |
