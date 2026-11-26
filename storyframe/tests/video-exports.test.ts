@@ -424,14 +424,28 @@ describe("video exports", () => {
     expect(settled).toMatchObject({ status: "failed", credits_counted: 0 });
   });
 
-  it("makes a failed copy terminal, keeps the provider URL, and stores nothing", async () => {
-    const { app, provider } = await startExportApp({ mode: "done", outputFails: true });
+  it("keeps a failed copy pending until the attempt limit, then keeps the provider copy", async () => {
+    // A pass every 800 ms, so one attempt is visible before the next begins.
+    const { app, provider } = await startExportApp(
+      { mode: "done", outputFails: true },
+      { VIDEO_SWEEP_INTERVAL_MS: "800" },
+    );
     const project = await createProject(app, exportDocument([approvedScene({ durationSeconds: 10 })]));
 
     const accepted = (await (await exportRequest(app, project.id, project.version)).json()) as ExportBody;
     expect(accepted.export.creditsEstimate).toBe(10);
 
-    const failed = await awaitStatus(app, project.id, accepted.export.id, ["failed", "ready"]);
+    // The first copy fails. The render is already paid for, so the row waits for
+    // the next pass instead of being thrown away.
+    const deadline = Date.now() + 4000;
+    while (provider.outputDownloads.length === 0 && Date.now() < deadline) await sleep(10);
+    expect(provider.outputDownloads).toHaveLength(1);
+    const pending = await awaitStatus(app, project.id, accepted.export.id, ["pending", "failed"]);
+    expect(pending.export.status).toBe("pending");
+    expect(pending.export.failureCode).toBeNull();
+    expect(app.r2.objects.size).toBe(0);
+
+    const failed = await awaitStatus(app, project.id, accepted.export.id, ["failed"], 10_000);
     expect(failed.export.status).toBe("failed");
     expect(failed.export.failureCode).toBe("VIDEO_OUTPUT_COPY_FAILED");
     // The row records what the billed attempt cost, not just the estimate.
@@ -442,23 +456,24 @@ describe("video exports", () => {
     // Nothing was written, so no object and no media row exist.
     expect(app.r2.objects.size).toBe(0);
 
-    // The URL of the finished render survives for the deferred retry, and the
-    // provider copy is kept rather than deleted.
+    // Three attempts at three passes, and never a second paid render.
+    expect(provider.outputDownloads).toHaveLength(3);
+    expect(provider.submits).toBe(1);
+
+    // The URL of the finished render survives for a later retry, and the provider
+    // copy is kept rather than deleted.
     const job = app.supabase.jobs.at(-1) as Record<string, unknown>;
     expect(job.status).toBe("failed");
     expect(job.result).toMatchObject({
       providerStatus: "done",
-      providerUrl: PROVIDER_OUTPUT,
+      providerCopy: { url: PROVIDER_OUTPUT },
       failureCode: "VIDEO_OUTPUT_COPY_FAILED",
     });
     expect(provider.deletes).toBe(0);
 
-    // Slice 1 copies once: a failed copy is not retried by the sweep.
-    const polls = provider.polls;
-    const downloads = provider.submits;
-    await sleep(120);
-    expect(provider.polls).toBe(polls);
-    expect(provider.submits).toBe(downloads);
+    // The row is settled, so no further copy is attempted.
+    await sleep(1_000);
+    expect(provider.outputDownloads).toHaveLength(3);
 
     const listed = await apiRequest(app.url, `/api/projects/${project.id}/exports/video`);
     const body = (await listed.json()) as { exports: { status: string }[] };
@@ -468,6 +483,39 @@ describe("video exports", () => {
     await sleep(80);
     const settled = app.supabase.videoUsage.at(-1) as Record<string, unknown>;
     expect(settled).toMatchObject({ status: "failed", credits_counted: 10 });
+  });
+
+  it("copies a deferred render from the stored URL when the provider no longer knows the job", async () => {
+    const { app, provider } = await startExportApp(
+      { mode: "done", outputFails: true },
+      { VIDEO_SWEEP_INTERVAL_MS: "800" },
+    );
+    const project = await createProject(app, exportDocument([approvedScene({ durationSeconds: 10 })]));
+
+    const accepted = (await (await exportRequest(app, project.id, project.version)).json()) as ExportBody;
+    const deadline = Date.now() + 4000;
+    while (provider.outputDownloads.length === 0 && Date.now() < deadline) await sleep(10);
+    expect(provider.outputDownloads).toHaveLength(1);
+    const polls = provider.polls;
+
+    // The provider forgets the job, but its CDN still serves the finished render.
+    provider.mode = "missing";
+    provider.outputFails = false;
+
+    const ready = await awaitStatus(app, project.id, accepted.export.id, ["ready", "failed"], 8000);
+    expect(ready.export.status).toBe("ready");
+    expect(ready.export.byteSize).toBe(MP4.length);
+    expect(ready.export.failureCode).toBeNull();
+    // The retry used the stored URL: no new poll, and no second paid render.
+    expect(provider.polls).toBe(polls);
+    expect(provider.submits).toBe(1);
+    expect(provider.outputDownloads).toEqual([PROVIDER_OUTPUT, PROVIDER_OUTPUT]);
+    // The finished render's own credit count survives the deferral.
+    expect(ready.export.creditsConsumed).toBe(8);
+
+    await sleep(80);
+    const settled = app.supabase.videoUsage.at(-1) as Record<string, unknown>;
+    expect(settled).toMatchObject({ status: "succeeded", credits_counted: 8 });
   });
 
   it("keeps the estimated credits when the submit failure is ambiguous", async () => {

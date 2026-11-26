@@ -90,6 +90,8 @@ const FAILURE_CODES: readonly VideoFailureCode[] = [
 ];
 
 const EXPORT_NOT_FOUND = "No video export with that id belongs to this project.";
+/** Copies one finished render gets before the export is settled as failed. */
+const COPY_ATTEMPT_LIMIT = 3;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -101,6 +103,49 @@ function round3(value: number): number {
 
 function isFailureCode(value: string): value is VideoFailureCode {
   return (FAILURE_CODES as readonly string[]).includes(value);
+}
+
+function numberField(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * What the copy needs to know about a finished render. A poll supplies it, or the
+ * job result supplies it when a failed copy is retried on a later pass.
+ */
+interface FinishedRender {
+  url: string;
+  durationSeconds: number | null;
+  width: number | null;
+  height: number | null;
+  consumedCredits: number | null;
+}
+
+function finishedRender(status: Json2VideoMovieStatus): FinishedRender {
+  return {
+    url: status.url ?? "",
+    durationSeconds: status.durationSeconds,
+    width: status.width,
+    height: status.height,
+    consumedCredits: status.consumedCredits,
+  };
+}
+
+/**
+ * The finished render a failed copy left behind in the job result, URL and poll
+ * facts together, so a later pass can copy it without asking the provider again.
+ * Null when no copy has failed.
+ */
+function deferredCopyOf(job: VideoExportJobRow | null): FinishedRender | null {
+  const copy = job?.result?.providerCopy;
+  if (!isRecord(copy) || typeof copy.url !== "string" || copy.url.length === 0) return null;
+  return {
+    url: copy.url,
+    durationSeconds: numberField(copy.durationSeconds),
+    width: numberField(copy.width),
+    height: numberField(copy.height),
+    consumedCredits: numberField(copy.consumedCredits),
+  };
 }
 
 export interface VideoLimits {
@@ -1234,11 +1279,10 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
 
   async function copyFinished(
     cursor: VideoExportCursor,
-    status: Json2VideoMovieStatus,
-    url: string,
+    finished: FinishedRender,
     signal: AbortSignal,
   ): Promise<void> {
-    const bytes = await downloadOutput(url, signal);
+    const bytes = await downloadOutput(finished.url, signal);
     const detected = detectMediaType(bytes);
     if (!detected || !mediaTypeMatches("video", detected)) {
       throw new ApiError(
@@ -1250,9 +1294,9 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
 
     const stored = await storeOutput(cursor.ownerId, cursor.projectId, bytes, detected.contentType, signal);
     const credits =
-      status.consumedCredits !== null
-        ? status.consumedCredits
-        : Math.ceil(status.durationSeconds ?? cursor.creditsEstimate);
+      finished.consumedCredits !== null
+        ? finished.consumedCredits
+        : Math.ceil(finished.durationSeconds ?? cursor.creditsEstimate);
 
     await deps.store.update(cursor.ownerId, cursor.id, {
       status: "ready",
@@ -1261,10 +1305,10 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
       outputKey: stored.objectKey,
       failureCode: null,
       failureMessage: null,
-      durationSeconds: status.durationSeconds,
+      durationSeconds: finished.durationSeconds,
       byteSize: stored.byteSize,
-      width: status.width,
-      height: status.height,
+      width: finished.width,
+      height: finished.height,
       creditsConsumed: credits,
     });
     if (cursor.job) {
@@ -1272,17 +1316,17 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
         status: "succeeded",
         result: {
           providerStatus: "done",
-          durationSeconds: status.durationSeconds,
-          byteSize: status.byteSize,
-          width: status.width,
-          height: status.height,
-          consumedCredits: status.consumedCredits,
-          providerUrl: url,
+          durationSeconds: finished.durationSeconds,
+          byteSize: bytes.length,
+          width: finished.width,
+          height: finished.height,
+          consumedCredits: finished.consumedCredits,
+          providerUrl: finished.url,
           providerUrlExpiresAt: null,
         },
       });
     }
-    await settle(cursor.ownerId, cursor.id, "succeeded", credits, status.durationSeconds);
+    await settle(cursor.ownerId, cursor.id, "succeeded", credits, finished.durationSeconds);
     // Referenced by the render row, so retention cannot delete a finished MP4.
     await deps.media
       .addReference(cursor.ownerId, cursor.projectId, stored.mediaId, {
@@ -1291,6 +1335,51 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
       })
       .catch(() => log.error("[video] VIDEO_MEDIA_REFERENCE_FAILED"));
     await deleteProviderCopy(cursor.job?.externalId ?? null);
+  }
+
+  /**
+   * Copies the finished render and, while attempts remain, keeps the row pending
+   * with the provider copy when the storage write fails. The provider has already rendered
+   * and billed it, so a storage hiccup must not throw the render away; only the
+   * last attempt settles the export as failed.
+   */
+  async function attemptCopy(
+    cursor: VideoExportCursor,
+    finished: FinishedRender,
+    signal: AbortSignal,
+  ): Promise<void> {
+    try {
+      await copyFinished(cursor, finished, signal);
+    } catch (error) {
+      // The row deadline aborted the copy, which is not an attempt: the row stays
+      // pending and the next pass tries again.
+      if (signal.aborted) return;
+      const code =
+        error instanceof ApiError && isFailureCode(error.code) ? error.code : "VIDEO_OUTPUT_COPY_FAILED";
+      const message =
+        error instanceof ApiError ? error.message : "The finished render could not be copied into storage.";
+      const attempts = (numberField(cursor.job?.result?.copyAttempts) ?? 0) + 1;
+      if (cursor.job === null || attempts >= COPY_ATTEMPT_LIMIT) {
+        await failExport(cursor, code, message, "estimate", {
+          providerStatus: "done",
+          providerCopy: finished,
+        });
+        return;
+      }
+      // One field holds what the retry needs: the URL and the poll that supplied
+      // it. Only the attempt count is added beside it.
+      await deps.store
+        .updateJob(cursor.ownerId, cursor.job.id, {
+          status: "running",
+          result: {
+            ...(cursor.job.result ?? {}),
+            providerCopy: finished,
+            copyAttempts: attempts,
+          },
+        })
+        .catch(() => log.error("[video] VIDEO_JOB_UPDATE_FAILED"));
+      log.error("[video] VIDEO_OUTPUT_COPY_DEFERRED");
+    }
   }
 
   async function advance(cursor: VideoExportCursor, signal: AbortSignal): Promise<void> {
@@ -1314,6 +1403,15 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
     if (job === null || job.externalId === null) {
       // Submission is not confirmed yet; the submit request settles it or the
       // abandonment above does.
+      return;
+    }
+
+    // A copy that already failed keeps the finished render, so retry it from the
+    // stored provider URL before the render timeout or another poll: the render
+    // is paid for, and the provider may have forgotten the job by now.
+    const deferred = deferredCopyOf(job);
+    if (deferred !== null) {
+      await attemptCopy(cursor, deferred, signal);
       return;
     }
 
@@ -1405,25 +1503,7 @@ export function createVideoExportService(deps: VideoExportDeps): VideoExportServ
       return;
     }
 
-    try {
-      await copyFinished(cursor, status, status.url, signal);
-    } catch (error) {
-      // The deadline aborted the copy of output the provider already finished
-      // and billed, so leave the row pending for the next pass to retry instead
-      // of settling a copy a later pass could complete.
-      if (signal.aborted) return;
-      const code =
-        error instanceof ApiError && isFailureCode(error.code) ? error.code : "VIDEO_OUTPUT_COPY_FAILED";
-      const message =
-        error instanceof ApiError ? error.message : "The finished render could not be copied into storage.";
-      // The provider copy is kept, not deleted, and its URL stays in the job
-      // result so a later slice can retry the copy instead of paying again.
-      await failExport(cursor, code, message, "estimate", {
-        providerStatus: "done",
-        providerUrl: status.url,
-        providerUrlExpiresAt: null,
-      });
-    }
+    await attemptCopy(cursor, finishedRender(status), signal);
   }
 
   function sweep(): Promise<void> {
