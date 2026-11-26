@@ -1,6 +1,7 @@
 import { loadEnvFile } from "node:process";
 import { fileURLToPath } from "node:url";
 import { createStoryframeServer } from "./app";
+import { loadConfig } from "./config";
 
 const envPath = fileURLToPath(new URL("../.env", import.meta.url));
 try {
@@ -15,13 +16,23 @@ try {
 const production = process.env.NODE_ENV === "production";
 const host = process.env.HOST?.trim() || "127.0.0.1";
 const port = Number(process.env.PORT?.trim() || 8787);
+const caps = loadConfig();
 const server = createStoryframeServer();
+
+function mib(bytes: number): string {
+  return `${Number((bytes / (1024 * 1024)).toFixed(1))} MiB`;
+}
 
 const hasPublishableKey = Boolean(process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY);
 
 server.listen(port, host, () => {
   console.log(
     `[storyframe] ${production ? "Server" : "Development AI server"} listening on http://${host}:${port}`,
+  );
+  // The deploy config lowers these caps for a 512 MB instance. Printing them once
+  // makes the running values visible in the host's logs instead of assumed.
+  console.log(
+    `[storyframe] Limits: video.maxBytes=${caps.video.maxBytes} (${mib(caps.video.maxBytes)}) lipsync.maxInputBytes=${caps.lipsync.maxInputBytes} (${mib(caps.lipsync.maxInputBytes)}) lipsync.maxOutputBytes=${caps.lipsync.maxOutputBytes} (${mib(caps.lipsync.maxOutputBytes)})`,
   );
   console.log(`[storyframe] OLLAMA_API_KEY: ${process.env.OLLAMA_API_KEY ? "present" : "missing"}`);
   console.log(
