@@ -34,10 +34,13 @@ function createBrowserClient(): BrowserClientResult {
       // The client refreshes the session on its own (autoRefreshToken) and
       // single-flights concurrent refreshes; session tokens stay in storage and
       // are only sent to the StoryFrame server in the Authorization header.
+      // detectSessionInUrl is required because a password-recovery link returns
+      // with the session in the URL, which emits PASSWORD_RECOVERY.
       client: createClient(supabaseUrl, supabaseKey, {
         auth: {
           persistSession: true,
           autoRefreshToken: true,
+          detectSessionInUrl: true,
         },
       }),
       configError: null,

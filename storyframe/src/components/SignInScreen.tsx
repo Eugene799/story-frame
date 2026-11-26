@@ -6,10 +6,22 @@ interface SignInScreenProps {
   configError?: string | null;
   busy: boolean;
   error: string | null;
+  notice?: string | null;
   onSignIn: (email: string, password: string) => Promise<void>;
+  onShowSignUp?: () => void;
+  onShowReset?: () => void;
 }
 
-export function SignInScreen({ configured, configError = null, busy, error, onSignIn }: SignInScreenProps) {
+export function SignInScreen({
+  configured,
+  configError = null,
+  busy,
+  error,
+  notice = null,
+  onSignIn,
+  onShowSignUp,
+  onShowReset,
+}: SignInScreenProps) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const canSubmit = configured && email.trim().length > 0 && password.length > 0 && !busy;
@@ -60,6 +72,12 @@ export function SignInScreen({ configured, configError = null, busy, error, onSi
             refreshed automatically.
           </p>
 
+          {notice && (
+            <div className="callout" role="status">
+              {notice}
+            </div>
+          )}
+
           <form onSubmit={handleSubmit} noValidate>
             <label className="field" htmlFor="email">
               <span className="field-label">Email</span>
@@ -102,9 +120,18 @@ export function SignInScreen({ configured, configError = null, busy, error, onSi
             </div>
           )}
 
-          <p className="hint signin-hint">
-            There is no sign-up or password-reset flow yet. Ask the project owner for an account.
-          </p>
+          <div className="auth-links">
+            {onShowSignUp && (
+              <button type="button" className="link-button" onClick={onShowSignUp} disabled={busy}>
+                Create an account
+              </button>
+            )}
+            {onShowReset && (
+              <button type="button" className="link-button" onClick={onShowReset} disabled={busy}>
+                Forgot your password?
+              </button>
+            )}
+          </div>
         </>
       )}
     </section>

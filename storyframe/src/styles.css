@@ -152,8 +152,24 @@ h3 {
   margin: 0 0 1rem;
 }
 
-.signin-hint {
+.auth-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
   margin-top: 1rem;
+}
+
+.link-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+}
+
+.link-button:hover:not(:disabled) {
+  color: var(--text);
 }
 
 .button-secondary {

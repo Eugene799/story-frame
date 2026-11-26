@@ -220,7 +220,7 @@ cannot sign in.
 
 A real deployment still needs its own Supabase project with every migration applied, its own R2 bucket with a CORS rule
 for the production origin (`npm run cors:preview -- https://<origin>`), `APP_ORIGIN` set to that origin, and accounts
-created through the admin API: there is no sign-up or password-reset flow.
+created in the app or through the admin API.
 
 ### Zero-cost deploy verification (Render Free)
 
@@ -330,7 +330,7 @@ The startup line also proves the caps in force on the host. Render's *Logs* tab 
 Those numbers matching `render.yaml` are the evidence that a 512 MB instance runs the measured caps rather than the
 code defaults (256 MiB / 25 MiB / 256 MiB).
 
-**5. Browser smoke, no provider spend.** Sign in with an account created through the admin API (there is no sign-up),
+**5. Browser smoke, no provider spend.** Sign in with an account created in the app or through the admin API,
 save a project and reload, upload an image and confirm the row reaches `ready` and plays back — that round trip is what
 proves the CORS rule — then check the console: no `4xx/5xx` on `/api/*`, and `403 ORIGIN_NOT_ALLOWED` means `APP_ORIGIN`
 does not match the address bar.
@@ -527,6 +527,34 @@ anon) key; never the service-role key.
 | --- | --- |
 | `VITE_SUPABASE_URL` | Supabase project URL used by the browser auth client. |
 | `VITE_SUPABASE_PUBLISHABLE_KEY` | Publishable key used by the browser auth client. `VITE_SUPABASE_ANON_KEY` is accepted as a fallback. |
+
+#### Redirect allowlist for non-localhost origins
+
+Recovery and confirmation links only return to an origin that Supabase lists under **Authentication → URL
+Configuration → Redirect URLs**. Any other `redirect_to` is silently rewritten to the project's Site URL (currently
+`http://localhost:3000`), so a hosted preview needs its origin allowlisted. The app asks for
+`window.location.origin`, and the `style.dev` preview hostname changes whenever the VM is restored
+(`pv-<chat>-<random>.style.dev`), so allowlist a pattern rather than one exact host:
+
+```
+https://pv-*.style.dev/**
+```
+
+Vite also has to accept the hostname: start the dev server with
+`__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=<preview host>`, otherwise loopback requests with that `Host` header get a 403.
+
+Checking an origin costs nothing and sends no mail. `generate_link` returns the `redirect_to` the emailed link will
+actually use:
+
+```bash
+curl -s -X POST "$SUPABASE_URL/auth/v1/admin/generate_link" \
+  -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"recovery","email":"someone@example.com","redirect_to":"https://your-preview-origin"}'
+```
+
+It comes back unchanged when the origin is allowed and as the Site URL when it is not. Changing the allowlist itself
+needs the Supabase dashboard; the service-role key cannot edit URL configuration.
 
 ### Server-only
 
@@ -1728,11 +1756,52 @@ users, projects, rows, and objects afterwards and checks that they are gone. It 
 URLs. Cleanup covers the project even if the run fails midway. Run on 2026-11-25: **38/38 checks passed**, including the upload
 ticket's CORS preflight from the `cors.json` preview origin, the document-delete guard, and project-deletion object cleanup.
 
+### Browser account end-to-end check
+
+```bash
+npm run e2e:account
+```
+
+This check drives a real Chromium against the dev server and the configured Supabase project. It is **opt-in** and
+not part of CI because it needs a browser. Start `npm run dev` first, then provide `SUPABASE_URL`,
+`SUPABASE_SERVICE_ROLE_KEY`, and `SUPABASE_ANON_KEY` (or `SUPABASE_PUBLISHABLE_KEY`); set `SMOKE_BASE_URL` if the app
+is not on `http://127.0.0.1:3000`. Install Playwright once with `npm install --no-save playwright` and either run
+`npx playwright install chromium` or point `CHROME_BIN` at an existing Chromium build.
+
+It starts with a `PREFLIGHT` line that asks Supabase which `redirect_to` it would actually use for the base origin;
+a `WARN` there means the origin is not allowlisted and emailed links would land on the project's Site URL. That is why
+the recovery step opens the session fragment directly rather than depending on the allowlist.
+
+The script creates disposable users, exercises sign-up, the reset request, a recovery link minted with the admin API
+(so no inbox is needed), the password change (the old password must stop working), an unconfirmed account, and the
+expired-session path, then deletes every user it created and verifies the deletion. It never calls the billing route:
+requests to `/api/ai/test` are counted and must stay at zero once the session is gone.
+
+Projects with `mailer_autoconfirm=false` send a confirmation mail, and Supabase rate-limits those sends. When the
+project's mail quota is exhausted (`over_email_send_rate_limit`), the sign-up and reset-request checks are reported
+as `BLOCKED` rather than as passes or failures, and the summary counts them separately. The recovery,
+password-change, and expiry checks need no mail and always run.
+
+Supabase also rejects addresses on domains that cannot receive mail, so the sign-up step is `BLOCKED` by default.
+Set `E2E_SIGNUP_EMAIL` to a throwaway inbox you control to run it for real; the script deletes that account at the
+end, and never deletes an account that existed before the run.
+
 ## Security limitations
 
-- Email/password sign-in only; there is no sign-up, password-reset, MFA, OAuth, or account-management UI. The
-  Supabase client persists session tokens in browser `localStorage`; production needs an explicit session-storage and
-  CSP review. Sign-out is local to this browser and does not revoke the account's other sessions.
+- Email/password sign-in, sign-up, and password reset; there is no MFA, OAuth, email-change, or account-settings
+  UI. The Supabase client persists session tokens in browser `localStorage`; production needs an explicit
+  session-storage and CSP review. Sign-out is local to this browser and does not revoke the account's other sessions.
+- Password-reset requests answer the same way whether or not an address has an account. Sign-up still names an
+  existing account so the person can sign in or reset instead of waiting for a mail that will not arrive. Supabase's
+  own rate limits still surface as errors to the person submitting the form.
+- Sign-up confirmation and password-recovery links depend on Supabase mail delivery and on the app origin being
+  allowlisted under Authentication → URL Configuration. Sign-up sends `emailRedirectTo` for the current origin;
+  recovery uses `redirectTo` for the current origin. Delivery is not exercised by the automated suite; those flows
+  are tested against a stubbed client.
+- The auth forms throttle bursts locally: five attempts per action and address within five minutes, then a wait
+  message naming the remaining time. The count lives in the mounted app, so a reload clears it. This is a usability
+  guard, not the security boundary; Supabase's server-side limits remain the enforcement point, and there is no
+  server-side throttle of our own.
 - All ten migrations and RLS policies are applied to the configured Supabase project (Phase 6 on 2026-11-25,
   including the ready-import uniqueness index). The
   hosted catalog was checked (12 tables, RLS, policies, grants, revision trigger), and live profile/project/child
@@ -1760,7 +1829,7 @@ ticket's CORS preflight from the `cors.json` preview origin, the document-delete
 - Rate limiting is in-memory and per-process; it is scoped to the verified account but is not a durable quota shared
   across processes or instances.
 - The Vite proxy and loopback API are the development loop; production serves the build and `/api` from one process,
-  but durable quotas shared across instances, managed secret rotation, and a sign-up/password-reset flow are still
+  but durable quotas shared across instances, managed secret rotation, and hosted email delivery remain
   missing.
 - The workspace is single-user per project and has no conflict merging: a stale save is refused, the draft is kept,
   and the caller must load the latest version. Revision history is read-only; restoring an old version is future work.
