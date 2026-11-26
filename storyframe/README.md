@@ -254,23 +254,23 @@ PID) before moving on.
 | Build command | `npm ci --include=dev && npm run build` |
 | Start command | `npm start` |
 | Health check path | `/api/health` |
-| Repository link | This repository through Render's **GitHub App**, not the public URL |
+| Repository link | This repository, connected through a Git provider in *Settings → Build & Deploy* |
 | Auto-deploy | **After CI Checks Pass** (dashboard only — see below) |
 
 Add `NODE_ENV=production` and `HOST=0.0.0.0`; the platform supplies `PORT`. That `NODE_ENV` is visible to the build
 as well, which makes `npm ci` skip devDependencies, so the build command keeps them with `--include=dev` — otherwise
 `npm run check` fails with `TS2688: Cannot find type definition file`.
 
-**Auto-deploy needs the GitHub App, and the CI gate is dashboard-only.** A service linked by a **public repository
-URL** never auto-deploys: Render only sends push events to services connected through a Git provider, so
-`autoDeploy`/`autoDeployTrigger` on such a service is inert — it still reads `yes`/`commit` with the right branch and
-nothing happens on a push. Connect the repository through Render's GitHub App for this service (*Settings → Build &
-Deploy → Repository*), authorizing the owner and granting this repository, before expecting a push to deploy anything.
-[`render.yaml`](render.yaml) pins `autoDeployTrigger: checksPass`, which makes Render wait until the branch's CI checks
-pass; a Blueprint applies that, but on a service created by hand the Render API integration cannot set it either — it
-accepts only the deprecated `autoDeploy: yes` (= `commit`) and silently drops `checksPass` — so it is one dashboard
-click: *Settings → Build & Deploy → Auto-Deploy → **After CI Checks Pass***. Render does not deploy a commit for which
-it detects no checks, so keep the CI workflow in place.
+**Auto-deploy depends on how the repository is linked, so check it instead of assuming.** The previous service — same
+public repository URL, auto-deploy on — never deployed on a push: every deploy was API-triggered. The service rebuilt for
+this checklist deployed by itself on a push (`trigger: new_commit`, three seconds after CI went green), so a public URL is
+not on its own enough to make the trigger inert; what matters is whether Render knows the repository through a Git
+provider. Confirm *Settings → Build & Deploy → Repository* names the repository rather than a bare URL.
+[`render.yaml`](render.yaml) pins `autoDeployTrigger: checksPass` and service creation accepts it, but changing the
+trigger on an existing service is dashboard-only — the Render API takes only the deprecated `autoDeploy: yes` (=
+`commit`) and silently drops `checksPass` — so it is one dashboard click: *Settings → Build & Deploy → Auto-Deploy →
+**After CI Checks Pass***. Render does not deploy a commit for which it detects no checks, so keep the CI workflow in
+place.
 
 **2. Set the environment.** Required, or `/api/health` answers `503`: `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`,
 `SUPABASE_SERVICE_ROLE_KEY`, `R2_ENDPOINT`, `R2_BUCKET_NAME`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and

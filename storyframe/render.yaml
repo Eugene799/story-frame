@@ -12,9 +12,9 @@ services:
     buildCommand: npm ci --include=dev && npm run build
     startCommand: npm start
     healthCheckPath: /api/health
-    # After CI Checks Pass. A Blueprint applies this; on a service created by
-    # hand the same choice is a dashboard setting (Settings -> Build & Deploy ->
-    # Auto-Deploy), and the Render API integration cannot set it.
+    # After CI Checks Pass. A Blueprint applies this and service creation
+    # accepts it; changing the trigger on an existing service is dashboard-only
+    # (Settings -> Build & Deploy -> Auto-Deploy).
     autoDeployTrigger: checksPass
     envVars:
       - key: NODE_ENV
