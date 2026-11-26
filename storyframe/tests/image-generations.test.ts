@@ -29,6 +29,10 @@ interface ProviderState {
   cloudflareGate?: Promise<void>;
   /** Polls return PENDING while true. */
   leonardoPending?: boolean;
+  /** Polls report FAILED while true. */
+  leonardoFailed?: boolean;
+  /** Counts status polls, so a test can prove who called the provider. */
+  leonardoPolls?: number;
   leonardoJobId?: string;
   /** Adds the provider's cost object and credits to the completed poll. */
   leonardoCost?: boolean;
@@ -56,10 +60,13 @@ function providerFetch(state: ProviderState = {}): typeof fetch {
       return jsonResponse({ sdGenerationJob: { generationId: jobId } });
     }
     if (url.startsWith("https://cloud.leonardo.ai/api/rest/v1/generations/")) {
+      state.leonardoPolls = (state.leonardoPolls ?? 0) + 1;
       return jsonResponse({
         generations_by_pk: state.leonardoPending
           ? { status: "PENDING" }
-          : {
+          : state.leonardoFailed
+            ? { status: "FAILED" }
+            : {
               status: "COMPLETE",
               generated_images: [{ url: imageUrl }],
               ...(state.leonardoCost
@@ -571,6 +578,114 @@ describe("image generation", () => {
     expect(app.supabase.imageGenerations[0]).toMatchObject({
       error_code: "IMAGE_GENERATION_ABANDONED",
     });
+  });
+
+  it("resumes a pending job from the sweep after its request is gone", async () => {
+    const app = await startImageApp(
+      { leonardoCost: true },
+      { ...PROVIDER_ENV, IMAGE_PENDING_SWEEP_INTERVAL_MS: "50" },
+    );
+    const projectId = await createProject(app);
+    // No request is holding this row: a restart left it behind with its job id.
+    seedGeneration(app, {
+      project_id: projectId,
+      provider: "leonardo",
+      status: "pending",
+      media_id: null,
+      job_id: "job-restart",
+      created_at: new Date(Date.now() - 60_000).toISOString(),
+    });
+
+    await eventually(() => app.supabase.imageGenerations[0].status === "succeeded");
+
+    expect(app.supabase.imageGenerations[0]).toMatchObject({
+      status: "succeeded",
+      job_id: "job-restart",
+      actual_usd: 0.02,
+      cost_source: "provider",
+    });
+    expect(app.supabase.imageGenerations[0].media_id).toEqual(expect.any(String));
+    expect(app.supabase.media).toHaveLength(1);
+    expect(app.supabase.media[0]).toMatchObject({
+      project_id: projectId,
+      kind: "image",
+      status: "ready",
+    });
+    expect(app.r2.puts).toBe(1);
+  });
+
+  it("leaves a job its own request may still be polling", async () => {
+    const state: ProviderState = { leonardoPolls: 0 };
+    const app = await startImageApp(state, {
+      ...PROVIDER_ENV,
+      IMAGE_PENDING_SWEEP_INTERVAL_MS: "50",
+    });
+    const projectId = await createProject(app);
+    const createdAt = Date.now();
+    seedGeneration(app, {
+      project_id: projectId,
+      provider: "leonardo",
+      status: "pending",
+      media_id: null,
+      job_id: "job-live",
+      created_at: new Date(createdAt).toISOString(),
+    });
+
+    // Inside the request's poll window the sweep must not spend a poll on it.
+    while (Date.now() < createdAt + 700) {
+      expect(state.leonardoPolls).toBe(0);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    // Once no request can still be waiting, the sweep finishes the job.
+    await eventually(() => app.supabase.imageGenerations[0].status === "succeeded");
+    expect(state.leonardoPolls).toBeGreaterThan(0);
+  });
+
+  it("fails a resumed job the provider reports as failed", async () => {
+    const app = await startImageApp(
+      { leonardoFailed: true },
+      { ...PROVIDER_ENV, IMAGE_PENDING_SWEEP_INTERVAL_MS: "50" },
+    );
+    const projectId = await createProject(app);
+    seedGeneration(app, {
+      project_id: projectId,
+      provider: "leonardo",
+      status: "pending",
+      media_id: null,
+      job_id: "job-failed",
+      created_at: new Date(Date.now() - 60_000).toISOString(),
+    });
+
+    await eventually(() => app.supabase.imageGenerations[0].status === "failed");
+
+    expect(app.supabase.imageGenerations[0].error_code).toBe("IMAGE_PROVIDER_FAILED");
+    expect(app.supabase.media).toHaveLength(0);
+    expect(app.r2.puts).toBe(0);
+  });
+
+  it("keeps a job pending when its result cannot be stored yet", async () => {
+    const state: ProviderState = { leonardoPolls: 0, imageUrl: "https://example.com/not-allowed.png" };
+    const app = await startImageApp(state, {
+      ...PROVIDER_ENV,
+      IMAGE_PENDING_SWEEP_INTERVAL_MS: "50",
+    });
+    const projectId = await createProject(app);
+    seedGeneration(app, {
+      project_id: projectId,
+      provider: "leonardo",
+      status: "pending",
+      media_id: null,
+      job_id: "job-retry",
+      created_at: new Date(Date.now() - 60_000).toISOString(),
+    });
+
+    // The image host is refused, so the row keeps its job and retries on the
+    // next pass instead of losing a paid result.
+    await eventually(() => (state.leonardoPolls ?? 0) >= 2);
+    expect(app.supabase.imageGenerations[0]).toMatchObject({ status: "pending", media_id: null });
+    expect(app.supabase.media).toHaveLength(0);
+    expect(app.r2.puts).toBe(0);
   });
 
   it("refuses a second generation while the first is still in flight", async () => {

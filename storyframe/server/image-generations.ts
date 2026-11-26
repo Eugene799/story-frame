@@ -259,6 +259,12 @@ export interface ImageGenerationStore {
   ): Promise<ImageGenerationRecord | null>;
   /** Settles every pending row older than the cutoff, across owners. */
   abandonStale(beforeIso: string): Promise<number>;
+  /** Pending rows past the cutoff, with the owner each job is billed to, so a
+   *  sweep can resume a job whose request is gone. */
+  listPending(
+    beforeIso: string,
+    limit: number,
+  ): Promise<Array<{ ownerId: string; generation: ImageGenerationRecord }>>;
   /** Every recorded attempt in the window, whatever its final status, since a
    *  failed attempt may still have been billed by the provider. */
   usageSince(ownerId: string, sinceIso: string): Promise<ImageSpendSnapshot>;
@@ -418,6 +424,23 @@ export function createSupabaseImageGenerationStore(
         ),
       );
       return settled.length;
+    },
+
+    async listPending(beforeIso, limit) {
+      const found = rows(
+        await request(
+          tableUrl({
+            select: `owner_id,${COLUMNS}`,
+            status: "eq.pending",
+            created_at: `lt.${beforeIso}`,
+            order: "created_at.asc",
+            limit: String(limit),
+          }),
+          { headers },
+          "the pending generation list",
+        ),
+      );
+      return found.map((row) => ({ ownerId: text(row, "owner_id"), generation: toRecord(row) }));
     },
 
     async usageSince(ownerId, sinceIso) {

@@ -177,12 +177,21 @@ import {
 
 const MAX_CONCURRENT_PER_USER = 1;
 const RATE_LIMIT_WINDOW_MS = 60_000;
+/** Pending images one sweep pass resumes, so a backlog cannot run forever. */
+const IMAGE_RESUME_PASS_LIMIT = 25;
 const LEDGER_READY_TTL_MS = 30_000;
 const CHILD_RESOURCES = new Set(["scenes", "sources", "claims", "proposals", "jobs", "renders"]);
 const PROJECT_REVISIONS_LIMIT = 20;
 const USAGE_PAGE_SIZE = 20;
 const PLANNING_BODY_BYTES = 8 * 1024;
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
+
+/** A pending generation settled by the poll its request started, or by a sweep. */
+interface ImageSettlement {
+  generation: ImageGenerationRecord;
+  media: MediaRecord | null;
+}
+
 const ABANDONED_MESSAGE =
   "This attempt did not finish, so its outcome is unknown and it was not retried. Ollama may have charged for it. Use a new Idempotency-Key only if you accept a possible duplicate charge.";
 
@@ -483,6 +492,9 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
   // One image generation per account at a time, so a double submit cannot
   // spend provider credit twice before the usage check sees the first row.
   const imageInFlight = new Set<string>();
+  // One settlement per generation, shared rather than repeated: the sweep that
+  // resumes a job and a client refresh must not store the same paid result twice.
+  const imageAdvancing = new Map<string, Promise<ImageSettlement>>();
   let lastRateLimitSweep = 0;
   let ledgerReadiness: { value: boolean; checkedAt: number } | null = null;
 
@@ -686,15 +698,39 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
 
   let imageSweep: Promise<void> | null = null;
 
-  /** Settles pending rows whose provider can no longer be waited on. */
+  /**
+   * Resumes pending jobs no request is waiting on, then settles rows whose
+   * provider can no longer be waited on. A request polls its job for at most
+   * `pollTimeoutMs`, so a pending row older than that was left behind by a
+   * restart or a closed tab; polling it here is what keeps a paid image from
+   * being stranded, and the abandon cutoff still bounds the whole wait.
+   */
   function runImageSweep(): Promise<void> {
     const store = imageStore;
     if (!store) return Promise.resolve();
     if (imageSweep) return imageSweep;
     imageSweep = (async () => {
       try {
-        const cutoff = new Date(now() - config.image.pendingAbandonAfterMs).toISOString();
-        await store.abandonStale(cutoff);
+        const resumeBefore = new Date(now() - config.image.pollTimeoutMs).toISOString();
+        const pending = await store.listPending(resumeBefore, IMAGE_RESUME_PASS_LIMIT);
+        for (const { ownerId, generation } of pending) {
+          // A row without a job id cannot be polled, and one past the abandon
+          // window is settled below; neither is worth a provider call.
+          if (!generation.jobId) continue;
+          if (now() - Date.parse(generation.createdAt) > config.image.pendingAbandonAfterMs) continue;
+          try {
+            const polled = await fetchLeonardoGeneration(imageSettings, generation.jobId, {
+              fetchImpl,
+              timeoutMs: Math.min(30_000, config.image.pollTimeoutMs),
+            });
+            if (polled.status === "pending") continue;
+            await advancePendingImage(generation, ownerId, polled);
+          } catch {
+            // Transient: the job id stays on the row and the next pass retries.
+            log.error("[image] IMAGE_RESUME_FAILED");
+          }
+        }
+        await store.abandonStale(new Date(now() - config.image.pendingAbandonAfterMs).toISOString());
       } catch {
         log.error("[image] IMAGE_SWEEP_FAILED");
       } finally {
@@ -1610,6 +1646,41 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     sendJson(response, 200, { ok: true, generation: final, media: null });
   }
 
+  /**
+   * Settles a pending generation whose provider job left PENDING. The polling
+   * request and the resuming sweep share this, so a resumed job is stored like a
+   * polled one and a second caller joins the settlement instead of repeating the
+   * download and the media write.
+   */
+  function advancePendingImage(
+    generation: ImageGenerationRecord,
+    ownerId: string,
+    polled: LeonardoGenerationStatus,
+  ): Promise<ImageSettlement> {
+    const inFlight = imageAdvancing.get(generation.id);
+    if (inFlight) return inFlight;
+    const settlement = (async (): Promise<ImageSettlement> => {
+      const store = requireImageStore();
+      if (polled.status !== "succeeded" || polled.imageUrls.length === 0) {
+        const failed = await store.update(ownerId, generation.projectId, generation.id, {
+          status: "failed",
+          errorCode: "IMAGE_PROVIDER_FAILED",
+        });
+        return { generation: failed ?? generation, media: null };
+      }
+      const download = await downloadGeneratedImage(polled.imageUrls[0]);
+      const media = await persistGeneratedImage(ownerId, generation.projectId, download.bytes, download.contentType);
+      const updated = await store.update(ownerId, generation.projectId, generation.id, {
+        status: "succeeded",
+        mediaId: media.id,
+        ...leonardoCost(null, polled.apiCreditCost, polled.cost, generation.providerCost),
+      });
+      return { generation: updated ?? generation, media };
+    })().finally(() => imageAdvancing.delete(generation.id));
+    imageAdvancing.set(generation.id, settlement);
+    return settlement;
+  }
+
   async function handleImageRefresh(
     response: ServerResponse,
     user: AuthenticatedUser,
@@ -1630,23 +1701,9 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       sendJson(response, 202, { ok: true, generation, media: null });
       return;
     }
-    if (polled.status !== "succeeded" || polled.imageUrls.length === 0) {
-      const failed = await store.update(user.id, projectId, generation.id, {
-        status: "failed",
-        errorCode: "IMAGE_PROVIDER_FAILED",
-      });
-      sendJson(response, 200, { ok: true, generation: failed ?? generation, media: null });
-      return;
-    }
     try {
-      const download = await downloadGeneratedImage(polled.imageUrls[0]);
-      const media = await persistGeneratedImage(user.id, projectId, download.bytes, download.contentType);
-      const updated = await store.update(user.id, projectId, generation.id, {
-        status: "succeeded",
-        mediaId: media.id,
-        ...leonardoCost(null, polled.apiCreditCost, polled.cost, generation.providerCost),
-      });
-      sendJson(response, 200, { ok: true, generation: updated ?? generation, media });
+      const settled = await advancePendingImage(generation, user.id, polled);
+      sendJson(response, 200, { ok: true, generation: settled.generation, media: settled.media });
     } catch (error) {
       const code =
         error instanceof HttpError || error instanceof ApiError ? error.code : "IMAGE_GENERATION_FAILED";

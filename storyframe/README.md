@@ -153,10 +153,14 @@ logged the same way and that tick is skipped; the next one tries again. The swee
 they write through is that same database. `MEDIA_SWEEP_INTERVAL_MS=0` (or the video, image, or lip sync equivalent)
 still means "no timer", and media requests keep triggering an opportunistic pass.
 
-Still in-process by design: an image generation is advanced inline by the request that started it, with `…/refresh` and
-the pending sweep as the recovery paths, and a pass advances a batch of rows rather than claiming each row. Per-row
-claims and a resumable image poller are the next slice; until then an instance that dies mid-image leaves that row to
-`IMAGE_PENDING_ABANDON_AFTER_MS` or the user's refresh.
+An image generation resumes in the background too. The request that starts a Leonardo job polls it for
+`IMAGE_GENERATION_TIMEOUT_MS` and returns `202`; the pending sweep (same interval, same `image-sweep` lease) then polls
+the stored job id of any pending row older than that window and settles it through the same path `…/refresh` uses. An
+instance that dies mid-image therefore finishes the paid job on the next pass instead of waiting for
+`IMAGE_PENDING_ABANDON_AFTER_MS`, and a result that cannot be stored yet keeps its row and job id for the next attempt.
+
+Still in-process by design: a pass advances a batch of rows rather than claiming each row, so two instances are separated
+by the sweep lease and not by a per-row claim. Per-row claims are the next slice.
 
 ## Applying the migrations
 
@@ -290,7 +294,7 @@ anon) key; never the service-role key.
 | `LEONARDO_API_KEY` | Leonardo API key. Read only in the Node process and never stored in a generation row. |
 | `IMAGE_POLL_INTERVAL_MS`, `IMAGE_GENERATION_TIMEOUT_MS`, `IMAGE_DOWNLOAD_TIMEOUT_MS` | Leonardo poll cadence, the poll deadline before a `202` is returned, and the provider image download timeout (defaults 1500, 60000, and 30000 ms). |
 | `IMAGE_DAILY_IMAGES_PER_USER`, `IMAGE_DAILY_USD_PER_USER` | Per-account spending guard over a rolling 24 hours: recorded attempts and their estimated USD (defaults 20 images and $1.00). Either value set to `0` disables that dimension. Leonardo attempts count toward images but not USD because its rate is unpublished. |
-| `IMAGE_PENDING_ABANDON_AFTER_MS`, `IMAGE_PENDING_SWEEP_INTERVAL_MS` | A pending generation older than the abandon window (default 15 minutes, minimum 1 minute) is settled as `IMAGE_GENERATION_ABANDONED` instead of blocking new images. The background sweep runs on the interval (default 60 seconds; `0` disables it, while generation requests still settle stale rows opportunistically). |
+| `IMAGE_PENDING_ABANDON_AFTER_MS`, `IMAGE_PENDING_SWEEP_INTERVAL_MS` | A pending generation older than the abandon window (default 15 minutes, minimum 1 minute) is settled as `IMAGE_GENERATION_ABANDONED` instead of blocking new images. The background sweep runs on the interval (default 60 seconds; `0` disables it, while generation requests still settle stale rows opportunistically); each pass also resumes a pending job older than `IMAGE_GENERATION_TIMEOUT_MS`, the request's own poll window. |
 | `STOCK_IMPORT_TIMEOUT_MS`, `STOCK_IMPORT_REDIRECTS` | Import download timeout and redirect bound (defaults 30000 ms, 3 hops). |
 | `DEEPGRAM_API_KEY` | Deepgram Aura-2 text-to-speech key. Read only in the Node process, sent as `Authorization: Token`, and never stored in a narration row or returned to the browser. |
 | `NARRATION_TIMEOUT_MS`, `NARRATION_MAX_AUDIO_BYTES` | Deepgram request timeout and generated-audio size bound (defaults 60000 ms and 25 MiB). Deepgram accepts at most 2,000 characters per Aura-2 request. |
