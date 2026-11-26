@@ -345,12 +345,23 @@ and while it is asleep no sweep runs — submitted renders, lip-sync jobs, pendi
 advancing. That is the reason production runs Starter, and it is the one property this pass cannot verify. A real 64 MiB
 render copy cannot be exercised for free either; its peak is covered by `npm run measure:memory`, not by this deploy.
 
+Render does report memory for a Free instance, even though it reports no memory limit. On 2026-11-26 its metrics API
+(`GET /v1/metrics/memory`, five-minute resolution, ISO `startTime`/`endTime` values) returned 20 samples across eight
+instances from 09:30 to 16:55 UTC: the peak was 104.0 MiB (`109,002,750` bytes) at 11:10Z and the low 86.1 MiB. Those
+are idle-runtime samples, not the 64 MiB render copy, but they are the figure the gate below asks for, and the
+`measure:memory` peaks (311 MiB video, 327 MiB submit, 343 MiB output copy) stay under 400 MB too.
+
 Upgrade that same service to Starter only when all of the following hold: step 3 exit `0`; step 4 exit `0` with every
 line `PASS`; `/api/health` at `200` with `auth`, `ledger` and `storage` all true; sign-in, project save, upload → `ready`
 and playback working with a clean console; every applicable step 6 script exiting `0`; no `5xx`,
 `*_SWEEP_LEASE_UNAVAILABLE`, `EADDRINUSE` or `MODULE_NOT_FOUND` in the Render logs; and, if the service shows memory,
-a peak under about 400 MB. The URL and environment survive the plan change, so re-run step 4 afterwards. Add the paid
-provider keys only once the instance is on Starter.
+a peak under about 400 MB. The URL and environment survive the plan change, so re-run step 4 afterwards.
+
+**This one move is Dashboard-only.** On 2026-11-26 `PATCH /v1/services/{id}` with
+`{"serviceDetails":{"plan":"starter"}}` answered `400 {"message":"cannot change between free and paid plans"}`, and a
+top-level `plan` was accepted with `200` but ignored. Render's docs route a Free → paid upgrade through the service's
+*Compute* page in the Dashboard, which also takes a payment method if the workspace has none; Save triggers the redeploy
+that applies the new plan. Add the paid provider keys only once the instance is on Starter.
 
 ## Durable job advancement
 
