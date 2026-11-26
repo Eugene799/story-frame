@@ -219,6 +219,91 @@ A real deployment still needs its own Supabase project with every migration appl
 for the production origin (`npm run cors:preview -- https://<origin>`), `APP_ORIGIN` set to that origin, and accounts
 created through the admin API: there is no sign-up or password-reset flow.
 
+### Zero-cost deploy verification (Render Free)
+
+Render's Free instance is the same 512 MB as Starter, so the deploy can be proven before anything is paid for. Two rules
+keep that run at \$0: create the service **by hand on the Free plan** (`render.yaml` pins `plan: starter`, so a Blueprint
+deploy creates the paid instance), and leave every paid provider key unset — a missing key disables that feature rather
+than spending on it, and `/api/health` does not depend on any provider.
+
+**1. Create the service.** *New → Web Service*, this repository and branch, then set by hand what `render.yaml` would:
+
+| Setting | Value |
+| --- | --- |
+| Plan | **Free** |
+| Build command | `npm ci && npm run build` |
+| Start command | `npm start` |
+| Health check path | `/api/health` |
+
+Add `NODE_ENV=production` and `HOST=0.0.0.0`; the platform supplies `PORT`.
+
+**2. Set the environment.** Required, or `/api/health` answers `503`: `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`,
+`SUPABASE_SERVICE_ROLE_KEY`, `R2_ENDPOINT`, `R2_BUCKET_NAME`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and
+`APP_ORIGIN` exactly as `https://<service>.onrender.com` (no trailing slash). Also set the three measured caps from
+[Instance size](#instance-size): `VIDEO_MAX_BYTES=67108864`, `LIPSYNC_MAX_INPUT_BYTES=16777216`,
+`LIPSYNC_MAX_OUTPUT_BYTES=67108864`. `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` must exist before the first
+build, because `npm run build` inlines them.
+
+Deliberately unset on this pass: `OLLAMA_API_KEY`, `DEEPGRAM_API_KEY`, `JSON2VIDEO_API_KEY`, `EVERYPIXEL_CLIENT_ID`,
+`EVERYPIXEL_SECRET_ID`, `LEONARDO_API_KEY`, `CLOUDFLARE_AI_API_TOKEN`. Those features stay disabled (`…_PROVIDER_DISABLED`)
+and `preflight` prints a `WARN` for each one, which is expected here, not a failure. `PEXELS_API_KEY` and `PIXABAY_API_KEY`
+are free and can be set if stock search should be verified too.
+
+**3. Point the bucket CORS rule at the origin.** A browser upload is a cross-origin `PUT` to a presigned URL, so a stale
+rule leaves media rows `pending` with nothing else to explain it. From a shell with `CLOUDFLARE_API_TOKEN` (R2 edit),
+`CLOUDFLARE_ACCOUNT_ID`, and the bucket name:
+
+```bash
+npm run cors:preview -- https://<service>.onrender.com
+```
+
+Exit `0` means the bucket echoes that exact origin and its own presigned-upload preflight passed. It creates no object.
+
+**4. Probe the deployed origin.**
+
+```bash
+APP_ORIGIN=https://<service>.onrender.com \
+  npm run preflight:deploy -- https://<service>.onrender.com
+```
+
+Exit `0` with every line `PASS`: the eight required values, `APP_ORIGIN` naming the probed origin, the origin serving the
+built client and its referenced bundle, `/api/health` at `200` with `ok:true` and no false `ready` flags, and an unknown
+`/api` path returning the JSON `404`. Readiness failures name the group to fix: `auth` → `SUPABASE_URL` or the
+publishable key, `ledger` → the service-role key, `storage` → one of the four `R2_*` values.
+
+The startup line also proves the caps in force on the host. Render's *Logs* tab shows:
+
+```
+[storyframe] Limits: video.maxBytes=67108864 (64 MiB) lipsync.maxInputBytes=16777216 (16 MiB) lipsync.maxOutputBytes=67108864 (64 MiB)
+```
+
+Those numbers matching `render.yaml` are the evidence that a 512 MB instance runs the measured caps rather than the
+code defaults (256 MiB / 25 MiB / 256 MiB).
+
+**5. Browser smoke, no provider spend.** Sign in with an account created through the admin API (there is no sign-up),
+save a project and reload, upload an image and confirm the row reaches `ready` and plays back — that round trip is what
+proves the CORS rule — then check the console: no `4xx/5xx` on `/api/*`, and `403 ORIGIN_NOT_ALLOWED` means `APP_ORIGIN`
+does not match the address bar.
+
+**6. Provider-free evidence against the same hosted data.** These run a local instance against the real Supabase project
+and R2 bucket and each must exit `0`: `npm run verify:live-routes` (two disposable users, isolation, ledger),
+`npm run verify:media-live` (real upload, playback, delete), `npm run verify:image-routes-live` (image route with a fake
+provider), `npm run verify:r2-live`, and `npm run verify:stock-routes-live` when the stock keys are set. They prove the
+route and storage layers, not the Render instance. Do **not** run `verify:video-live`, `verify:lipsync-live` or
+`verify:image-live` on this pass: they spend provider credits or seconds.
+
+**7. What Free cannot prove.** The instance sleeps after 15 minutes without traffic and takes roughly a minute to wake,
+and while it is asleep no sweep runs — submitted renders, lip-sync jobs, pending images and media metadata stop
+advancing. That is the reason production runs Starter, and it is the one property this pass cannot verify. A real 64 MiB
+render copy cannot be exercised for free either; its peak is covered by `npm run measure:memory`, not by this deploy.
+
+Upgrade that same service to Starter only when all of the following hold: step 3 exit `0`; step 4 exit `0` with every
+line `PASS`; `/api/health` at `200` with `auth`, `ledger` and `storage` all true; sign-in, project save, upload → `ready`
+and playback working with a clean console; every applicable step 6 script exiting `0`; no `5xx`,
+`*_SWEEP_LEASE_UNAVAILABLE`, `EADDRINUSE` or `MODULE_NOT_FOUND` in the Render logs; and, if the service shows memory,
+a peak under about 400 MB. The URL and environment survive the plan change, so re-run step 4 afterwards. Add the paid
+provider keys only once the instance is on Starter.
+
 ## Durable job advancement
 
 The work itself is durable: `media_metadata`, `image_generations`, `render_snapshots`/`provider_jobs`, and
