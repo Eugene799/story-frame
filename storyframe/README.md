@@ -1,4 +1,4 @@
-# StoryFrame — Phase 10: complete story workflow
+# StoryFrame — Phase 10 complete; Phase 11 implemented: product ads
 
 This repository state keeps the Phase 2 pieces — a **server-verified Supabase session boundary**, a **durable,
 idempotent usage ledger**, and the **project data model** with owner-scoped access — and the Phase 3 **private media
@@ -11,6 +11,9 @@ Workers AI or Leonardo), Phase 8 adds Deepgram narration with uploaded audio, Ph
 sync through Everypixel Labs renders a talking clip or portrait against an audio track. Phase 10 completes
 recoverable revision history, the pre-render media/narration checklist, and optional fiction continuity notes; its
 paid factual-and-fiction acceptance run passed on 2026-11-27 against hosted Supabase, R2, Deepgram, and JSON2Video.
+Phase 11 adds the owner-scoped product and campaign catalog, grounded three-concept ad generation from a frozen
+snapshot, a one-way selected manifest, a dashboard catalog panel, and an apply step that turns the selected manifest
+into an approved project revision the existing video export can render.
 
 The account screens use real Supabase email/password sign-in, sign-up, and password recovery, and the signed-in
 workspace handles projects, media, planning, and exports. The Phase 1–2 connection-test screen remains a development
@@ -460,6 +463,7 @@ these tables. Apply them in filename order:
 19. `20261126100000_create_video_usage.sql` (Phase 9: credits ledger and atomic per-account reservation)
 20. `20261126110000_create_lipsync_exports.sql` (Phase 9: lip sync exports and the provider-seconds ledger)
 21. `20261126120000_create_job_leases.sql` (Phase 9: one durable advancement lease per sweep name, with claim and renew functions)
+22. `20261127120000_create_product_ad_concepts.sql` (Phase 11: frozen-snapshot ad-concept sets, one-way selection, manifest)
 
 Run the compatibility check first. It must return no rows:
 
@@ -472,7 +476,8 @@ where table_schema = 'public'
     'media_references', 'sources', 'claims', 'generation_proposals',
     'provider_jobs', 'render_snapshots', 'profiles', 'model_health', 'stock_search_cache',
     'image_generations', 'narration_tracks', 'narration_usage', 'video_usage',
-    'lipsync_exports', 'lipsync_usage', 'job_leases'
+    'lipsync_exports', 'lipsync_usage', 'job_leases',
+    'products', 'campaigns', 'product_ad_concepts'
   );
 ```
 
@@ -493,9 +498,12 @@ Afterwards, check the running server rather than assuming the schema is ready:
 3. Run `npm run smoke:live` (five billable calls, described under Tests). It creates and deletes
    its own disposable Supabase user; no pre-existing session token is used.
 
-**The migration set through Phase 9 is applied to the configured project (`myrohtkfsuppcabedwmn`): the sixth on
+**The migration set through Phase 11 is applied to the configured project (`myrohtkfsuppcabedwmn`): the sixth on
 2026-11-24, the seventh and eighth (Phase 5) on 2026-11-25, the ninth through seventeenth (Phases 6–8) on 2026-11-25, and
-the eighteenth through twenty-first (Phase 9) through the management API, the last on 2026-11-26. `npm run verify:sql`
+the eighteenth through twenty-first (Phase 9) through the management API, the last on 2026-11-26. The twenty-second and
+twenty-third (Phase 11) followed through the same API on 2026-11-27; `verify:sql` then reported 162/162, and a direct
+probe confirmed all three tables, their select-own policies, an anon request refused with `42501`, and a service-role
+read of `product_ad_concepts` returning `200 []`. `npm run verify:sql`
 still proves every one locally first, and after applying the first two Phase 9 migrations a PostgREST probe returned
 `200` for `render_snapshots.kind`, `render_snapshots.media_id`, and `video_usage`.** The Phase 6 catalog was
 checked directly after applying it: `media_metadata.provenance` and its object constraint exist,
@@ -762,7 +770,7 @@ rejected request cannot append a revision.
 | `GET /api/projects` | The caller's 50 most recently updated projects, without documents. |
 | `GET /api/projects/:id` | One owned project, including its document. |
 | `PUT /api/projects/:id` | Replace `{ title, document }`, sending the `version` last read. Scene asset ids must be UUID-shaped ready media in the same project (`422 MEDIA_ASSET_INVALID` otherwise). |
-| `DELETE /api/projects/:id` | Delete an owned project; its revisions cascade. |
+| `DELETE /api/projects/:id` | Delete an owned project; its revisions cascade. Refused with `409 PROJECT_MEDIA_IN_USE` while a catalog product still references one of its images. |
 | `GET /api/projects/:id/revisions` | The owner's 20 newest revision summaries (no document payloads). |
 | `POST /api/projects/:id/export` | Export the `{ title, document }` the editor is showing. Returns the document, one unique stock credit per referenced asset (creator, provider, source page, license, scene ids), and a render payload with per-scene credited assets. Attribution is read from stored media rows, never the request. |
 
@@ -1078,7 +1086,126 @@ by the route and UI tests above.
 against mocked Supabase endpoints and fails CI if the disposable user is not created, signed in, and deleted, or if
 its `ai_usage` rows survive. It also covers a failed sign-in, an account that survives deletion, leaked ledger rows,
 and an unavailable deletion probe. It spends nothing and makes no provider call; the paid-acceptance boundary above
-still requires the opt-in `smoke:live` run.
+still requires the opt-in `smoke:live` run. Phase 11 starts from that boundary with the product catalog and campaign
+foundation described below.
+
+## Phase 11: product ads — catalog, grounded concepts, and manifest (2026-11-27)
+
+A product ad needs facts before it needs footage. Phase 11 keeps those facts in an owner-scoped catalog: `products`
+holds the real name and variant, brand settings, **approved claims with their evidence notes**, **prohibited wording**,
+and the ready image ids for the actual product asset and logo. `campaigns` holds the offer: audience, price and
+currency, promotion window with its IANA time zone, call to action, destination, duration, aspect ratio, and
+disclaimer. Both tables live in `supabase/migrations/20261127090000_create_products_and_campaigns.sql` with the same
+select-own RLS and service-role-only writes as the project tables.
+
+**Catalog routes.** `POST/GET /api/products`, `GET /api/products/:id`, and `PATCH /api/products/:id` create, read, and
+correct a catalog entry; `GET /api/media/images` lists the account's ready images across every project, newest first,
+with each row's project id and title, content type, size, upload date, and stock provenance, so the catalog picker can
+name real files instead of UUIDs (pending, deleted, audio, and video rows are excluded); `POST/GET /api/campaigns`,
+`GET /api/campaigns/:id`, `PATCH /api/campaigns/:id`, and `DELETE /api/campaigns/:id` create, read, correct, and delete
+a campaign. A PATCH merges the omitted fields with the stored row and then reuses the creation validator, so a correction
+cannot bypass the same limits. A campaign's owning product is immutable; a different `productId` is `400
+INVALID_CAMPAIGN`, and deletion cascades only that campaign's concept sets. A product correction preserves the id of a
+claim whose text is unchanged (so later ad snapshots keep stable claim ids); changed or new claim text gets a generated
+id. Its media references are reconciled against the new image set: every added image must be a ready image owned by the
+caller, new references are written before the product row, references for removed images are released after it, and
+added references are rolled back if the row update fails. Campaign creation proves the product belongs to the caller and
+rejects a project id the caller does not own. A product's `assetMediaIds` and `logoMediaId` must be **ready images owned
+by the caller** (`readyOwnedMedia`), refused `422 PRODUCT_ASSET_INVALID` otherwise, so one account cannot point a catalog
+entry at another account's object. Each image gets a media reference naming the product, so the retention sweep cannot
+retire a catalog image as unreferenced; `DELETE /api/products/:id` releases those references and the database cascades
+the product's campaigns and concept sets. A product PATCH can also clear or replace those image references without
+deleting the product. The same references guard project deletion: `DELETE /api/projects/:id` answers `409
+PROJECT_MEDIA_IN_USE` while a product still names an image in that project, because the project cascade would remove the
+media row and leave the product with a dead id. Clear that image from the product (or delete the product) first to
+release its references, then the project. Validation also refuses empty
+text, duplicate claims or prohibited phrases, malformed asset ids, a non-http destination, an invalid time zone, a
+promotion window that ends before it starts, a bad currency or aspect ratio, and any field outside the documented
+shape. `tests/products.test.ts` covers creation, listing, owner isolation, every refusal case, and the ready-image
+library (its ready-image-only and owner scoping, the project title, and the auth/method guards).
+
+**Grounded concepts.** `POST /api/products/:id/ad-concepts` takes only `campaignId` and an optional `instruction`, and
+requires an `Idempotency-Key` plus an available `ad-concept` planning route. It copies the product and campaign into a
+**frozen snapshot** (with a SHA-256 `snapshotHash` over the version and both fact sets) before contacting the model;
+all later reads use that snapshot, so renaming the product or changing the offer cannot rewrite an existing generation
+or an approved manifest. The model is asked for one JSON object with exactly **three distinct concepts**. Each concept
+carries a title, a hook, exactly **two bounded alternate hooks**, and 2–6 beats whose durations total the campaign
+duration within 2 seconds; the final beat's on-screen text must contain the campaign's exact call to action. The
+server, not the model, assigns concept ids and totals.
+
+**What the model may not invent.** Every beat asset id must be null or one of the snapshot's own ready image ids;
+every `claimIds` entry must be an approved claim **with a non-empty evidence note**; any prohibited phrase anywhere in
+the reply fails validation; the model cannot return concept ids, media URLs, or unknown fields. A rejected reply gets
+exactly one disclosed repair, and a second failure is `422 AD_CONCEPT_INVALID_JSON` with nothing stored. The reply is
+validated as untrusted data, and the prompt labels the product and campaign block as data, not instructions.
+
+**Prompt and reply budgets.** The catalog bounds are part of that budget, not separate from it: at most **8 claims**
+(300 characters each, with 400 characters of evidence), **12 prohibited phrases** (80 characters each), and **12
+product images**. The campaign's audience, offer, destination, and disclaimer are bounded alongside them, so a maximal
+product, campaign, and 500-character instruction fit the route's **16,000-character prompt** without truncation. If a
+stored snapshot still exceeds that limit, the builder closes any cut product/campaign block and reserves the complete
+task schema and instruction before spending any prompt budget on facts, with a marker stating that facts were
+truncated. The
+`ad-concept` route asks for **8,000 output tokens**; the other planning routes keep their 1,200-token bound. A
+maximal accepted reply (three concepts, six beats each, every text at its limit) fits that cap even at a conservative
+three characters per token. `tests/ad-concepts.test.ts` builds the maximal product, campaign, and reply, asserts the
+prompt keeps the full schema and all facts, and accepts the reply without a repair.
+
+**Selection and manifest.** `GET /api/products/:id/ad-concepts`, `GET /api/ad-concepts?productId=…`, and
+`GET /api/ad-concepts/:id` list and read the owner's sets. `POST /api/ad-concepts/:id/select` with `{ "index": 0-2 }`
+freezes a **manifest** built from the snapshot: product name and variant, the product `logoMediaId`, the campaign
+`projectId`, the selected concept and all three hook variants, beats with their asset ids, total and campaign duration,
+aspect ratio, CTA, destination, disclaimer, the cited claims with evidence, and the prohibited-wording list. Selection
+is one-way; repeating the same index is idempotent, and a different index is `409 AD_CONCEPT_ALREADY_SELECTED`. A
+stored snapshot whose hash no longer matches is refused `503 AD_CONCEPT_SNAPSHOT_INVALID` rather than producing a
+manifest that claims unverified facts. Every snapshot image id is rechecked against `readyOwnedMedia` before a paid
+generation and again before selection, so a product whose image was deleted or belongs to another account cannot
+produce a manifest naming it (`409 AD_CONCEPT_MEDIA_INVALID`; no provider call and no selection are made). Both tables
+live in `supabase/migrations/20261127120000_create_product_ad_concepts.sql`; `verify:sql` covers the three-concept and
+selection constraints, select-own RLS, refused browser writes, and the product/auth-user cascades.
+
+**Applying a manifest to a render project.** `POST /api/ad-concepts/:id/project` writes a selected manifest into the
+project its campaign names. Each beat becomes an already-approved scene with a deterministic id derived from the
+concept, so applying the same manifest again replaces its own scenes instead of duplicating them and leaves the
+project's other scenes alone; the final scene carries the campaign CTA, which the video export renders as on-screen
+text. The logo and every beat asset must still be ready media **in that project** (`409 AD_CONCEPT_MEDIA_INVALID`),
+component locks are respected like any other save, and the write is a normal project revision (`200` with
+`projectRevision`). The paid render itself stays explicit: nothing in this step calls a provider or spends credits;
+the dashboard opens the saved revision in Projects, where the existing video export can render it.
+
+**Billable safety.** Generation reserves the existing `ai_usage` ledger with the verified user id and the caller's key
+before the provider call, so a retry returns the stored concept set without paying twice; reusing the key for another
+product or campaign is `409 IDEMPOTENCY_KEY_REUSED`, and the per-account in-flight and rate guards cover concurrent
+tabs. `tests/ad-concepts.test.ts` covers generation, prompt grounding, replay, the one repair, both refusal paths,
+owner isolation, the frozen snapshot surviving a later catalog edit, the manifest, tamper detection, campaign
+mismatch/foreign-campaign refusals, every concept closing on the campaign CTA, the media revalidation before generation
+and selection, and the apply path that writes approved scenes into the campaign's project (including a repeat apply
+and a deleted logo). The project-delete regression test proves that a project holding catalog-referenced media is
+refused (`409 PROJECT_MEDIA_IN_USE`), that generation and selection still freeze a manifest from the intact images,
+and that deleting the product releases the references so the project can then be deleted. `tests/media.test.ts` keeps
+a catalog-referenced image through retention until its product is deleted. `tests/products.test.ts` also covers partial
+product and campaign corrections, claim id stability, reference add/remove/rollback, immutable campaign products, and
+owner-scoped campaign deletion with its concept sets. `tests/catalog-panel.test.tsx` covers creation, generation,
+product and campaign editing, cancelling either edit without a write, unavailable media, and deleting one campaign while
+its sibling and product remain. The full suite is 55 files / 509 tests.
+
+**Catalog UI.** The dashboard's **Open product catalog** button opens `CatalogPanel`: create a product with its
+claims and evidence, prohibited wording, and ready images picked from the account library; create a campaign against a
+product, choosing the **Render project** that will hold and render the ad; choose a product and campaign and generate
+the three concepts;
+then select one, **apply** the frozen manifest to that project, inspect the manifest, or delete the product (which
+releases its image references and removes its campaigns and concept sets). Applying saves approved scenes and reports
+the project revision to open in Projects, where the existing preview and video export continue; the catalog does not
+start a paid render itself. Product images are picked from one account-wide list of ready images, each labelled by the
+project that holds it and its format, size, and upload date; the logo is a single-choice picker over the same list.
+The panel also exposes the correction path: **Edit product** loads the stored facts, claims, images, and logo into the
+form and saves them with `PATCH /api/products/:id`; **Edit campaign** loads the mutable offer fields and saves them with
+`PATCH /api/campaigns/:id` while keeping the owning product fixed; and **Delete campaign** removes only the selected
+campaign and its concept sets after confirmation, leaving the product and its media references intact. The larger
+**Delete product** action remains separate and still removes the product's campaigns and concept sets.
+
+Phase 11's routes and UI are implementation-complete and covered by the migration check and test suite. Unlike Phase 10,
+no paid live acceptance run is recorded for Phase 11.
 
 ## Phase 5: six-model routing and AI planning (2026-11-25)
 

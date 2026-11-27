@@ -56,3 +56,25 @@ export interface MediaPlayback {
   contentType: string;
   byteSize: number;
 }
+
+/**
+ * A ready image the catalog can ground a product on. Media rows belong to a
+ * project, so the picker names the project that holds each image rather than
+ * asking the operator to remember a UUID.
+ */
+export interface ReadyImageOption {
+  id: string;
+  projectId: string;
+  /** Empty when the owning project is no longer listed. */
+  projectTitle: string;
+  contentType: string;
+  byteSize: number;
+  readyAt: string | null;
+  createdAt: string;
+  provenance: MediaProvenance | null;
+}
+
+export interface ReadyImagesResponse {
+  ok: true;
+  images: ReadyImageOption[];
+}

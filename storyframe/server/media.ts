@@ -286,6 +286,17 @@ export interface StoredMedia {
   objectKey: string;
 }
 
+/** A ready image owned by the caller, before its project title is attached. */
+export interface ReadyImageRow {
+  id: string;
+  projectId: string;
+  contentType: string;
+  byteSize: number;
+  readyAt: string | null;
+  createdAt: string;
+  provenance: MediaProvenance | null;
+}
+
 export interface MediaStore {
   createPending(
     ownerId: string,
@@ -310,6 +321,8 @@ export interface MediaStore {
     match: Pick<MediaProvenance, "provider" | "providerId" | "rendition">,
   ): Promise<StoredMedia | null>;
   list(ownerId: string, projectId: string, limit: number): Promise<MediaRecord[]>;
+  /** This owner's ready images across every project, newest first. */
+  listReadyImages(ownerId: string, limit: number): Promise<ReadyImageRow[]>;
   /** Object keys for a project, read before its rows cascade away. */
   listObjectKeys(ownerId: string, projectId: string): Promise<string[]>;
   markReady(
@@ -322,8 +335,29 @@ export interface MediaStore {
   removeRow(id: string): Promise<void>;
   /** Ids among mediaIds that are ready in this owner's project. */
   readyAssetIds(ownerId: string, projectId: string, mediaIds: string[]): Promise<Set<string>>;
+  /**
+   * Ready media by id across this owner's projects, with its kind and project.
+   * A catalog entry may reuse an image from any project, but never another
+   * account's, and the project is needed to record a retention reference.
+   */
+  readyOwnedMedia(
+    ownerId: string,
+    mediaIds: string[],
+  ): Promise<Map<string, { kind: MediaKind; projectId: string }>>;
 
   listReferences(ownerId: string, projectId: string, mediaId: string): Promise<MediaReferenceRecord[]>;
+  /** References naming a non-project target, such as a catalog product. */
+  listTargetReferences(
+    ownerId: string,
+    refKind: MediaRefKind,
+    refId: string,
+  ): Promise<{ id: string; mediaId: string; projectId: string }[]>;
+  /**
+   * True when a catalog product still references media in this project. Those
+   * references survive the project row, so deleting it would leave a product
+   * pointing at media that no longer exists.
+   */
+  hasProjectTargetReferences(ownerId: string, projectId: string): Promise<boolean>;
   addReference(
     ownerId: string,
     projectId: string,
@@ -559,6 +593,44 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
     return { media: toMedia(row, counts.get(id) ?? 0), objectKey: rowText(row, "object_key") };
   }
 
+  async function hasProjectTargetReferences(ownerId: string, projectId: string): Promise<boolean> {
+    const found = rows(
+      await request(
+        tableUrl("media_references", {
+          select: "id",
+          owner_id: `eq.${ownerId}`,
+          project_id: `eq.${projectId}`,
+          ref_kind: "eq.other",
+          limit: "1",
+        }),
+        { headers: readHeaders },
+        "the project catalog reference check",
+      ),
+    );
+    return found.length > 0;
+  }
+
+  async function listTargetReferences(ownerId: string, refKind: MediaRefKind, refId: string) {
+    const found = rows(
+      await request(
+        tableUrl("media_references", {
+          select: "id,media_id,project_id",
+          owner_id: `eq.${ownerId}`,
+          ref_kind: `eq.${refKind}`,
+          ref_id: `eq.${refId}`,
+          limit: "100",
+        }),
+        { headers: readHeaders },
+        "the catalog media reference list",
+      ),
+    );
+    return found.map((row) => ({
+      id: rowText(row, "id"),
+      mediaId: rowText(row, "media_id"),
+      projectId: rowText(row, "project_id"),
+    }));
+  }
+
   async function listReferences(
     ownerId: string,
     projectId: string,
@@ -639,6 +711,8 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
     get,
     findImported,
     listReferences,
+    listTargetReferences,
+    hasProjectTargetReferences,
     referenceCounts,
 
     async list(ownerId, projectId, limit) {
@@ -660,6 +734,64 @@ export function createSupabaseMediaStore(options: SupabaseMediaStoreOptions): Me
         found.map((row) => rowText(row, "id")),
       );
       return found.map((row) => toMedia(row, counts.get(rowText(row, "id")) ?? 0));
+    },
+
+    async listReadyImages(ownerId, limit) {
+      const found = rows(
+        await request(
+          tableUrl("media_metadata", {
+            select: "id,project_id,content_type,byte_size,ready_at,created_at,provenance",
+            owner_id: `eq.${ownerId}`,
+            status: "eq.ready",
+            kind: "eq.image",
+            order: "created_at.desc",
+            limit: String(limit),
+          }),
+          { headers: readHeaders },
+          "the ready image library",
+        ),
+      );
+      return found.map((row) => {
+        const byteSize = row.byte_size;
+        if (typeof byteSize !== "number" || !Number.isFinite(byteSize)) corrupt("byte_size");
+        return {
+          id: rowText(row, "id"),
+          projectId: rowText(row, "project_id"),
+          contentType: rowText(row, "content_type"),
+          byteSize,
+          readyAt: rowNullableText(row, "ready_at"),
+          createdAt: rowText(row, "created_at"),
+          provenance: toProvenance(row),
+        };
+      });
+    },
+
+    async readyOwnedMedia(ownerId, mediaIds) {
+      const ready = new Map<string, { kind: MediaKind; projectId: string }>();
+      const unique = [...new Set(mediaIds)];
+      for (let index = 0; index < unique.length; index += 100) {
+        const chunk = unique.slice(index, index + 100);
+        const found = rows(
+          await request(
+            tableUrl("media_metadata", {
+              select: "id,kind,project_id",
+              id: `in.(${chunk.join(",")})`,
+              owner_id: `eq.${ownerId}`,
+              status: "eq.ready",
+              limit: String(chunk.length),
+            }),
+            { headers: readHeaders },
+            "the ready media list",
+          ),
+        );
+        for (const row of found) {
+          const kind = rowText(row, "kind");
+          if (kind === "image" || kind === "audio" || kind === "video") {
+            ready.set(rowText(row, "id"), { kind, projectId: rowText(row, "project_id") });
+          }
+        }
+      }
+      return ready;
     },
 
     async readyAssetIds(ownerId, projectId, mediaIds) {

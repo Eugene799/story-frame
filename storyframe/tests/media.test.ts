@@ -749,6 +749,53 @@ describe("private media storage", () => {
     }
   });
 
+  it("keeps a catalog-referenced image through retention until the product is deleted", async () => {
+    let clock = Date.now();
+    const app = await startTestServer({ now: () => clock, env: { MEDIA_UNREFERENCED_RETENTION_MS: "0" } });
+    try {
+      const projectId = await createProject(app.url);
+      const ticket = await initiateUpload(app.url, projectId, {
+        kind: "image",
+        contentType: "image/png",
+        byteSize: PNG.length,
+      });
+      await putObject(ticket, PNG);
+      expect((await complete(app.url, projectId, ticket.media.id)).status).toBe(200);
+
+      // The catalog image is ready but not attached to any scene. Its product
+      // reference is the only thing that may protect it from retention.
+      const productResponse = await apiRequest(app.url, "/api/products", {
+        method: "POST",
+        body: JSON.stringify({ name: "Harbor Serum", assetMediaIds: [ticket.media.id] }),
+      });
+      expect(productResponse.status).toBe(201);
+      const product = ((await productResponse.json()) as { product: { id: string } }).product;
+
+      clock += 1000;
+      const first = await apiRequest(app.url, `/api/projects/${projectId}/media`);
+      expect(((await first.json()) as { media: MediaRecord[] }).media).toHaveLength(1);
+      expect(app.r2.objects.size).toBe(1);
+
+      // A second pass proves the reference is durable rather than a one-pass race.
+      clock += 1000;
+      const second = await apiRequest(app.url, `/api/projects/${projectId}/media`);
+      expect(((await second.json()) as { media: MediaRecord[] }).media).toHaveLength(1);
+      expect(app.r2.objects.size).toBe(1);
+
+      // Deleting the product releases the reference, so the next pass retires
+      // the image the same way it retires any other unreferenced asset.
+      const deleted = await apiRequest(app.url, `/api/products/${product.id}`, { method: "DELETE" });
+      expect(deleted.status).toBe(200);
+      clock += 1000;
+      const third = await apiRequest(app.url, `/api/projects/${projectId}/media`);
+      expect(((await third.json()) as { media: MediaRecord[] }).media).toHaveLength(0);
+      expect(app.r2.objects.size).toBe(0);
+      expect(app.supabase.media).toHaveLength(0);
+    } finally {
+      await app.close();
+    }
+  });
+
   it("pages past more protected rows than one sweep batch", async () => {
     let clock = Date.now();
     const app = await startTestServer({ now: () => clock, env: { MEDIA_UNREFERENCED_RETENTION_MS: "0" } });

@@ -38,14 +38,45 @@ import {
   carrySceneLocks,
   isProjectId,
   migrateDocument,
+  parseDocument,
   parseProjectExportInput,
   parseProjectRestore,
   parseProjectUpdate,
   parseProjectWrite,
   type ProjectStore,
 } from "./projects";
+import {
+  CAMPAIGN_NOT_FOUND_MESSAGE,
+  PRODUCT_LIMITS,
+  PRODUCT_NOT_FOUND_MESSAGE,
+  createSupabaseProductStore,
+  isProductId,
+  parseCampaignUpdate,
+  parseCampaignWrite,
+  parseProductUpdate,
+  parseProductWrite,
+  type ProductStore,
+  type ProductWriteWithClaims,
+} from "./products";
+import {
+  AD_CONCEPT_NOT_FOUND_MESSAGE,
+  AdConceptInvalidError,
+  buildAdConceptPrompt,
+  buildAdManifest,
+  buildAdSnapshot,
+  createSupabaseAdConceptStore,
+  generateAdConceptPayload,
+  hashAdSnapshot,
+  parseAdConceptGenerateRequest,
+  parseAdConceptSelectRequest,
+  snapshotMediaIds,
+  type AdConceptStore,
+} from "./ad-concepts";
+import { manifestMediaIds, mergeAdConceptScenes } from "./ad-concept-project";
+import { AD_CONCEPT_LIMITS } from "../shared/ad-concept-contract";
 import { ApiError } from "./api-error";
-import type { MediaRecord } from "../shared/media-contract";
+import type { MediaKind, MediaRecord } from "../shared/media-contract";
+import type { ProductRecord } from "../shared/product-contract";
 import { buildProjectExport } from "../shared/project-export";
 import type {
   ImageBillingView,
@@ -530,6 +561,24 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
         })
       : null;
 
+  const catalogStore: ProductStore | null =
+    config.supabaseUrl && config.supabaseServiceRoleKey
+      ? createSupabaseProductStore({
+          url: config.supabaseUrl,
+          serviceRoleKey: config.supabaseServiceRoleKey,
+          timeoutMs: config.authTimeoutMs,
+        })
+      : null;
+
+  const adConceptStore: AdConceptStore | null =
+    config.supabaseUrl && config.supabaseServiceRoleKey
+      ? createSupabaseAdConceptStore({
+          url: config.supabaseUrl,
+          serviceRoleKey: config.supabaseServiceRoleKey,
+          timeoutMs: config.authTimeoutMs,
+        })
+      : null;
+
   const profileStore: ProfileStore | null =
     config.supabaseUrl && config.supabaseServiceRoleKey
       ? createSupabaseProfileStore({
@@ -923,6 +972,26 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       return;
     }
 
+    if (path === "/api/ad-concepts" || path.startsWith("/api/ad-concepts/")) {
+      await handleAdConcepts(request, response, path, requestUrl);
+      return;
+    }
+
+    if (path === "/api/media/images") {
+      await handleMediaLibrary(request, response);
+      return;
+    }
+
+    if (path === "/api/products" || path.startsWith("/api/products/")) {
+      await handleProducts(request, response, path);
+      return;
+    }
+
+    if (path === "/api/campaigns" || path.startsWith("/api/campaigns/")) {
+      await handleCampaigns(request, response, path);
+      return;
+    }
+
     if (path === "/api/projects" || path.startsWith("/api/projects/")) {
       await handleProjects(request, response, path);
       return;
@@ -1032,6 +1101,28 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       );
     }
     return projectStore;
+  }
+
+  function requireCatalog(): ProductStore {
+    if (!catalogStore) {
+      throw new HttpError(
+        503,
+        "PROJECTS_NOT_CONFIGURED",
+        "The product catalog is not configured on the server. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.",
+      );
+    }
+    return catalogStore;
+  }
+
+  function requireAdConcepts(): AdConceptStore {
+    if (!adConceptStore) {
+      throw new HttpError(
+        503,
+        "PROJECTS_NOT_CONFIGURED",
+        "The ad-concept store is not configured on the server. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.",
+      );
+    }
+    return adConceptStore;
   }
 
   function requireChildren(): ChildStore {
@@ -1957,6 +2048,750 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     }
   }
 
+  /**
+   * The catalog is account-wide while media rows belong to a project, so the
+   * picker needs one list that names the project behind each ready image.
+   * Only ready images are listed: pending, deleted, audio, and video rows can
+   * never ground a product ad.
+   */
+  async function handleMediaLibrary(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    checkOrigin(request);
+    const user = await authenticate(request);
+    if ((request.method ?? "GET") !== "GET") {
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for the ready image library.");
+    }
+    const images = await requireMediaStore().listReadyImages(user.id, config.media.listLimit);
+    const projects = await requireProjects().list(user.id, config.media.listLimit);
+    const titles = new Map(projects.map((project) => [project.id, project.title]));
+    sendJson(response, 200, {
+      ok: true,
+      images: images.map((image) => ({ ...image, projectTitle: titles.get(image.projectId) ?? "" })),
+    });
+  }
+
+  async function handleProducts(
+    request: IncomingMessage,
+    response: ServerResponse,
+    path: string,
+  ): Promise<void> {
+    checkOrigin(request);
+    const user = await authenticate(request);
+    const store = requireCatalog();
+    const method = request.method ?? "GET";
+
+    if (path === "/api/products") {
+      if (method === "GET") {
+        sendJson(response, 200, { ok: true, products: await store.listProducts(user.id) });
+        return;
+      }
+      if (method === "POST") {
+        const write = parseProductWrite(await readJsonBody(request, PRODUCT_LIMITS.bodyBytes));
+        const product = await createProductWithReferences(user.id, write);
+        sendJson(response, 201, { ok: true, product });
+        return;
+      }
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET or POST for this endpoint.");
+    }
+
+    const rest = path.slice("/api/products/".length);
+    const separator = rest.indexOf("/");
+    const productId = separator === -1 ? rest : rest.slice(0, separator);
+    if (!isProductId(productId)) {
+      throw new HttpError(404, "PRODUCT_NOT_FOUND", PRODUCT_NOT_FOUND_MESSAGE);
+    }
+
+    if (separator !== -1) {
+      const subpath = rest.slice(separator + 1);
+      if (subpath !== "ad-concepts") {
+        throw new HttpError(404, "NOT_FOUND", "Unknown product endpoint.");
+      }
+      if (method === "POST") {
+        await handleAdConceptGenerate(request, response, user, productId);
+        return;
+      }
+      if (method === "GET") {
+        if (!(await store.getProduct(user.id, productId))) {
+          throw new HttpError(404, "PRODUCT_NOT_FOUND", PRODUCT_NOT_FOUND_MESSAGE);
+        }
+        const conceptSets = await requireAdConcepts().listAdConceptSets(user.id, productId);
+        sendJson(response, 200, { ok: true, conceptSets });
+        return;
+      }
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET or POST for this endpoint.");
+    }
+
+    if (method === "PATCH") {
+      const existing = await store.getProduct(user.id, productId);
+      if (!existing) throw new HttpError(404, "PRODUCT_NOT_FOUND", PRODUCT_NOT_FOUND_MESSAGE);
+      const write = parseProductUpdate(await readJsonBody(request, PRODUCT_LIMITS.bodyBytes), existing);
+      const product = await updateProductWithReferences(user.id, existing, write);
+      sendJson(response, 200, { ok: true, product });
+      return;
+    }
+
+    if (method === "DELETE") {
+      const product = await store.getProduct(user.id, productId);
+      if (!product) throw new HttpError(404, "PRODUCT_NOT_FOUND", PRODUCT_NOT_FOUND_MESSAGE);
+      const references = mediaStore
+        ? await mediaStore.listTargetReferences(user.id, "other", productId)
+        : [];
+      async function restoreReferences(): Promise<void> {
+        if (!mediaStore) return;
+        for (const reference of references) {
+          await mediaStore
+            .addReference(user.id, reference.projectId, reference.mediaId, {
+              refKind: "other",
+              refId: productId,
+            })
+            .catch(() => undefined);
+        }
+      }
+      // Release the images first; a failed delete re-adds the references so the
+      // product keeps protecting them from the retention sweep.
+      if (mediaStore) {
+        for (const reference of references) {
+          await mediaStore.removeReference(user.id, reference.projectId, reference.mediaId, reference.id);
+        }
+      }
+      let deleted = false;
+      try {
+        deleted = await store.deleteProduct(user.id, productId);
+      } catch (error) {
+        await restoreReferences();
+        throw error;
+      }
+      if (!deleted) {
+        await restoreReferences();
+        throw new HttpError(404, "PRODUCT_NOT_FOUND", PRODUCT_NOT_FOUND_MESSAGE);
+      }
+      sendJson(response, 200, { ok: true, deletedId: productId });
+      return;
+    }
+
+    if (method !== "GET") {
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET, PATCH, or DELETE for this endpoint.");
+    }
+    const product = await store.getProduct(user.id, productId);
+    if (!product) throw new HttpError(404, "PRODUCT_NOT_FOUND", PRODUCT_NOT_FOUND_MESSAGE);
+    sendJson(response, 200, { ok: true, product });
+  }
+
+  async function handleCampaigns(
+    request: IncomingMessage,
+    response: ServerResponse,
+    path: string,
+  ): Promise<void> {
+    checkOrigin(request);
+    const user = await authenticate(request);
+    const store = requireCatalog();
+    const method = request.method ?? "GET";
+    const requestUrl = new URL(request.url ?? "/", "http://localhost");
+
+    if (path === "/api/campaigns") {
+      if (method === "GET") {
+        const productId = requestUrl.searchParams.get("productId");
+        if (productId !== null && (!isProductId(productId) || !(await store.getProduct(user.id, productId)))) {
+          throw new HttpError(404, "PRODUCT_NOT_FOUND", PRODUCT_NOT_FOUND_MESSAGE);
+        }
+        const campaigns = await store.listCampaigns(user.id, productId ?? undefined);
+        sendJson(response, 200, { ok: true, campaigns });
+        return;
+      }
+      if (method === "POST") {
+        const write = parseCampaignWrite(await readJsonBody(request, PRODUCT_LIMITS.bodyBytes));
+        if (!(await store.getProduct(user.id, write.productId))) {
+          throw new HttpError(404, "PRODUCT_NOT_FOUND", PRODUCT_NOT_FOUND_MESSAGE);
+        }
+        if (write.projectId) await requireProjects().get(user.id, write.projectId);
+        sendJson(response, 201, { ok: true, campaign: await store.createCampaign(user.id, write) });
+        return;
+      }
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET or POST for this endpoint.");
+    }
+
+    const campaignId = path.slice("/api/campaigns/".length);
+    if (!isProductId(campaignId)) {
+      throw new HttpError(404, "CAMPAIGN_NOT_FOUND", CAMPAIGN_NOT_FOUND_MESSAGE);
+    }
+
+    if (method === "PATCH") {
+      const existing = await store.getCampaign(user.id, campaignId);
+      if (!existing) throw new HttpError(404, "CAMPAIGN_NOT_FOUND", CAMPAIGN_NOT_FOUND_MESSAGE);
+      const write = parseCampaignUpdate(await readJsonBody(request, PRODUCT_LIMITS.bodyBytes), existing);
+      if (write.projectId) await requireProjects().get(user.id, write.projectId);
+      const campaign = await store.updateCampaign(user.id, campaignId, write);
+      if (!campaign) throw new HttpError(404, "CAMPAIGN_NOT_FOUND", CAMPAIGN_NOT_FOUND_MESSAGE);
+      sendJson(response, 200, { ok: true, campaign });
+      return;
+    }
+
+    if (method === "DELETE") {
+      if (!(await store.deleteCampaign(user.id, campaignId))) {
+        throw new HttpError(404, "CAMPAIGN_NOT_FOUND", CAMPAIGN_NOT_FOUND_MESSAGE);
+      }
+      sendJson(response, 200, { ok: true, deletedId: campaignId });
+      return;
+    }
+
+    if (method !== "GET") {
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET, PATCH, or DELETE for this endpoint.");
+    }
+    const campaign = await store.getCampaign(user.id, campaignId);
+    if (!campaign) throw new HttpError(404, "CAMPAIGN_NOT_FOUND", CAMPAIGN_NOT_FOUND_MESSAGE);
+    sendJson(response, 200, { ok: true, campaign });
+  }
+
+  /**
+   * A catalog entry may reuse only this account's ready images. Without this a
+   * product could name another account's media id and an ad would later render
+   * it, so ownership is checked before the row is written.
+   */
+  async function assertProductMediaOwned(
+    ownerId: string,
+    assetMediaIds: string[],
+    logoMediaId: string | null,
+  ): Promise<Map<string, { kind: MediaKind; projectId: string }>> {
+    const wanted = [...new Set([...assetMediaIds, ...(logoMediaId ? [logoMediaId] : [])])];
+    if (wanted.length === 0) return new Map();
+    const ready = await requireMediaStore().readyOwnedMedia(ownerId, wanted);
+    const missing = wanted.find((id) => !ready.has(id));
+    if (missing) {
+      throw new HttpError(
+        422,
+        "PRODUCT_ASSET_INVALID",
+        `Media ${missing} is not ready media owned by this account.`,
+      );
+    }
+    const nonImage = wanted.find((id) => ready.get(id)?.kind !== "image");
+    if (nonImage) {
+      throw new HttpError(
+        422,
+        "PRODUCT_ASSET_INVALID",
+        `Media ${nonImage} must be an image; product assets and the logo are packaging or product photography.`,
+      );
+    }
+    return ready;
+  }
+
+  /**
+   * A snapshot is only as trustworthy as the media behind it. A project delete
+   * can cascade media rows away while a catalog entry still lists their ids, so
+   * readiness is rechecked before a paid generation and again before a manifest
+   * is frozen; otherwise an approved ad could name an image that no longer exists.
+   */
+  async function assertSnapshotMediaReady(
+    ownerId: string,
+    mediaIds: string[],
+    message: string,
+  ): Promise<void> {
+    if (mediaIds.length === 0) return;
+    const ready = await requireMediaStore().readyOwnedMedia(ownerId, mediaIds);
+    const missing = mediaIds.find((id) => ready.get(id)?.kind !== "image");
+    if (missing) throw new HttpError(409, "AD_CONCEPT_MEDIA_INVALID", message);
+  }
+
+  /** Scenes may only reference ready media that lives in the project they render from. */
+  async function assertManifestMediaInProject(
+    ownerId: string,
+    projectId: string,
+    mediaIds: string[],
+  ): Promise<void> {
+    if (mediaIds.length === 0) return;
+    const ready = await requireMediaStore().readyAssetIds(ownerId, projectId, mediaIds);
+    if (mediaIds.some((id) => !ready.has(id))) {
+      throw new HttpError(
+        409,
+        "AD_CONCEPT_MEDIA_INVALID",
+        "A beat or logo image is no longer ready media in the campaign's project. Keep the product's ready images in that project before applying the manifest.",
+      );
+    }
+  }
+
+  /**
+   * A reference keeps the media sweep from retiring a product image as
+   * unreferenced. The product id is generated here so the references can
+   * exist before the product row does; a failed write removes them again.
+   */
+  async function createProductWithReferences(
+    ownerId: string,
+    write: Parameters<ProductStore["createProduct"]>[1],
+  ) {
+    const store = requireCatalog();
+    const owned = await assertProductMediaOwned(ownerId, write.assetMediaIds ?? [], write.logoMediaId ?? null);
+    const productId = randomUUID();
+    const mediaStore = owned.size > 0 ? requireMediaStore() : null;
+    const references: { mediaId: string; projectId: string; referenceId: string }[] = [];
+    try {
+      if (mediaStore) {
+        for (const [mediaId, asset] of owned) {
+          const reference = await mediaStore.addReference(ownerId, asset.projectId, mediaId, {
+            refKind: "other",
+            refId: productId,
+          });
+          references.push({ mediaId, projectId: asset.projectId, referenceId: reference.id });
+        }
+      }
+      return await store.createProduct(ownerId, write, productId);
+    } catch (error) {
+      if (mediaStore) {
+        for (const reference of references) {
+          await mediaStore
+            .removeReference(ownerId, reference.projectId, reference.mediaId, reference.referenceId)
+            .catch(() => undefined);
+        }
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * A product correction must not orphan a removed image or strand a new one.
+   * New references are written before the row so the product never names an
+   * unprotected image; references for removed images are released afterwards,
+   * because a stale reference only delays retention while a missing one is
+   * unsafe. Claim ids are preserved by `parseProductUpdate` for unchanged text.
+   */
+  async function updateProductWithReferences(
+    ownerId: string,
+    existing: ProductRecord,
+    write: ProductWriteWithClaims,
+  ): Promise<ProductRecord> {
+    const store = requireCatalog();
+    const oldMediaIds = new Set([
+      ...existing.assetMediaIds,
+      ...(existing.logoMediaId ? [existing.logoMediaId] : []),
+    ]);
+    const newMediaIds = new Set([
+      ...write.assetMediaIds,
+      ...(write.logoMediaId ? [write.logoMediaId] : []),
+    ]);
+    const added = [...newMediaIds].filter((mediaId) => !oldMediaIds.has(mediaId));
+    const removed = [...oldMediaIds].filter((mediaId) => !newMediaIds.has(mediaId));
+    const owned = added.length > 0 ? await assertProductMediaOwned(ownerId, added, null) : new Map();
+    const referenceStore = added.length > 0 || removed.length > 0 ? requireMediaStore() : null;
+    const oldReferences = referenceStore
+      ? await referenceStore.listTargetReferences(ownerId, "other", existing.id)
+      : [];
+    const oldReferencesByMedia = new Map(oldReferences.map((reference) => [reference.mediaId, reference]));
+    const addedReferences: { mediaId: string; projectId: string; referenceId: string }[] = [];
+
+    try {
+      if (referenceStore) {
+        for (const mediaId of added) {
+          const asset = owned.get(mediaId);
+          if (!asset) {
+            throw new HttpError(
+              422,
+              "PRODUCT_ASSET_INVALID",
+              `Media ${mediaId} is not ready media owned by this account.`,
+            );
+          }
+          const reference = await referenceStore.addReference(ownerId, asset.projectId, mediaId, {
+            refKind: "other",
+            refId: existing.id,
+          });
+          // A stale reference may already name this image even though the row
+          // did not; keep it on rollback because it was not added here.
+          if (!oldReferencesByMedia.has(mediaId)) {
+            addedReferences.push({ mediaId, projectId: asset.projectId, referenceId: reference.id });
+          }
+        }
+      }
+
+      const updated = await store.updateProduct(ownerId, existing.id, write);
+      if (!updated) throw new HttpError(404, "PRODUCT_NOT_FOUND", PRODUCT_NOT_FOUND_MESSAGE);
+
+      if (referenceStore) {
+        for (const mediaId of removed) {
+          const reference = oldReferencesByMedia.get(mediaId);
+          if (!reference) continue;
+          await referenceStore
+            .removeReference(ownerId, reference.projectId, mediaId, reference.id)
+            .catch(() => log.error("[catalog] PRODUCT_MEDIA_REFERENCE_RELEASE_FAILED"));
+        }
+      }
+      return updated;
+    } catch (error) {
+      if (referenceStore) {
+        for (const reference of addedReferences) {
+          await referenceStore
+            .removeReference(ownerId, reference.projectId, reference.mediaId, reference.referenceId)
+            .catch(() => undefined);
+        }
+      }
+      throw error;
+    }
+  }
+
+  async function handleAdConceptGenerate(
+    request: IncomingMessage,
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    productId: string,
+  ): Promise<void> {
+    const catalog = requireCatalog();
+    const store = requireAdConcepts();
+    const usageLedger = requireLedger();
+    const product = await catalog.getProduct(user.id, productId);
+    if (!product) throw new HttpError(404, "PRODUCT_NOT_FOUND", PRODUCT_NOT_FOUND_MESSAGE);
+
+    const body = parseAdConceptGenerateRequest(await readJsonBody(request, AD_CONCEPT_LIMITS.bodyBytes));
+    const campaign = await catalog.getCampaign(user.id, body.campaignId);
+    if (!campaign) throw new HttpError(404, "CAMPAIGN_NOT_FOUND", CAMPAIGN_NOT_FOUND_MESSAGE);
+    if (campaign.productId !== product.id) {
+      throw new HttpError(
+        400,
+        "CAMPAIGN_PRODUCT_MISMATCH",
+        "campaignId must name a campaign for this product.",
+      );
+    }
+
+    const route = findPlanningRoute(config.planning.routes, "ad-concept");
+    if (!route || !route.available || !route.requestId) {
+      throw new HttpError(
+        503,
+        "PLANNING_ROUTE_UNAVAILABLE",
+        route?.reason ?? "No model is configured for the ad-concept route.",
+      );
+    }
+    if (!config.apiKey) {
+      throw new HttpError(
+        503,
+        "PROVIDER_NOT_CONFIGURED",
+        "OLLAMA_API_KEY is not configured on the server. Add it to the server environment and restart.",
+      );
+    }
+
+    // The snapshot is what the model and the later manifest both read. Editing
+    // the catalog after this point cannot change what was generated or chosen.
+    const modelId = route.modelId ?? "unknown";
+    const snapshot = buildAdSnapshot(product, campaign, new Date(now()).toISOString());
+    const snapshotHash = hashAdSnapshot(snapshot);
+    // A stale catalog entry must not cost a provider call or store a snapshot
+    // that no manifest could legally be built from.
+    await assertSnapshotMediaReady(
+      user.id,
+      snapshotMediaIds(snapshot),
+      "The product lists an image that is no longer ready media owned by this account. Upload it again or remove the id before generating concepts.",
+    );
+    const prompt = buildAdConceptPrompt(snapshot, body.instruction, route.inputLimitChars);
+    const requestHash = hashRequest(
+      `ad-concept:${route.requestId}:${product.id}:${campaign.id}`,
+      prompt,
+    );
+    const idempotencyKey = readIdempotencyKey(request);
+
+    beginProviderRequest(user.id);
+    try {
+      let reservation: ReservationResult;
+      try {
+        reservation = await usageLedger.reserve({
+          userId: user.id,
+          idempotencyKey,
+          requestHash,
+          modelId,
+          configuredModel: route.requestId,
+        });
+      } catch (error) {
+        if (error instanceof UsageLedgerError) {
+          throw new HttpError(
+            503,
+            "LEDGER_UNAVAILABLE",
+            "The usage ledger is not ready. Apply the ai_usage migrations and check SUPABASE_SERVICE_ROLE_KEY.",
+          );
+        }
+        throw error;
+      }
+
+      if (reservation.state === "existing") {
+        try {
+          await replayReservation(usageLedger, user, idempotencyKey, requestHash, response, reservation.usage);
+        } catch (error) {
+          if (error instanceof UsageLedgerError) {
+            throw new HttpError(503, "LEDGER_UNAVAILABLE", "The usage ledger is temporarily unavailable.");
+          }
+          throw error;
+        }
+        return;
+      }
+      if (reservation.state === "project_busy") {
+        throw new HttpError(
+          409,
+          "AD_CONCEPT_ATTEMPT_IN_FLIGHT",
+          "Another ad-concept attempt for this product is already in progress.",
+        );
+      }
+
+      const startedAt = now();
+      let generation;
+      try {
+        generation = await generateAdConceptPayload({
+          requestId: route.requestId,
+          apiKey: config.apiKey,
+          prompt,
+          timeoutMs: config.providerTimeoutMs,
+          maxOutputTokens: route.outputTokenLimit,
+          fetchImpl,
+          snapshot,
+        });
+        await recordModelOutcome(modelId, "success");
+      } catch (error) {
+        const providerError = error instanceof ProviderError ? error : null;
+        const invalidError = error instanceof AdConceptInvalidError ? error : null;
+        const code = providerError?.code ?? (error instanceof ApiError ? error.code : "INTERNAL_ERROR");
+        const message = error instanceof Error ? error.message : "Unexpected server error.";
+        const status = providerError?.status ?? (error instanceof ApiError ? error.status : 500);
+        await recordModelOutcome(modelId, "failure", code);
+        await recordOutcome(usageLedger, user.id, reservation.id, {
+          status: "error",
+          returnedModel: invalidError?.returnedModel ?? null,
+          promptEvalCount: invalidError?.usage?.promptEvalCount ?? null,
+          evalCount: invalidError?.usage?.evalCount ?? null,
+          latencyMs: invalidError?.latencyMs ?? Math.max(0, now() - startedAt),
+          errorCode: code,
+          upstreamStatus: providerError?.upstreamStatus ?? null,
+          responseStatus: status,
+          responseBody: failure(code, message, providerError?.upstreamStatus),
+        });
+        throw error;
+      }
+
+      let conceptSet;
+      try {
+        conceptSet = await store.createAdConceptSet(user.id, {
+          productId: product.id,
+          campaignId: campaign.id,
+          snapshot,
+          snapshotHash,
+          modelId,
+          repairAttempted: generation.repairAttempted,
+          summary: generation.summary,
+          notes: generation.notes,
+          concepts: generation.concepts,
+        });
+      } catch (error) {
+        await recordOutcome(usageLedger, user.id, reservation.id, {
+          status: "error",
+          returnedModel: generation.returnedModel,
+          promptEvalCount: generation.usage.promptEvalCount,
+          evalCount: generation.usage.evalCount,
+          latencyMs: generation.latencyMs,
+          errorCode: "AD_CONCEPT_WRITE_FAILED",
+          responseStatus: 500,
+          responseBody: failure(
+            "AD_CONCEPT_WRITE_FAILED",
+            error instanceof Error ? error.message : "The ad concepts could not be stored.",
+          ),
+        });
+        throw error;
+      }
+
+      const successBody = { ok: true as const, conceptSet };
+      const recorded = await recordOutcome(usageLedger, user.id, reservation.id, {
+        status: "success",
+        returnedModel: generation.returnedModel,
+        promptEvalCount: generation.usage.promptEvalCount,
+        evalCount: generation.usage.evalCount,
+        latencyMs: generation.latencyMs,
+        responseStatus: 201,
+        responseBody: successBody,
+      });
+      sendJson(response, 201, successBody, recorded ? undefined : { "X-Storyframe-Usage": "unrecorded" });
+    } finally {
+      endProviderRequest(user.id);
+    }
+  }
+
+  /**
+   * Turns the frozen manifest into the project it belongs to. The campaign's
+   * project is the render destination and the only project whose media can be
+   * used, so a product image that was deleted or lives elsewhere is refused
+   * before any scene is written. Each beat becomes an approved scene, which is
+   * what the existing video export reads, and applying the same manifest again
+   * replaces only its own scenes.
+   */
+  async function handleAdConceptProject(
+    response: ServerResponse,
+    user: AuthenticatedUser,
+    conceptSetId: string,
+  ): Promise<void> {
+    const conceptSet = await requireAdConcepts().getAdConceptSet(user.id, conceptSetId);
+    if (!conceptSet) {
+      throw new HttpError(404, "AD_CONCEPT_NOT_FOUND", AD_CONCEPT_NOT_FOUND_MESSAGE);
+    }
+    if (conceptSet.status !== "selected" || !conceptSet.manifest) {
+      throw new HttpError(
+        409,
+        "AD_CONCEPT_NOT_SELECTED",
+        "Select a concept before applying its manifest to a project.",
+      );
+    }
+    if (hashAdSnapshot(conceptSet.snapshot) !== conceptSet.snapshotHash) {
+      throw new HttpError(
+        503,
+        "AD_CONCEPT_SNAPSHOT_INVALID",
+        "The frozen product snapshot does not match its recorded hash.",
+      );
+    }
+    const manifest = conceptSet.manifest;
+    if (!manifest.projectId) {
+      throw new HttpError(
+        409,
+        "AD_CONCEPT_PROJECT_REQUIRED",
+        "This campaign does not name a project. Set the campaign's projectId so the ad renders into the project that holds its product images.",
+      );
+    }
+
+    const store = requireProjects();
+    const project = await store.get(user.id, manifest.projectId);
+    await assertManifestMediaInProject(user.id, project.id, manifestMediaIds(manifest));
+
+    const document = mergeAdConceptScenes(project.document, manifest);
+    assertSceneLocks(project.document, document);
+    await assertReadySceneAssets(user.id, project.id, document);
+    const updated = await store.update(user.id, project.id, {
+      title: project.title,
+      document: parseDocument(document),
+      version: project.version,
+    });
+    sendJson(response, 200, { ok: true, project: updated, projectRevision: updated.version });
+  }
+
+  async function handleAdConcepts(
+    request: IncomingMessage,
+    response: ServerResponse,
+    path: string,
+    requestUrl: URL,
+  ): Promise<void> {
+    checkOrigin(request);
+    const user = await authenticate(request);
+    const store = requireAdConcepts();
+    const method = request.method ?? "GET";
+
+    if (path === "/api/ad-concepts") {
+      if (method !== "GET") {
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for this endpoint.");
+      }
+      const productId = requestUrl.searchParams.get("productId");
+      if (productId !== null) {
+        if (!isProductId(productId) || !(await requireCatalog().getProduct(user.id, productId))) {
+          throw new HttpError(404, "PRODUCT_NOT_FOUND", PRODUCT_NOT_FOUND_MESSAGE);
+        }
+      }
+      const conceptSets = await store.listAdConceptSets(user.id, productId ?? undefined);
+      sendJson(response, 200, { ok: true, conceptSets });
+      return;
+    }
+
+    const rest = path.slice("/api/ad-concepts/".length);
+    if (rest.endsWith("/select")) {
+      if (method !== "POST") {
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to select a concept.");
+      }
+      const conceptSetId = rest.slice(0, -"select".length - 1);
+      if (!isProductId(conceptSetId)) {
+        throw new HttpError(404, "AD_CONCEPT_NOT_FOUND", AD_CONCEPT_NOT_FOUND_MESSAGE);
+      }
+      const conceptSet = await store.getAdConceptSet(user.id, conceptSetId);
+      if (!conceptSet) {
+        throw new HttpError(404, "AD_CONCEPT_NOT_FOUND", AD_CONCEPT_NOT_FOUND_MESSAGE);
+      }
+      const selection = parseAdConceptSelectRequest(await readJsonBody(request, AD_CONCEPT_LIMITS.bodyBytes));
+      if (selection.index < 0 || selection.index >= conceptSet.concepts.length) {
+        throw new HttpError(
+          400,
+          "INVALID_AD_CONCEPT_SELECTION",
+          `index must be from 0 to ${conceptSet.concepts.length - 1}.`,
+        );
+      }
+      if (conceptSet.status === "selected") {
+        if (conceptSet.selectedIndex === selection.index) {
+          sendJson(response, 200, { ok: true, conceptSet });
+          return;
+        }
+        throw new HttpError(
+          409,
+          "AD_CONCEPT_ALREADY_SELECTED",
+          "This set already has a selected concept. Generate a new set to choose a different one.",
+        );
+      }
+      if (hashAdSnapshot(conceptSet.snapshot) !== conceptSet.snapshotHash) {
+        throw new HttpError(
+          503,
+          "AD_CONCEPT_SNAPSHOT_INVALID",
+          "The frozen product snapshot does not match its recorded hash.",
+        );
+      }
+      // Freezing a manifest freezes its media ids too, so every one of them
+      // must still be this account's ready image at this moment.
+      await assertSnapshotMediaReady(
+        user.id,
+        snapshotMediaIds(conceptSet.snapshot),
+        "An image in this frozen snapshot is no longer ready media owned by this account, so no manifest can be built from it. Upload the image again to generate a new set.",
+      );
+
+      const chosen = conceptSet.concepts[selection.index];
+      if (!chosen) {
+        throw new HttpError(400, "INVALID_AD_CONCEPT_SELECTION", "That concept index is not in this set.");
+      }
+      const selectedAt = new Date(now()).toISOString();
+      const manifest = buildAdManifest(
+        conceptSet.snapshot,
+        conceptSet.snapshotHash,
+        chosen,
+        selectedAt,
+      );
+      const selected = await store.selectAdConcept(
+        user.id,
+        conceptSet.id,
+        selection.index,
+        manifest,
+        selectedAt,
+      );
+      if (!selected) {
+        const current = await store.getAdConceptSet(user.id, conceptSet.id);
+        if (current?.status === "selected" && current.selectedIndex === selection.index) {
+          sendJson(response, 200, { ok: true, conceptSet: current });
+          return;
+        }
+        throw new HttpError(
+          409,
+          "AD_CONCEPT_ALREADY_SELECTED",
+          "This set already has a selected concept. Generate a new set to choose a different one.",
+        );
+      }
+      sendJson(response, 200, { ok: true, conceptSet: selected });
+      return;
+    }
+
+    if (rest.endsWith("/project")) {
+      if (method !== "POST") {
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to apply a manifest to its project.");
+      }
+      const conceptSetId = rest.slice(0, -"project".length - 1);
+      if (!isProductId(conceptSetId)) {
+        throw new HttpError(404, "AD_CONCEPT_NOT_FOUND", AD_CONCEPT_NOT_FOUND_MESSAGE);
+      }
+      await handleAdConceptProject(response, user, conceptSetId);
+      return;
+    }
+
+    if (method !== "GET") {
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET for this endpoint.");
+    }
+    if (!isProductId(rest)) {
+      throw new HttpError(404, "AD_CONCEPT_NOT_FOUND", AD_CONCEPT_NOT_FOUND_MESSAGE);
+    }
+    const conceptSet = await store.getAdConceptSet(user.id, rest);
+    if (!conceptSet) {
+      throw new HttpError(404, "AD_CONCEPT_NOT_FOUND", AD_CONCEPT_NOT_FOUND_MESSAGE);
+    }
+    sendJson(response, 200, { ok: true, conceptSet });
+  }
+
   async function handleProjects(
     request: IncomingMessage,
     response: ServerResponse,
@@ -2233,6 +3068,17 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       return;
     }
     if (method === "DELETE") {
+      // A project delete cascades its media rows and their references, but the
+      // catalog product that named those images survives with the ids. Refuse
+      // that stranding, just as deleting one referenced image is refused, so a
+      // later concept can never be built from a missing product asset.
+      if (mediaStore && (await mediaStore.hasProjectTargetReferences(user.id, projectId))) {
+        throw new HttpError(
+          409,
+          "PROJECT_MEDIA_IN_USE",
+          "This project holds images that a catalog product still references. Delete that product to release its images before deleting the project.",
+        );
+      }
       // The rows cascade with the project, so their object keys are read first.
       // Cleanup is best effort after the delete: the alternative is a project
       // the caller cannot remove because the bucket is briefly unavailable.

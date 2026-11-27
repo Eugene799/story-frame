@@ -74,13 +74,29 @@ export interface PlanningModelDefinition {
 
 const ALL_ROUTES: PlanningRoute[] = [...PLANNING_ROUTES];
 
+/**
+ * The largest reply a planning model may be asked for. Ad-concept sets carry
+ * three concepts of up to six beats, so they need far more than the original
+ * 1,200-token bound; the smaller routes keep their own bound below.
+ */
+const PLANNING_MODEL_OUTPUT_TOKENS = 8000;
+
+/** Per-route reply bounds; these match each route's accepted JSON shape. */
+export const PLANNING_ROUTE_OUTPUT_LIMITS: Record<PlanningRoute, number> = {
+  angles: 1200,
+  script: 1200,
+  storyboard: 1200,
+  "ad-concept": 8000,
+  "transcript-analysis": 1200,
+};
+
 export const PLANNING_MODELS: readonly PlanningModelDefinition[] = [
   {
     id: "deepseek",
     family: "deepseek-v4.1-flash",
     capabilities: ALL_ROUTES,
     inputLimitChars: PLANNING_LIMITS.promptChars,
-    outputTokenLimit: 1200,
+    outputTokenLimit: PLANNING_MODEL_OUTPUT_TOKENS,
     costRateVersion: "unpriced",
     testedOn: null,
   },
@@ -89,7 +105,7 @@ export const PLANNING_MODELS: readonly PlanningModelDefinition[] = [
     family: "gemma4",
     capabilities: ALL_ROUTES,
     inputLimitChars: PLANNING_LIMITS.promptChars,
-    outputTokenLimit: 1200,
+    outputTokenLimit: PLANNING_MODEL_OUTPUT_TOKENS,
     costRateVersion: "unpriced",
     testedOn: null,
   },
@@ -98,7 +114,7 @@ export const PLANNING_MODELS: readonly PlanningModelDefinition[] = [
     family: "glm-5.3-flash",
     capabilities: ALL_ROUTES,
     inputLimitChars: PLANNING_LIMITS.promptChars,
-    outputTokenLimit: 1200,
+    outputTokenLimit: PLANNING_MODEL_OUTPUT_TOKENS,
     costRateVersion: "unpriced",
     testedOn: null,
   },
@@ -107,7 +123,7 @@ export const PLANNING_MODELS: readonly PlanningModelDefinition[] = [
     family: "gpt-oss",
     capabilities: ALL_ROUTES,
     inputLimitChars: PLANNING_LIMITS.promptChars,
-    outputTokenLimit: 1200,
+    outputTokenLimit: PLANNING_MODEL_OUTPUT_TOKENS,
     costRateVersion: "unpriced",
     testedOn: null,
   },
@@ -116,7 +132,7 @@ export const PLANNING_MODELS: readonly PlanningModelDefinition[] = [
     family: "minimax-m3.1-flash",
     capabilities: ALL_ROUTES,
     inputLimitChars: PLANNING_LIMITS.promptChars,
-    outputTokenLimit: 1200,
+    outputTokenLimit: PLANNING_MODEL_OUTPUT_TOKENS,
     costRateVersion: "unpriced",
     testedOn: null,
   },
@@ -184,7 +200,7 @@ export function resolvePlanningRoutes(
       available: true,
       reason: null,
       capabilities: definition.capabilities,
-      outputTokenLimit: definition.outputTokenLimit,
+      outputTokenLimit: Math.min(definition.outputTokenLimit, PLANNING_ROUTE_OUTPUT_LIMITS[route]),
       inputLimitChars: definition.inputLimitChars,
     };
   });
