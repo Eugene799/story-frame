@@ -2,6 +2,7 @@ node_modules/
 dist/
 dist-server/
 coverage/
+artifacts/
 *.log
 e2e-account-failure.png
 .DS_Store
