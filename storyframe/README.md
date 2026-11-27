@@ -572,13 +572,15 @@ needs the Supabase dashboard; the service-role key cannot edit URL configuration
 | `AUTH_TIMEOUT_MS` | Supabase Auth/ledger timeout (default 5000). |
 | `OLLAMA_MODEL_*` | Optional exact-request-id overrides for the six families. |
 | `AI_ROUTE_ANGLES`, `AI_ROUTE_SCRIPT`, `AI_ROUTE_STORYBOARD`, `AI_ROUTE_AD_CONCEPT`, `AI_ROUTE_TRANSCRIPT_ANALYSIS` | Planning route override, naming a family key from the allowlist (`gemma`, `deepseek`, `glm`, `gpt-oss`, `minimax`). The default for every route is `gemma`; a value that is unknown, disabled, or lacks the capability disables that route instead of falling back. |
-| `AI_TIMEOUT_MS`, `AI_MAX_PROMPT_CHARS`, `AI_MAX_OUTPUT_TOKENS`, `AI_MAX_REQUESTS_PER_MINUTE` | Optional bounds. |
+| `AI_TIMEOUT_MS`, `AI_MAX_PROMPT_CHARS`, `AI_MAX_BODY_BYTES`, `AI_MAX_OUTPUT_TOKENS`, `AI_MAX_REQUESTS_PER_MINUTE` | Optional bounds. `AI_MAX_BODY_BYTES` caps the JSON request body for `/api/ai/test` (default 4096; range 256–65536). |
 | `AI_ABANDON_AFTER_MS` | Age at which a pending reservation may be settled as abandoned instead of retried (default 90000, floored at the provider timeout plus three auth timeouts). Planning uses a wider floor of two provider timeouts plus three auth timeouts, covering its initial call and one repair. |
 | `APP_ORIGIN` | Optional additional origin restriction for API calls. |
 | `SMOKE_SUPABASE_ACCESS_TOKEN` | Only for `npm run smoke:live`; a valid session token. Never commit it. |
+| `HOST`, `PORT` | Server bind address and port. `HOST` defaults to `127.0.0.1`; `PORT` falls back to `8787` when unset. |
 | `R2_ENDPOINT` | R2 S3 endpoint (`https://<account-id>.r2.cloudflarestorage.com`). `CLOUDFLARE_S3_ENDPOINT_URL` is accepted as a fallback. |
 | `R2_BUCKET_NAME` | Private media bucket. `CLOUDFLARE_R2_BUCKET_NAME` is accepted as a fallback. |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 S3 credentials. Read only in the Node process; never sent to the browser. `CLOUDFLARE_ACCESS_ID` / `CLOUDFLARE_SECRET_ACCESS_KEY` are accepted as fallbacks. |
+| `CLOUDFLARE_API_TOKEN` | Optional R2 edit token used only by `npm run cors:preview`; never read by the running server. |
 | `MEDIA_IMAGE_MAX_BYTES`, `MEDIA_AUDIO_MAX_BYTES`, `MEDIA_VIDEO_MAX_BYTES` | Per-file bounds (defaults 10 MiB, 25 MiB, 200 MiB). |
 | `MEDIA_OWNER_STORAGE_BYTES` | Total pending + ready bytes per account (default 2 GiB). |
 | `MEDIA_UPLOAD_URL_SECONDS`, `MEDIA_DOWNLOAD_URL_SECONDS`, `MEDIA_UPLOAD_TTL_MS` | Presigned URL and upload-window lifetimes. |
@@ -1801,8 +1803,9 @@ as `BLOCKED` rather than as passes or failures, and the summary counts them sepa
 password-change, and expiry checks need no mail and always run.
 
 Supabase also rejects addresses on domains that cannot receive mail, so the sign-up step is `BLOCKED` by default.
-Set `E2E_SIGNUP_EMAIL` to a throwaway inbox you control to run it for real; the script deletes that account at the
-end, and never deletes an account that existed before the run.
+Set `E2E_SIGNUP_EMAIL` to a throwaway inbox you control to run the confirmation branch, and set
+`E2E_ACCOUNT_EMAIL` to a second throwaway inbox to send the reset-request mail to a real address. The script deletes
+the accounts it creates at the end, and never deletes an account that existed before the run.
 
 ## Security limitations
 

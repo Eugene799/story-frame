@@ -22,9 +22,13 @@ const stamp = Date.now().toString(36);
 // Supabase rejects addresses on domains that cannot receive mail, so the default
 // only exercises the failure path. Set E2E_SIGNUP_EMAIL to a throwaway inbox you
 // control (the script deletes the account it creates) to run the confirmation branch.
-const liveSignUpEmail = process.env.E2E_SIGNUP_EMAIL ?? `sf-e2e-live-${stamp}@storyframe-e2e.dev`;
+// Set E2E_ACCOUNT_EMAIL to a second throwaway inbox so the reset-request branch
+// also sends real recovery mail; both accounts are removed in the finally block.
+const signupEmailOverride = process.env.E2E_SIGNUP_EMAIL?.trim() || null;
+const accountEmailOverride = process.env.E2E_ACCOUNT_EMAIL?.trim() || null;
+const liveSignUpEmail = signupEmailOverride ?? `sf-e2e-live-${stamp}@storyframe-e2e.dev`;
 const reservedEmail = `sf-e2e-reserved-${stamp}@example.com`;
-const accountEmail = `sf-e2e-account-${stamp}@example.com`;
+const accountEmail = accountEmailOverride ?? `sf-e2e-account-${stamp}@example.com`;
 const unconfirmedEmail = `sf-e2e-unconfirmed-${stamp}@example.com`;
 const initialPassword = `Sf!${randomBytes(18).toString("base64url")}`;
 const newPassword = `Sf!${randomBytes(18).toString("base64url")}`;
@@ -87,6 +91,7 @@ async function deleteUsers() {
   // Include every address the run may have created even if its creation
   // response was lost, so a malformed reply cannot leave an account behind.
   const emails = [...new Set([...created.map((user) => user.email), accountEmail, unconfirmedEmail, liveSignUpEmail])];
+  const operatorEmails = new Set([signupEmailOverride, accountEmailOverride].filter(Boolean));
   for (const email of emails) {
     const label = email.split("@")[0];
     try {
@@ -102,9 +107,9 @@ async function deleteUsers() {
         report.push(`${label}=absent`);
         continue;
       }
-      // E2E_SIGNUP_EMAIL may point at an inbox the operator already uses: never
-      // delete an account this run did not create.
-      if (email === liveSignUpEmail && new Date(user.created_at) < startedAt) {
+      // E2E_SIGNUP_EMAIL and E2E_ACCOUNT_EMAIL may point at inboxes the operator
+      // already uses: never delete an account this run did not create.
+      if (operatorEmails.has(email) && new Date(user.created_at) < startedAt) {
         report.push(`${label}=pre-existing (left alone)`);
         continue;
       }
@@ -140,9 +145,12 @@ try {
   // not allowlisted, so an emailed recovery link would never reach this app. Ask
   // first, so a hosted run says why instead of looking like a broken flow.
   async function preflightRedirect(origin) {
+    // Use an account that is not the reset target: generate_link starts the same
+    // per-address cooldown as a real /recover request, which would make the next
+    // reset-request check fail with "only request this after 59 seconds".
     const { status, body } = await admin("/auth/v1/admin/generate_link", {
       method: "POST",
-      body: JSON.stringify({ type: "recovery", email: accountEmail, redirect_to: origin }),
+      body: JSON.stringify({ type: "recovery", email: unconfirmedEmail, redirect_to: origin }),
     });
     if (status !== 200) {
       console.log(`PREFLIGHT WARN generate_link failed with status=${status}; redirect target unknown`);
@@ -210,7 +218,9 @@ try {
   await page.getByLabel("Password").fill(initialPassword);
   await page.getByRole("button", { name: "Create account" }).click();
 
-  const notice = page.getByText(new RegExp(`Check ${liveSignUpEmail} for a confirmation link`));
+  // Plain text, not a RegExp: real inboxes use plus-addresses, and `+` is a
+  // quantifier that would stop the pattern from matching the rendered address.
+  const notice = page.getByText(`Check ${liveSignUpEmail} for a confirmation link`);
   const alert = page.getByRole("alert");
   await Promise.race([
     notice.waitFor({ timeout: 20000 }).catch(() => {}),
