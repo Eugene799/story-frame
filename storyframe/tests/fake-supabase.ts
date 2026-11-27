@@ -550,11 +550,13 @@ export async function startFakeSupabase(
           const id = eqFilter(url.searchParams.get("id"));
           const ownerId = eqFilter(url.searchParams.get("owner_id"));
           const projectId = eqFilter(url.searchParams.get("project_id"));
+          const revision = eqFilter(url.searchParams.get("revision"));
           let rows = table.filter(
             (row) =>
               (id === null || row.id === id) &&
               (ownerId === null || row.owner_id === ownerId) &&
-              (projectId === null || row.project_id === projectId),
+              (projectId === null || row.project_id === projectId) &&
+              (revision === null || String(row.revision) === revision),
           );
 
           const order = url.searchParams.get("order");

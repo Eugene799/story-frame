@@ -57,6 +57,7 @@ import type {
   ProjectRecord,
   ProjectResponse,
   ProjectRevisionListResponse,
+  ProjectRevisionRestoreResponse,
   ProjectRevisionSummary,
   ProjectSummary,
   ProjectType,
@@ -194,6 +195,20 @@ export async function listProjectRevisions(
   return (
     await authorizedJson<ProjectRevisionListResponse>(`/api/projects/${projectId}/revisions`, accessToken)
   ).revisions;
+}
+
+export async function restoreProjectRevision(
+  accessToken: string,
+  projectId: string,
+  revision: number,
+  version: number,
+): Promise<ProjectRecord> {
+  const body = await authorizedJson<ProjectRevisionRestoreResponse>(
+    `/api/projects/${projectId}/revisions/${revision}/restore`,
+    accessToken,
+    { method: "POST", body: { version } },
+  );
+  return body.project;
 }
 
 export async function listProjectMedia(accessToken: string, projectId: string): Promise<MediaRecord[]> {

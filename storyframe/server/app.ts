@@ -35,8 +35,11 @@ import {
   PROJECT_NOT_FOUND_MESSAGE,
   createSupabaseProjectStore,
   assertSceneLocks,
+  carrySceneLocks,
   isProjectId,
+  migrateDocument,
   parseProjectExportInput,
+  parseProjectRestore,
   parseProjectUpdate,
   parseProjectWrite,
   type ProjectStore,
@@ -1930,6 +1933,30 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
     throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use GET or PUT for this endpoint.");
   }
 
+  /** A saved document may only reference ready media owned by this project. */
+  async function assertReadySceneAssets(
+    ownerId: string,
+    projectId: string,
+    document: { scenes: { assetIds: string[] }[] },
+  ): Promise<void> {
+    const assetIds = [...new Set(document.scenes.flatMap((scene) => scene.assetIds))];
+    const malformed = assetIds.find((assetId) => !isMediaId(assetId));
+    if (malformed) {
+      throw new HttpError(422, "MEDIA_ASSET_INVALID", `Scene asset id ${malformed} is not a valid media id.`);
+    }
+    if (assetIds.length > 0) {
+      const ready = await requireMediaStore().readyAssetIds(ownerId, projectId, assetIds);
+      const unknown = assetIds.find((assetId) => !ready.has(assetId));
+      if (unknown) {
+        throw new HttpError(
+          422,
+          "MEDIA_ASSET_INVALID",
+          `Scene asset id ${unknown} is not ready media in this project.`,
+        );
+      }
+    }
+  }
+
   async function handleProjects(
     request: IncomingMessage,
     response: ServerResponse,
@@ -1979,6 +2006,41 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       await store.get(user.id, projectId);
       const revisions = await store.listRevisions(user.id, projectId, PROJECT_REVISIONS_LIMIT);
       sendJson(response, 200, { ok: true, revisions });
+      return;
+    }
+
+    if (segments.length === 4 && segments[1] === "revisions" && segments[3] === "restore") {
+      if (method !== "POST") {
+        throw new HttpError(405, "METHOD_NOT_ALLOWED", "Use POST to restore a saved revision.");
+      }
+      const revisionNumber = Number(segments[2]);
+      if (!Number.isInteger(revisionNumber) || revisionNumber < 1) {
+        throw new HttpError(404, "PROJECT_REVISION_NOT_FOUND", "No such saved revision exists for this project.");
+      }
+      const restore = parseProjectRestore(await readJsonBody(request, PROJECT_LIMITS.bodyBytes));
+      const current = await store.get(user.id, projectId);
+      if (current.version !== restore.version) {
+        throw new HttpError(
+          409,
+          "PROJECT_VERSION_CONFLICT",
+          "This project changed since you read it. Reload it before restoring a revision.",
+        );
+      }
+      const revision = await store.getRevision(user.id, projectId, revisionNumber);
+      const document = carrySceneLocks(
+        current.document,
+        migrateDocument(revision.schemaVersion, revision.document, current.projectType),
+      );
+      // Restoring is a normal write: component locks still win, and an old
+      // revision cannot reintroduce an asset that was since deleted.
+      assertSceneLocks(current.document, document);
+      await assertReadySceneAssets(user.id, projectId, document);
+      const project = await store.update(user.id, projectId, {
+        title: revision.title,
+        document,
+        version: current.version,
+      });
+      sendJson(response, 200, { ok: true, project, restoredFrom: revision.revision });
       return;
     }
 
@@ -2165,22 +2227,7 @@ export function createStoryframeServer(options: ServerOptions = {}): Server {
       // The document's scene asset ids are the other half of the media link.
       // Refuse a save that would store an id with no ready media behind it, so
       // an API write cannot create a dangling reference.
-      const assetIds = [...new Set(update.document.scenes.flatMap((scene) => scene.assetIds))];
-      const malformed = assetIds.find((assetId) => !isMediaId(assetId));
-      if (malformed) {
-        throw new HttpError(422, "MEDIA_ASSET_INVALID", `Scene asset id ${malformed} is not a valid media id.`);
-      }
-      if (assetIds.length > 0) {
-        const ready = await requireMediaStore().readyAssetIds(user.id, projectId, assetIds);
-        const unknown = assetIds.find((assetId) => !ready.has(assetId));
-        if (unknown) {
-          throw new HttpError(
-            422,
-            "MEDIA_ASSET_INVALID",
-            `Scene asset id ${unknown} is not ready media in this project.`,
-          );
-        }
-      }
+      await assertReadySceneAssets(user.id, projectId, update.document);
       const project = await store.update(user.id, projectId, update);
       sendJson(response, 200, { ok: true, project });
       return;

@@ -1,4 +1,4 @@
-# StoryFrame — Phase 9: dashboard, image, narration, video export, and lip sync
+# StoryFrame — Phase 10: complete story workflow
 
 This repository state keeps the Phase 2 pieces — a **server-verified Supabase session boundary**, a **durable,
 idempotent usage ledger**, and the **project data model** with owner-scoped access — and the Phase 3 **private media
@@ -8,7 +8,9 @@ validated JSON proposals for angles, scripts, storyboards, ad concepts, and tran
 accepted content. Phase 6 adds protected Pexels and Pixabay stock search with normalized previews, a durable shared
 cache, credited attribution, and server-mediated imports into project media. Phase 7 adds image generation (Cloudflare
 Workers AI or Leonardo), Phase 8 adds Deepgram narration with uploaded audio, Phase 9 adds JSON2Video export, and lip
-sync through Everypixel Labs renders a talking clip or portrait against an audio track.
+sync through Everypixel Labs renders a talking clip or portrait against an audio track. Phase 10 completes
+recoverable revision history, the pre-render media/narration checklist, and optional fiction continuity notes; its
+paid factual-and-fiction acceptance run passed on 2026-11-27 against hosted Supabase, R2, Deepgram, and JSON2Video.
 
 The account screens use real Supabase email/password sign-in, sign-up, and password recovery, and the signed-in
 workspace handles projects, media, planning, and exports. The Phase 1–2 connection-test screen remains a development
@@ -488,8 +490,8 @@ Afterwards, check the running server rather than assuming the schema is ready:
 2. With a real session token, read and write `GET/PUT /api/profile`, create one project, and
    list one child table. A `503` with `PROJECTS_UNAVAILABLE`, `PROFILE_UNAVAILABLE`, or
    `CHILD_STORE_UNAVAILABLE` means the hosted columns still do not match these files.
-3. Set `SMOKE_SUPABASE_ACCESS_TOKEN` to a session token and run `npm run smoke:live` (five
-   billable calls, described under Tests).
+3. Run `npm run smoke:live` (five billable calls, described under Tests). It creates and deletes
+   its own disposable Supabase user; no pre-existing session token is used.
 
 **The migration set through Phase 9 is applied to the configured project (`myrohtkfsuppcabedwmn`): the sixth on
 2026-11-24, the seventh and eighth (Phase 5) on 2026-11-25, the ninth through seventeenth (Phases 6–8) on 2026-11-25, and
@@ -575,7 +577,6 @@ needs the Supabase dashboard; the service-role key cannot edit URL configuration
 | `AI_TIMEOUT_MS`, `AI_MAX_PROMPT_CHARS`, `AI_MAX_BODY_BYTES`, `AI_MAX_OUTPUT_TOKENS`, `AI_MAX_REQUESTS_PER_MINUTE` | Optional bounds. `AI_MAX_BODY_BYTES` caps the JSON request body for `/api/ai/test` (default 4096; range 256–65536). |
 | `AI_ABANDON_AFTER_MS` | Age at which a pending reservation may be settled as abandoned instead of retried (default 90000, floored at the provider timeout plus three auth timeouts). Planning uses a wider floor of two provider timeouts plus three auth timeouts, covering its initial call and one repair. |
 | `APP_ORIGIN` | Optional additional origin restriction for API calls. |
-| `SMOKE_SUPABASE_ACCESS_TOKEN` | Only for `npm run smoke:live`; a valid session token. Never commit it. |
 | `HOST`, `PORT` | Server bind address and port. `HOST` defaults to `127.0.0.1`; `PORT` falls back to `8787` when unset. |
 | `R2_ENDPOINT` | R2 S3 endpoint (`https://<account-id>.r2.cloudflarestorage.com`). `CLOUDFLARE_S3_ENDPOINT_URL` is accepted as a fallback. |
 | `R2_BUCKET_NAME` | Private media bucket. `CLOUDFLARE_R2_BUCKET_NAME` is accepted as a fallback. |
@@ -746,7 +747,8 @@ document, while `version` is the optimistic concurrency token for the row.
 
 Document **schema 2** carries the brief (`topic`, `audience`, `goal`, factual/fiction, target duration, tone, preset,
 voice preference, planning budget) and scenes with a stable id, order, narration, visual direction, asset ids,
-on-screen text, duration, approval, approval fingerprint, and per-component locks. Stored schema 1 rows are upgraded
+on-screen text, duration, approval, approval fingerprint, per-component locks, and optional fiction continuity notes.
+Stored schema 1 rows are upgraded
 on read and written back as schema 2 on the next save; the migration adds empty visual/on-screen fields, zero
 durations, unlocked components, and a default brief rather than guessing content.
 
@@ -1010,8 +1012,73 @@ and then attached the same scene as an explicit reference, so the store counted 
 one and deletion could not be resolved from the UI. The upload now registers the scene link once, as the explicit
 reference; the row and the delete guard agree.
 
-**FAIL: none in the Phase 4 scope.** Restoring an old revision from Settings is not implemented; history is read-only
-in Phase 4.
+**FAIL: none in the Phase 4 scope.** Phase 4 history is read-only; the Phase 10 slice below adds explicit restore.
+
+## Phase 10: complete story workflow (2026-11-27)
+
+Phase 10 is the first phase after the Phase 9 export. The current slice adds the workflow safeguards that were still
+missing from the editor; it does not claim that the full factual and fiction acceptance runs have been repeated against
+a paid JSON2Video render.
+
+**Recoverable history.** Settings now restores any saved revision through
+`POST /api/projects/:id/revisions/:revision/restore` with the current `version`. The server reads the saved document,
+migrates it if it is older, carries the current component locks into the restored document and applies the normal lock
+check, verifies every listed scene asset is still ready media, and appends the restored document as a new version. It
+never rewrites the revision it came from.
+`tests/projects-v2.test.ts` covers restore, stale versions, unknown revisions, locked fields, and owner scoping;
+`tests/settings-panel.test.tsx` covers the confirmation flow and the new-version report.
+
+**Pre-render checklist.** Preview now reads the project's media rows and narration state before the export block. It
+names attached assets that are missing, pending, or deleted; lists scenes that will render as text-only cards; shows
+the narration duration measured from the stored audio beside the scene timeline; and states which saved revision the
+export will pin. It says explicitly that a text-only scene is not a missing-file error. `tests/pre-render-checklist.test.tsx`
+covers missing, pending, text-only, measured-duration, and snapshot reporting.
+
+**Fiction continuity notes.** A fiction brief can now carry character, setting, and continuity notes. They are optional
+in schema 2, so existing documents remain readable, and the server preserves them through saves, reloads, and revision
+restore. `tests/brief-panel.test.tsx` covers the fields; `tests/projects-v2.test.ts` covers persistence and rejects a
+partial notes object.
+
+**Already in the workflow.** Planning proposals keep sources, exact-quote claims, and unresolved claim status; locked
+components resist script and storyboard updates; exports include the exact document and stock credits. The existing
+Media tab's attach/detach flow is the selective-replacement path: attach the replacement to the scene, then detach the
+old asset; the saved document and media references move independently and a failed save keeps the link visible.
+
+**Paid acceptance (2026-11-27).** `npm run verify:phase10-live` drove one factual and one fiction project through
+the real routes against hosted Supabase and R2, with a real Deepgram narration and a real JSON2Video render for each
+accepted project. The fiction half of the combined run was refused before submission; that failed attempt cost a
+narration but no render credit, and the fiction rerun passed in full.
+
+| Run | Checks | Deepgram narration | JSON2Video | Cleanup evidence |
+| --- | --- | --- | --- | --- |
+| Factual | 20/20 | 139 chars, $0.00417 | 10 s, 10 credits | project DELETE 200, read 404, 0 media rows; user probe 404 |
+| Fiction, first attempt | 12/13, stopped at render acceptance | 106 chars, $0.00318 | 409 `VIDEO_NARRATION_OVERFLOW`, 0 credits | user probe 404; project removed in `finally`, not asserted |
+| Fiction, rerun | 18/18 | 106 chars, $0.00318 | 10 s, 10 credits | project DELETE 200, read 404, 0 media rows; user probe 404 |
+
+**Provider spend in the retained logs.** 351 Deepgram characters = **$0.01053** at the recorded Aura-2 rate of
+$0.03 per 1,000 characters (`deepgram-aura-2-2026-11-25`), and **20 JSON2Video credits** for the two accepted
+10-second renders at the recorded one-credit-per-output-second rate (`json2video-2026-11-25`). The refused fiction
+submission reserved and consumed no render credit. JSON2Video publishes no credits-to-USD rate, so no dollar figure is
+invented. Each project uploaded two 1×1 PNGs; the two accepted renders
+added one MP4 each. R2 storage and request charges are not separately metered here. Narration and video ledger rows
+were removed with the disposable user, so this table is the durable record of those calls. Earlier exploratory
+attempts from the same session are not itemized; the table covers only the runs whose output was retained in
+`/tmp/phase10-live.log` and `/tmp/phase10-live-fiction.log`.
+
+**Cleanup evidence.** Each completed run asserted that the project `DELETE` returned 200, a follow-up `GET` returned
+404, and a hosted `media_metadata` query for the project returned zero rows; after deleting the disposable auth user,
+a probe of `/auth/v1/admin/users/:id` returned 404. The exported MP4 was downloaded from private storage and matched
+the stored byte size before cleanup. The script does not list bucket keys independently, so object removal is
+evidenced by the project-delete path and zero media rows rather than a separate bucket listing. Each completed run
+also created and restored a revision, reloaded the saved document, downloaded the JSON/script export, and replaced a
+scene asset while the old one was released and deleted. The provider-free workflows and failure cases remain covered
+by the route and UI tests above.
+
+**Provider-free smoke workflow test.** `tests/smoke-live-cleanup.test.ts` runs the real `scripts/smoke-live.ts`
+against mocked Supabase endpoints and fails CI if the disposable user is not created, signed in, and deleted, or if
+its `ai_usage` rows survive. It also covers a failed sign-in, an account that survives deletion, leaked ledger rows,
+and an unavailable deletion probe. It spends nothing and makes no provider call; the paid-acceptance boundary above
+still requires the opt-in `smoke:live` run.
 
 ## Phase 5: six-model routing and AI planning (2026-11-25)
 
@@ -1718,18 +1785,21 @@ Coverage includes:
 ### Repeatable live smoke check
 
 ```bash
-SMOKE_SUPABASE_ACCESS_TOKEN=<valid session token> npm run smoke:live
+npm run smoke:live
 ```
 
 This check is **opt-in** and makes **five real requests** (one per enabled family), which count against your Ollama
-usage and write five ledger rows. It requires `OLLAMA_API_KEY` plus Supabase configuration in the environment or
-`storyframe/.env`, and a valid session token. It starts an isolated API server on an ephemeral loopback port, runs the
-five families sequentially, then reads `/api/ai/usage` to confirm the ledger is working. It then repeats one successful
-request with its original `Idempotency-Key`: the replay must return the same stored values and leave the ledger row
-count unchanged, which proves no second provider call was billed. Because `response_body` is JSONB, the comparison
-ignores object key order. It exits non-zero on failure, performs no retries, and never prints the provider key or
-session token. Nemotron is checked only for its disabled status and is
-never called.
+usage and write five ledger rows. It requires `OLLAMA_API_KEY` plus `SUPABASE_URL`,
+`SUPABASE_SERVICE_ROLE_KEY`, and `SUPABASE_PUBLISHABLE_KEY` (or the legacy `SUPABASE_ANON_KEY`) in the environment or
+`storyframe/.env`. It creates a confirmed disposable user with the admin API and signs in as that user, so no manual
+token is needed. It starts an isolated API server on an ephemeral loopback port, runs the five families sequentially,
+then reads `/api/ai/usage` to confirm the ledger is working and prints the row count and latest model/status. It then repeats
+one successful request with its original `Idempotency-Key`: the replay must return the same stored values and leave
+the ledger row count unchanged, which proves no second provider call was billed. Because `response_body` is JSONB, the
+comparison ignores object key order. It exits non-zero on failure, performs no retries, and never prints the provider
+key or session token. Unavailable models are listed for visibility and are never called. It deletes the disposable
+user afterwards and verifies both the account and its `ai_usage` rows are gone; that cascade also removes the five
+rows the run created.
 
 ### Provider-free live route checks
 
@@ -1854,7 +1924,8 @@ the accounts it creates at the end, and never deletes an account that existed be
   but durable quotas shared across instances, managed secret rotation, and hosted email delivery remain
   missing.
 - The workspace is single-user per project and has no conflict merging: a stale save is refused, the draft is kept,
-  and the caller must load the latest version. Revision history is read-only; restoring an old version is future work.
+  and the caller must load the latest version. Revision restore is explicit and appends a new version (Phase 10);
+  there is still no conflict merging.
 - Automatic scene generation is not implemented: scenes are authored by hand and use uploaded or generated media. Video
   rendering is implemented in Phase 9: the Preview tab submits the saved scene timeline to JSON2Video and stores the
   finished MP4 as a private media asset, and the lip-sync route renders a talking clip or portrait against an audio track

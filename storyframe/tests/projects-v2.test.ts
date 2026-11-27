@@ -5,6 +5,7 @@ import type {
   ProjectRecord,
   ProjectResponse,
   ProjectRevisionListResponse,
+  ProjectRevisionRestoreResponse,
 } from "../shared/project-contract";
 import { USER_A, USER_B } from "./fake-supabase";
 import { documentFixture, sceneFixture } from "./project-fixture";
@@ -234,6 +235,50 @@ describe("project document v2", () => {
     }
   });
 
+  it("preserves optional fiction continuity notes through save and reload", async () => {
+    const app = await startTestServer();
+
+    try {
+      const storyNotes = {
+        characters: "Mara wants the letter delivered; Elias wants it forgotten.",
+        setting: "Night train, winter 1912, gas lamps and frost.",
+        continuity: "The envelope stays sealed until scene three.",
+      };
+      const project = await createProject(app, documentFixture({ storyNotes }));
+      expect(project.document.storyNotes).toEqual(storyNotes);
+
+      const edited = clone(project.document);
+      edited.summary = "A later summary";
+      const saved = await saveProject(app, project, edited);
+      expect(saved.status).toBe(200);
+      const body = (await saved.json()) as ProjectResponse;
+      expect(body.project.document.storyNotes).toEqual(storyNotes);
+
+      const reloaded = await apiRequest(app.url, `/api/projects/${project.id}`);
+      expect(reloaded.status).toBe(200);
+      const reloadedBody = (await reloaded.json()) as ProjectResponse;
+      expect(reloadedBody.project.document.storyNotes).toEqual(storyNotes);
+
+      const malformed = await apiRequest(
+        app.url,
+        "/api/projects",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            projectType: "story",
+            title: "Malformed notes",
+            document: { ...documentFixture(), storyNotes: { characters: "only one field" } },
+          }),
+        },
+        USER_B.token,
+      );
+      expect(malformed.status).toBe(400);
+      expect(await malformed.json()).toMatchObject({ ok: false, error: { code: "INVALID_PROJECT" } });
+    } finally {
+      await app.close();
+    }
+  });
+
   it("keeps scene ids stable through reordering and refuses duplicate ids", async () => {
     const app = await startTestServer();
 
@@ -274,6 +319,112 @@ describe("project document v2", () => {
         ok: false,
         error: { code: "DUPLICATE_SCENE_ID" },
       });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("restores a saved revision as a new version without rewriting history", async () => {
+    const app = await startTestServer();
+
+    try {
+      const first = await createProject(
+        app,
+        documentFixture({ summary: "Revision one" }),
+      );
+
+      const secondDocument = clone(first.document);
+      secondDocument.summary = "Revision two";
+      secondDocument.scenes[0].body = "The courier opens the envelope.";
+      const second = await saveProject(app, first, secondDocument);
+      expect(second.status).toBe(200);
+      const atTwo = ((await second.json()) as ProjectResponse).project;
+
+      const thirdDocument = clone(atTwo.document);
+      thirdDocument.summary = "Revision three";
+      const third = await saveProject(app, atTwo, thirdDocument);
+      expect(third.status).toBe(200);
+      const atThree = ((await third.json()) as ProjectResponse).project;
+
+      const restored = await apiRequest(
+        app.url,
+        `/api/projects/${first.id}/revisions/1/restore`,
+        { method: "POST", body: JSON.stringify({ version: atThree.version }) },
+      );
+      expect(restored.status).toBe(200);
+      const body = (await restored.json()) as ProjectRevisionRestoreResponse;
+      expect(body.restoredFrom).toBe(1);
+      expect(body.project).toMatchObject({
+        version: 4,
+        title: first.title,
+        document: { summary: "Revision one" },
+      });
+      expect(body.project.document.scenes[0].body).toBe(first.document.scenes[0].body);
+      expect(app.supabase.revisions.map((revision) => revision.revision).sort((a, b) => a - b)).toEqual([
+        1, 2, 3, 4,
+      ]);
+      expect(app.supabase.revisions.find((revision) => revision.revision === 4)?.document).toMatchObject({
+        summary: "Revision one",
+      });
+
+      const stale = await apiRequest(
+        app.url,
+        `/api/projects/${first.id}/revisions/1/restore`,
+        { method: "POST", body: JSON.stringify({ version: atThree.version }) },
+      );
+      expect(stale.status).toBe(409);
+      expect(await stale.json()).toMatchObject({
+        ok: false,
+        error: { code: "PROJECT_VERSION_CONFLICT" },
+      });
+
+      const unknown = await apiRequest(
+        app.url,
+        `/api/projects/${first.id}/revisions/999/restore`,
+        { method: "POST", body: JSON.stringify({ version: 4 }) },
+      );
+      expect(unknown.status).toBe(404);
+      expect(await unknown.json()).toMatchObject({
+        ok: false,
+        error: { code: "PROJECT_REVISION_NOT_FOUND" },
+      });
+
+      // A lock on the current scene blocks a restore that would overwrite it.
+      const lockedDocument = clone(body.project.document);
+      lockedDocument.scenes[0].locks.narration = true;
+      const locked = await saveProject(app, body.project, lockedDocument);
+      expect(locked.status).toBe(200);
+      const atFive = ((await locked.json()) as ProjectResponse).project;
+      // Restoring content that matches the locked component keeps the current
+      // lock; the old revision cannot clear it just because it predates it.
+      const keptLock = await apiRequest(
+        app.url,
+        `/api/projects/${first.id}/revisions/1/restore`,
+        { method: "POST", body: JSON.stringify({ version: atFive.version }) },
+      );
+      expect(keptLock.status).toBe(200);
+      const atSix = ((await keptLock.json()) as ProjectRevisionRestoreResponse).project;
+      expect(atSix.version).toBe(6);
+      expect(atSix.document.scenes[0].locks.narration).toBe(true);
+
+      const blocked = await apiRequest(
+        app.url,
+        `/api/projects/${first.id}/revisions/2/restore`,
+        { method: "POST", body: JSON.stringify({ version: atSix.version }) },
+      );
+      expect(blocked.status).toBe(409);
+      expect(await blocked.json()).toMatchObject({
+        ok: false,
+        error: { code: "SCENE_FIELD_LOCKED" },
+      });
+
+      const foreign = await apiRequest(
+        app.url,
+        `/api/projects/${first.id}/revisions/1/restore`,
+        { method: "POST", body: JSON.stringify({ version: atSix.version }) },
+        USER_B.token,
+      );
+      expect(foreign.status).toBe(404);
     } finally {
       await app.close();
     }

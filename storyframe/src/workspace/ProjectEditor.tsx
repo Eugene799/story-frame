@@ -250,7 +250,12 @@ export function ProjectEditor({
 
       <div role="tabpanel" aria-label={TABS.find((item) => item.id === tab)?.label}>
         {tab === "brief" && (
-          <BriefPanel brief={draft.brief} onChange={(brief) => setDraft({ ...draft, brief })} />
+          <BriefPanel
+            brief={draft.brief}
+            storyNotes={draft.storyNotes}
+            onChange={(brief) => setDraft({ ...draft, brief })}
+            onStoryNotesChange={(storyNotes) => setDraft({ ...draft, storyNotes })}
+          />
         )}
         {tab === "sources" && (
           <SourcesPanel
@@ -328,7 +333,19 @@ export function ProjectEditor({
           />
         )}
         {tab === "settings" && (
-          <SettingsPanel project={saved} getAccessToken={getAccessToken} onDeleted={onDeleted} />
+          <SettingsPanel
+            project={saved}
+            getAccessToken={getAccessToken}
+            onDeleted={onDeleted}
+            onRestored={(restored) => {
+              setSaved(restored);
+              setDraft(restored.document);
+              setTitle(restored.title);
+              setConflict(false);
+              setNotice(`Restored a saved version as version ${restored.version}.`);
+              onSaved?.(restored);
+            }}
+          />
         )}
       </div>
     </div>

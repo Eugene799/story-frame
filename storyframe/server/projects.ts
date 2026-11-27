@@ -9,6 +9,7 @@ import {
   type ProjectRecord,
   type ProjectRevisionSummary,
   type ProjectScene,
+  type ProjectStoryNotes,
   type ProjectSummary,
   type ProjectType,
   type SceneLocks,
@@ -38,6 +39,7 @@ export const PROJECT_LIMITS = {
   briefGoalChars: 500,
   briefToneChars: 80,
   briefPresetChars: 80,
+  storyNoteChars: 8000,
   targetDurationMin: 5,
   targetDurationMax: 3600,
   planningBudgetMaxUsd: 10_000,
@@ -113,6 +115,34 @@ function parseLocks(value: unknown, label: string): SceneLocks {
     visualDirection: readBoolean(value.visualDirection, `${label}.visualDirection`),
     onScreenText: readBoolean(value.onScreenText, `${label}.onScreenText`),
     duration: readBoolean(value.duration, `${label}.duration`),
+  };
+}
+
+function parseStoryNotes(value: unknown): ProjectStoryNotes | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) {
+    throw new ApiError(400, "INVALID_PROJECT", "document.storyNotes must be an object when present.");
+  }
+  requireExactKeys(value, ["characters", "setting", "continuity"], "document.storyNotes");
+  return {
+    characters: readBoundedText(
+      value.characters,
+      "document.storyNotes.characters",
+      PROJECT_LIMITS.storyNoteChars,
+      true,
+    ),
+    setting: readBoundedText(
+      value.setting,
+      "document.storyNotes.setting",
+      PROJECT_LIMITS.storyNoteChars,
+      true,
+    ),
+    continuity: readBoundedText(
+      value.continuity,
+      "document.storyNotes.continuity",
+      PROJECT_LIMITS.storyNoteChars,
+      true,
+    ),
   };
 }
 
@@ -270,7 +300,7 @@ function parseDocumentValue(value: unknown): ProjectDocumentV2 {
   if (!isRecord(value)) {
     throw new ApiError(400, "INVALID_PROJECT", "document must be an object.");
   }
-  requireExactKeys(value, ["schemaVersion", "summary", "brief", "scenes"], "document");
+  requireExactKeys(value, ["schemaVersion", "summary", "brief", "scenes", "storyNotes"], "document");
 
   if (value.schemaVersion !== PROJECT_SCHEMA_VERSION) {
     throw new ApiError(
@@ -302,11 +332,13 @@ function parseDocumentValue(value: unknown): ProjectDocumentV2 {
     ids.add(scene.id);
   }
 
+  const storyNotes = parseStoryNotes(value.storyNotes);
   return {
     schemaVersion: PROJECT_SCHEMA_VERSION,
     summary,
     brief: parseBrief(value.brief),
     scenes: parsed,
+    ...(storyNotes === undefined ? {} : { storyNotes }),
   };
 }
 
@@ -427,6 +459,25 @@ export function assertSceneLocks(current: ProjectDocumentV2, next: ProjectDocume
   }
 }
 
+/**
+ * Locks are current user state, not part of a saved revision. Carrying them
+ * into the restored document means an old revision can never clear a lock; the
+ * normal lock check then decides whether its content may replace the current one.
+ */
+export function carrySceneLocks(
+  current: ProjectDocumentV2,
+  restored: ProjectDocumentV2,
+): ProjectDocumentV2 {
+  const locks = new Map(current.scenes.map((scene) => [scene.id, scene.locks]));
+  return {
+    ...restored,
+    scenes: restored.scenes.map((scene) => {
+      const currentLocks = locks.get(scene.id);
+      return currentLocks ? { ...scene, locks: currentLocks } : scene;
+    }),
+  };
+}
+
 export interface ProjectWrite {
   projectType: ProjectType;
   title: string;
@@ -439,6 +490,15 @@ export interface ProjectUpdate {
   version: number;
 }
 
+export interface ProjectRestore {
+  /** The current version the caller reviewed before restoring. */
+  version: number;
+}
+
+export interface ProjectRevisionRecord extends ProjectRevisionSummary {
+  document: unknown;
+}
+
 const PROJECT_TYPES: readonly ProjectType[] = ["story", "product-ad", "repurpose"];
 
 function readBody(body: unknown, allowed: readonly string[]): Record<string, unknown> {
@@ -447,6 +507,13 @@ function readBody(body: unknown, allowed: readonly string[]): Record<string, unk
   }
   requireExactKeys(body, allowed, "Request body");
   return body;
+}
+
+function parseVersion(value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new ApiError(400, "INVALID_PROJECT_VERSION", "version must be the integer version you last read.");
+  }
+  return value;
 }
 
 export function parseProjectWrite(input: unknown): ProjectWrite {
@@ -476,16 +543,15 @@ export function parseProjectExportInput(input: unknown): { title: string; docume
 export function parseProjectUpdate(input: unknown): ProjectUpdate {
   const body = readBody(input, ["title", "document", "version"]);
 
-  const version = body.version;
-  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
-    throw new ApiError(400, "INVALID_PROJECT_VERSION", "version must be the integer version you last read.");
-  }
-
   return {
     title: readBoundedText(body.title, "title", PROJECT_LIMITS.titleChars),
     document: parseDocument(body.document),
-    version,
+    version: parseVersion(body.version),
   };
+}
+
+export function parseProjectRestore(input: unknown): ProjectRestore {
+  return { version: parseVersion(readBody(input, ["version"]).version) };
 }
 
 export interface ProjectStore {
@@ -494,6 +560,7 @@ export interface ProjectStore {
   create(ownerId: string, write: ProjectWrite): Promise<ProjectRecord>;
   update(ownerId: string, projectId: string, update: ProjectUpdate): Promise<ProjectRecord>;
   listRevisions(ownerId: string, projectId: string, limit: number): Promise<ProjectRevisionSummary[]>;
+  getRevision(ownerId: string, projectId: string, revision: number): Promise<ProjectRevisionRecord>;
   remove(ownerId: string, projectId: string): Promise<void>;
 }
 
@@ -721,6 +788,35 @@ export function createSupabaseProjectStore(options: SupabaseProjectStoreOptions)
         ),
       );
       return found.map(toRevision);
+    },
+
+    async getRevision(
+      ownerId: string,
+      projectId: string,
+      revision: number,
+    ): Promise<ProjectRevisionRecord> {
+      const query = new URLSearchParams({
+        select: "revision,title,schema_version,document,created_at",
+        project_id: `eq.${projectId}`,
+        owner_id: `eq.${ownerId}`,
+        revision: `eq.${revision}`,
+        limit: "1",
+      });
+      const found = rows(
+        await request(
+          `${revisionsEndpoint}?${query}`,
+          { headers: { ...authHeaders, Accept: "application/json" } },
+          "the revision read",
+        ),
+      );
+      if (found.length === 0) {
+        throw new ApiError(
+          404,
+          "PROJECT_REVISION_NOT_FOUND",
+          `No saved revision ${revision} exists for this project.`,
+        );
+      }
+      return { ...toRevision(found[0]), document: found[0].document };
     },
 
     async remove(ownerId: string, projectId: string): Promise<void> {

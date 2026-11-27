@@ -42,12 +42,21 @@ export interface ProjectScene {
   locks: SceneLocks;
 }
 
-/** Document v2: Phase 4 brief, scenes, locks, and approvals. */
+/** Optional Phase 10 notes that must survive script and storyboard changes. */
+export interface ProjectStoryNotes {
+  characters: string;
+  setting: string;
+  continuity: string;
+}
+
+/** Document v2: Phase 4 brief, scenes, locks, approvals, and optional story notes. */
 export interface ProjectDocumentV2 {
   schemaVersion: 2;
   summary: string;
   brief: ProjectBrief;
   scenes: ProjectScene[];
+  /** Fiction notes are optional so existing schema 2 rows stay readable. */
+  storyNotes?: ProjectStoryNotes;
 }
 
 /** Document v1, kept so rows written before Phase 4 remain readable. */
@@ -99,4 +108,9 @@ export interface ProjectRevisionSummary {
 export interface ProjectRevisionListResponse {
   ok: true;
   revisions: ProjectRevisionSummary[];
+}
+
+/** Restoring a saved revision appends a new version; it never rewrites history. */
+export interface ProjectRevisionRestoreResponse extends ProjectResponse {
+  restoredFrom: number;
 }
