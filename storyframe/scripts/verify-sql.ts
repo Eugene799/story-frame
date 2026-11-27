@@ -34,6 +34,8 @@ const MIGRATIONS = [
   "20261126100000_create_video_usage.sql",
   "20261126110000_create_lipsync_exports.sql",
   "20261126120000_create_job_leases.sql",
+  "20261127090000_create_products_and_campaigns.sql",
+  "20261127120000_create_product_ad_concepts.sql",
 ];
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "supabase", "migrations");
 
@@ -42,6 +44,12 @@ const USER_B = "22222222-2222-4222-8222-222222222222";
 const PROJECT_A = "44444444-4444-4444-8444-444444444444";
 const PROJECT_B = "55555555-5555-4555-8555-555555555555";
 const PROJECT_C = "66666666-6666-4666-8666-666666666666";
+const PRODUCT_A = "77777777-7777-4777-8777-777777777777";
+const PRODUCT_B = "88888888-8888-4888-8888-888888888888";
+const CAMPAIGN_A = "99999999-9999-4999-8999-999999999999";
+const CAMPAIGN_B = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const CONCEPT_A = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const CONCEPT_B = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 
 const DOCUMENT = {
   schemaVersion: 1,
@@ -711,7 +719,78 @@ check("a second profile for the same user is rejected (23505)",
   (await errorCode(() => as("service_role", null,
     `insert into public.profiles (owner_id, workspace_name) values ($1, 'second')`, [USER_A]))) === "23505");
 
-// 10. Deleting a project cascades revisions and child rows, but preserves the
+// 10. The product catalog and campaigns keep the same owner boundary, and a
+// campaign belongs to both a product and (optionally) a project.
+await as("service_role", null,
+  `insert into public.products
+     (id, owner_id, name, variant, brand_settings, approved_claims, prohibited_wording)
+   values ($1, $2, 'Harbor Serum', '30 ml', '{"voice":"calm"}'::jsonb,
+     '[{"id":"claim-1","text":"Clinically tested","evidence":"LAB-26-04"}]'::jsonb,
+     '{cures,miracle}')`,
+  [PRODUCT_A, USER_A]);
+await as("service_role", null,
+  `insert into public.campaigns
+     (id, owner_id, product_id, project_id, audience, offer, price, currency,
+      promotion_start, promotion_end, timezone, cta, destination, duration_seconds, aspect_ratio)
+   values ($1, $2, $3, $4, 'Adults with sensitive skin', '20% off the starter kit', 24.50, 'USD',
+     '2026-12-01T00:00:00Z', '2026-12-15T00:00:00Z', 'America/New_York', 'Shop the kit',
+     'https://example.com/starter-kit', 15, '9:16')`,
+  [CAMPAIGN_A, USER_A, PRODUCT_A, PROJECT_A]);
+check("owner reads their own product",
+  (await count("products", "owner_id = $1", [USER_A], "authenticated", USER_A)) === 1);
+check("another account reads no products",
+  (await count("products", "owner_id = $1", [USER_A], "authenticated", USER_B)) === 0);
+check("owner reads their own campaign",
+  (await count("campaigns", "owner_id = $1", [USER_A], "authenticated", USER_A)) === 1);
+check("another account reads no campaigns",
+  (await count("campaigns", "owner_id = $1", [USER_A], "authenticated", USER_B)) === 0);
+check("authenticated product write is refused (42501)",
+  (await errorCode(() => as("authenticated", USER_A,
+    `insert into public.products (owner_id, name) values ($1, 'hijacked')`, [USER_B]))) === "42501");
+check("authenticated campaign write is refused (42501)",
+  (await errorCode(() => as("authenticated", USER_A,
+    `insert into public.campaigns
+       (owner_id, product_id, audience, offer, price, currency, timezone, cta, destination, duration_seconds, aspect_ratio)
+     values ($1, $2, 'a', 'b', 1, 'USD', 'UTC', 'c', 'https://example.com', 10, '1:1')`, [USER_B, PRODUCT_A]))) === "42501");
+check("a promotion window that ends before it starts is rejected (23514)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.campaigns
+       (owner_id, product_id, audience, offer, price, currency, promotion_start, promotion_end,
+        timezone, cta, destination, duration_seconds, aspect_ratio)
+     values ($1, $2, 'a', 'b', 1, 'USD', '2026-12-15T00:00:00Z', '2026-12-01T00:00:00Z',
+       'UTC', 'c', 'https://example.com', 10, '1:1')`, [USER_A, PRODUCT_A]))) === "23514");
+
+// 10b. An ad-concept set freezes one product and campaign, keeps three concepts,
+// and is readable only by its owner.
+await as("service_role", null,
+  `insert into public.product_ad_concepts
+     (id, owner_id, product_id, campaign_id, status, snapshot, snapshot_hash, model_id, concepts)
+   values ($1, $2, $3, $4, 'proposed', '{"version":1}'::jsonb, $5, 'gemma', '[{},{},{}]'::jsonb)`,
+  [CONCEPT_A, USER_A, PRODUCT_A, CAMPAIGN_A, "a".repeat(64)]);
+check("owner reads their own ad-concept set",
+  (await count("product_ad_concepts", "owner_id = $1", [USER_A], "authenticated", USER_A)) === 1);
+check("another account reads no ad-concept sets",
+  (await count("product_ad_concepts", "owner_id = $1", [USER_A], "authenticated", USER_B)) === 0);
+check("authenticated ad-concept write is refused (42501)",
+  (await errorCode(() => as("authenticated", USER_A,
+    `insert into public.product_ad_concepts
+       (owner_id, product_id, campaign_id, snapshot, snapshot_hash, model_id, concepts)
+     values ($1, $2, $3, '{}'::jsonb, $4, 'gemma', '[{},{},{}]'::jsonb)`,
+    [USER_B, PRODUCT_A, CAMPAIGN_A, "b".repeat(64)]))) === "42501");
+check("a set must hold exactly three concepts (23514)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.product_ad_concepts
+       (owner_id, product_id, campaign_id, snapshot, snapshot_hash, model_id, concepts)
+     values ($1, $2, $3, '{}'::jsonb, $4, 'gemma', '[{}]'::jsonb)`,
+    [USER_A, PRODUCT_A, CAMPAIGN_A, "c".repeat(64)]))) === "23514");
+check("a selected set must name its concept and manifest (23514)",
+  (await errorCode(() => as("service_role", null,
+    `insert into public.product_ad_concepts
+       (owner_id, product_id, campaign_id, status, snapshot, snapshot_hash, model_id, concepts)
+     values ($1, $2, $3, 'selected', '{}'::jsonb, $4, 'gemma', '[{},{},{}]'::jsonb)`,
+    [USER_A, PRODUCT_A, CAMPAIGN_A, "d".repeat(64)]))) === "23514");
+
+// 11. Deleting a project cascades revisions and child rows, but preserves the
 // Deepgram ledger so deleting a project cannot reset the spending guard.
 await as("service_role", null, "delete from public.projects where id = $1 and owner_id = $2", [PROJECT_A, USER_A]);
 check("deleting the project removed its narration tracks",
@@ -730,8 +809,18 @@ for (const child of CHILD_ROWS) {
 }
 check("deleting the project removed its media references",
   (await count("media_references", "project_id = $1", [PROJECT_A])) === 0);
+check("deleting the project kept its campaign and cleared the project link",
+  (await count("campaigns", "id = $1 and project_id is null", [CAMPAIGN_A])) === 1);
+check("deleting the project kept its ad-concept set",
+  (await count("product_ad_concepts", "id = $1", [CONCEPT_A])) === 1);
+await as("service_role", null, "delete from public.products where id = $1", [PRODUCT_A]);
+check("deleting a product removed its campaigns",
+  (await count("campaigns", "owner_id = $1", [USER_A])) === 0);
+check("deleting a product removed its ad-concept sets",
+  (await count("product_ad_concepts", "owner_id = $1", [USER_A])) === 0);
 
-// 11. Deleting the auth user cascades projects, revisions, child rows and the profile.
+// 12. Deleting the auth user cascades projects, revisions, child rows, catalog
+// rows, and the profile.
 await as("service_role", null,
   `insert into public.projects (id, owner_id, project_type, title, schema_version, document)
    values ($1, $2, 'repurpose', 'Owned By B', 1, $3::jsonb)`,
@@ -752,6 +841,19 @@ await as("service_role", null,
      (owner_id, project_id, status, credits_estimate, credits_counted, rate_version)
    values ($1, $2, 'succeeded', 6, 6, 'json2video-2026-11-25')`,
   [USER_B, PROJECT_B]);
+await as("service_role", null,
+  `insert into public.products (id, owner_id, name) values ($1, $2, 'B product')`,
+  [PRODUCT_B, USER_B]);
+await as("service_role", null,
+  `insert into public.campaigns
+     (id, owner_id, product_id, audience, offer, price, currency, timezone, cta, destination, duration_seconds, aspect_ratio)
+   values ($1, $2, $3, 'B audience', 'B offer', 1, 'USD', 'UTC', 'Buy', 'https://example.com', 10, '1:1')`,
+  [CAMPAIGN_B, USER_B, PRODUCT_B]);
+await as("service_role", null,
+  `insert into public.product_ad_concepts
+     (id, owner_id, product_id, campaign_id, snapshot, snapshot_hash, model_id, concepts)
+   values ($1, $2, $3, $4, '{}'::jsonb, $5, 'gemma', '[{},{},{}]'::jsonb)`,
+  [CONCEPT_B, USER_B, PRODUCT_B, CAMPAIGN_B, "e".repeat(64)]);
 await db.exec(`delete from auth.users where id = '${USER_B}'`);
 check("deleting the auth user removed their projects",
   (await count("projects", "owner_id = $1", [USER_B])) === 0);
@@ -765,6 +867,12 @@ check("deleting the auth user removed their narration usage rows",
   (await count("narration_usage", "owner_id = $1", [USER_B])) === 0);
 check("deleting the auth user removed their video usage rows",
   (await count("video_usage", "owner_id = $1", [USER_B])) === 0);
+check("deleting the auth user removed their products",
+  (await count("products", "owner_id = $1", [USER_B])) === 0);
+check("deleting the auth user removed their campaigns",
+  (await count("campaigns", "owner_id = $1", [USER_B])) === 0);
+check("deleting the auth user removed their ad-concept sets",
+  (await count("product_ad_concepts", "owner_id = $1", [USER_B])) === 0);
 check("deleting the auth user removed their profile",
   (await count("profiles", "owner_id = $1", [USER_B])) === 0);
 

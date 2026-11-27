@@ -5,6 +5,8 @@ import type {
   MediaRecord,
   MediaReferenceRecord,
   MediaUploadTicket,
+  ReadyImageOption,
+  ReadyImagesResponse,
 } from "../shared/media-contract";
 import type {
   GenerationProposalRecord,
@@ -51,12 +53,31 @@ import type {
   ImageUsageSummary,
 } from "../shared/image-generation-contract";
 import type {
+  AdConceptListResponse,
+  AdConceptProjectResponse,
+  AdConceptResponse,
+  ProductAdConceptRecord,
+} from "../shared/ad-concept-contract";
+import type {
+  CampaignListResponse,
+  CampaignPatch,
+  CampaignRecord,
+  CampaignResponse,
+  CampaignWrite,
+  ProductListResponse,
+  ProductPatch,
+  ProductRecord,
+  ProductResponse,
+  ProductWrite,
+} from "../shared/product-contract";
+import type {
   ProjectDeletedResponse,
   ProjectDocumentV2,
   ProjectListResponse,
   ProjectRecord,
   ProjectResponse,
   ProjectRevisionListResponse,
+  ProjectRevisionRestoreResponse,
   ProjectRevisionSummary,
   ProjectSummary,
   ProjectType,
@@ -196,9 +217,28 @@ export async function listProjectRevisions(
   ).revisions;
 }
 
+export async function restoreProjectRevision(
+  accessToken: string,
+  projectId: string,
+  revision: number,
+  version: number,
+): Promise<ProjectRecord> {
+  const body = await authorizedJson<ProjectRevisionRestoreResponse>(
+    `/api/projects/${projectId}/revisions/${revision}/restore`,
+    accessToken,
+    { method: "POST", body: { version } },
+  );
+  return body.project;
+}
+
 export async function listProjectMedia(accessToken: string, projectId: string): Promise<MediaRecord[]> {
   return (await authorizedJson<{ ok: true; media: MediaRecord[] }>(`/api/projects/${projectId}/media`, accessToken))
     .media;
+}
+
+/** Every ready image this account owns, across its projects, newest first. */
+export async function listReadyImages(accessToken: string): Promise<ReadyImageOption[]> {
+  return (await authorizedJson<ReadyImagesResponse>("/api/media/images", accessToken)).images;
 }
 
 export interface MediaInitiation {
@@ -727,6 +767,131 @@ export async function getVideoExportPlayback(
     `/api/projects/${projectId}/exports/video/${exportId}/url`,
     accessToken,
   );
+}
+
+// ---- Phase 11: product catalog and grounded ad concepts ---------------------
+
+export async function listProducts(accessToken: string): Promise<ProductRecord[]> {
+  return (await authorizedJson<ProductListResponse>("/api/products", accessToken)).products;
+}
+
+export async function createProduct(accessToken: string, write: ProductWrite): Promise<ProductRecord> {
+  return (
+    await authorizedJson<ProductResponse>("/api/products", accessToken, {
+      method: "POST",
+      body: write,
+    })
+  ).product;
+}
+
+export async function updateProduct(
+  accessToken: string,
+  productId: string,
+  patch: ProductPatch,
+): Promise<ProductRecord> {
+  return (
+    await authorizedJson<ProductResponse>(`/api/products/${productId}`, accessToken, {
+      method: "PATCH",
+      body: patch,
+    })
+  ).product;
+}
+
+export async function deleteProduct(accessToken: string, productId: string): Promise<string> {
+  return (
+    await authorizedJson<{ ok: true; deletedId: string }>(`/api/products/${productId}`, accessToken, {
+      method: "DELETE",
+    })
+  ).deletedId;
+}
+
+export async function listCampaigns(
+  accessToken: string,
+  productId?: string,
+): Promise<CampaignRecord[]> {
+  const query = productId ? `?productId=${encodeURIComponent(productId)}` : "";
+  return (await authorizedJson<CampaignListResponse>(`/api/campaigns${query}`, accessToken)).campaigns;
+}
+
+export async function createCampaign(
+  accessToken: string,
+  write: CampaignWrite,
+): Promise<CampaignRecord> {
+  return (
+    await authorizedJson<CampaignResponse>("/api/campaigns", accessToken, {
+      method: "POST",
+      body: write,
+    })
+  ).campaign;
+}
+
+export async function updateCampaign(
+  accessToken: string,
+  campaignId: string,
+  patch: CampaignPatch,
+): Promise<CampaignRecord> {
+  return (
+    await authorizedJson<CampaignResponse>(`/api/campaigns/${campaignId}`, accessToken, {
+      method: "PATCH",
+      body: patch,
+    })
+  ).campaign;
+}
+
+export async function deleteCampaign(accessToken: string, campaignId: string): Promise<string> {
+  return (
+    await authorizedJson<{ ok: true; deletedId: string }>(`/api/campaigns/${campaignId}`, accessToken, {
+      method: "DELETE",
+    })
+  ).deletedId;
+}
+
+export async function listAdConceptSets(
+  accessToken: string,
+  productId?: string,
+): Promise<ProductAdConceptRecord[]> {
+  const query = productId ? `?productId=${encodeURIComponent(productId)}` : "";
+  return (await authorizedJson<AdConceptListResponse>(`/api/ad-concepts${query}`, accessToken)).conceptSets;
+}
+
+/** The key makes a retried click return the same paid generation. */
+export async function generateAdConcepts(
+  accessToken: string,
+  productId: string,
+  campaignId: string,
+  idempotencyKey: string,
+): Promise<ProductAdConceptRecord> {
+  return (
+    await authorizedJson<AdConceptResponse>(`/api/products/${productId}/ad-concepts`, accessToken, {
+      method: "POST",
+      body: { campaignId },
+      headers: { "Idempotency-Key": idempotencyKey },
+    })
+  ).conceptSet;
+}
+
+export async function selectAdConcept(
+  accessToken: string,
+  conceptSetId: string,
+  index: number,
+): Promise<ProductAdConceptRecord> {
+  return (
+    await authorizedJson<AdConceptResponse>(`/api/ad-concepts/${conceptSetId}/select`, accessToken, {
+      method: "POST",
+      body: { index },
+    })
+  ).conceptSet;
+}
+
+/** Saves the selected manifest's scenes into the campaign's project. */
+export async function applyAdConceptToProject(
+  accessToken: string,
+  conceptSetId: string,
+): Promise<AdConceptProjectResponse> {
+  return authorizedJson<AdConceptProjectResponse>(`/api/ad-concepts/${conceptSetId}/project`, accessToken, {
+    method: "POST",
+    body: {},
+  });
 }
 
 export interface AiTestOutcome {

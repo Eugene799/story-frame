@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { ProjectRecord, ProjectSummary, ProjectType } from "../../shared/project-contract";
 import { AiRequestError, createProject, getProject, listProjects } from "../api";
+import { CatalogPanel } from "./CatalogPanel";
 import { ProjectEditor } from "./ProjectEditor";
 import { PROJECT_TYPE_LABELS, createDocument } from "./model";
 
@@ -25,6 +26,7 @@ export function Workspace({ getAccessToken, onBusyChange }: WorkspaceProps) {
   const [createType, setCreateType] = useState<ProjectType>("story");
   const [creating, setCreating] = useState(false);
   const [openingId, setOpeningId] = useState<string | null>(null);
+  const [showCatalog, setShowCatalog] = useState(false);
 
   async function refresh() {
     try {
@@ -87,6 +89,29 @@ export function Workspace({ getAccessToken, onBusyChange }: WorkspaceProps) {
     }
   }
 
+  if (showCatalog) {
+    return (
+      <div className="workspace">
+        <section className="panel editor-header" aria-labelledby="catalog-page-heading">
+          <div className="editor-header-top">
+            <button
+              type="button"
+              className="button-secondary button-small"
+              onClick={() => setShowCatalog(false)}
+            >
+              Back to dashboard
+            </button>
+            <span className="status">Product ads</span>
+          </div>
+          <h2 id="catalog-page-heading" className="sr-only">
+            Product catalog
+          </h2>
+        </section>
+        <CatalogPanel getAccessToken={getAccessToken} onBusyChange={onBusyChange} />
+      </div>
+    );
+  }
+
   if (project) {
     return (
       <ProjectEditor
@@ -119,6 +144,12 @@ export function Workspace({ getAccessToken, onBusyChange }: WorkspaceProps) {
           Create a project to write the brief, script, and storyboard. Projects are private to your signed-in account
           and reopen with their saved version and history.
         </p>
+
+        <div className="button-row">
+          <button type="button" className="button-secondary" onClick={() => setShowCatalog(true)}>
+            Open product catalog
+          </button>
+        </div>
 
         <div className="create-row">
           <label className="field" htmlFor="create-type">

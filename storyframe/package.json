@@ -25,6 +25,7 @@
     "verify:claim-live": "tsx scripts/verify-claim-live.ts",
     "verify:narration-live": "tsx scripts/verify-narration-live.ts",
     "verify:video-live": "tsx scripts/verify-video-live.ts",
+    "verify:phase10-live": "tsx scripts/verify-phase10-live.ts",
     "verify:r2-live": "tsx scripts/verify-r2-live.ts",
     "cors:preview": "tsx scripts/set-preview-cors.ts",
     "preflight:deploy": "tsx scripts/preflight-deploy.ts",

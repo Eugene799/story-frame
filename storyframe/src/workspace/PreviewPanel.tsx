@@ -5,6 +5,7 @@ import { buildScriptText } from "../../shared/project-export";
 import { AiRequestError, exportProject } from "../api";
 import { formatDuration, totalDurationSeconds } from "./model";
 import { LipsyncPanel } from "./LipsyncPanel";
+import { PreRenderChecklist } from "./PreRenderChecklist";
 import { VideoExportSection } from "./VideoExportSection";
 
 interface PreviewPanelProps {
@@ -168,6 +169,14 @@ export function PreviewPanel({
           a credits block.
         </p>
       </div>
+
+      <PreRenderChecklist
+        projectId={projectId}
+        scenes={scenes}
+        projectVersion={projectVersion}
+        dirty={dirty}
+        getAccessToken={getAccessToken}
+      />
 
       <VideoExportSection
         projectId={projectId}

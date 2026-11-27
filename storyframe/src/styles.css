@@ -446,6 +446,85 @@ button:disabled {
   margin-bottom: 0;
 }
 
+.catalog-block {
+  border-top: 1px dashed var(--border);
+  margin-top: 1rem;
+  padding-top: 1rem;
+}
+
+.catalog-block h3 {
+  margin: 0 0 0.6rem;
+  font-size: 1rem;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.catalog-block h4 {
+  margin: 0.9rem 0 0.4rem;
+  font-size: 0.92rem;
+}
+
+.catalog-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.media-picker-field {
+  border: 0;
+  margin: 0 0 0.75rem;
+  padding: 0;
+}
+
+.media-picker {
+  display: grid;
+  gap: 0.35rem;
+  max-height: 14rem;
+  overflow: auto;
+  margin-bottom: 0.75rem;
+  padding: 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input);
+}
+
+.media-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  font-size: 0.85rem;
+}
+
+.media-option input {
+  margin-top: 0.2rem;
+}
+
+.claim-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(220px, 2fr) auto;
+  gap: 0.6rem;
+  align-items: end;
+  margin-bottom: 0.6rem;
+}
+
+@media (max-width: 720px) {
+  .claim-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+.catalog-block pre {
+  max-height: 22rem;
+  overflow: auto;
+  padding: 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input);
+  font-family: var(--mono);
+  font-size: 0.75rem;
+}
+
 .project-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));

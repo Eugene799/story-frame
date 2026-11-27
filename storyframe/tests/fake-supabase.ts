@@ -96,6 +96,9 @@ export interface FakeSupabase {
   narrationTracks: Record<string, unknown>[];
   narrationUsage: Record<string, unknown>[];
   videoUsage: Record<string, unknown>[];
+  products: Record<string, unknown>[];
+  campaigns: Record<string, unknown>[];
+  productAdConcepts: Record<string, unknown>[];
   /** One row per sweep name, mirroring `job_leases` and its claim RPC. */
   jobLeases: Record<string, unknown>[];
   /** Every claim that reached the fake, whether granted or refused. */
@@ -108,6 +111,8 @@ export interface FakeSupabaseOptions {
   failure?: "auth" | "reads" | "complete" | "stockCache";
   /** Fail the first N ledger writes with 500, to exercise completion retries. */
   failWrites?: number;
+  /** Fail the next N writes to one table with 500, to exercise rollback paths. */
+  failTableWrite?: { table: string; method: "POST" | "PATCH" | "DELETE"; count?: number };
   /** Make conditional updates match no rows, to exercise a lost takeover race. */
   loseConditionalUpdate?: boolean;
   /** Simulate the schema before the planning preflight migration. */
@@ -163,6 +168,9 @@ export async function startFakeSupabase(
   const narrationTracks: Record<string, unknown>[] = [];
   const narrationUsage: Record<string, unknown>[] = [];
   const videoUsage: Record<string, unknown>[] = [];
+  const products: Record<string, unknown>[] = [];
+  const campaigns: Record<string, unknown>[] = [];
+  const productAdConcepts: Record<string, unknown>[] = [];
   const jobLeases: Record<string, unknown>[] = [];
   const jobLeaseClaims: { name: string; holder: string; granted: boolean }[] = [];
   const childTables: Record<string, Record<string, unknown>[]> = {
@@ -180,8 +188,14 @@ export async function startFakeSupabase(
     narration_tracks: narrationTracks,
     narration_usage: narrationUsage,
     video_usage: videoUsage,
+    products,
+    campaigns,
+    product_ad_concepts: productAdConcepts,
   };
   let failWritesRemaining = options.failWrites ?? 0;
+  const failTableWrite = options.failTableWrite
+    ? { ...options.failTableWrite, remaining: options.failTableWrite.count ?? 1 }
+    : null;
 
   /** Mirrors the projects_record_revision trigger: one revision per accepted write. */
   function recordRevision(project: FakeProjectRow): void {
@@ -536,9 +550,11 @@ export async function startFakeSupabase(
             for (let position = data.length - 1; position >= 0; position -= 1) {
               if (data[position].project_id !== removed.id) continue;
               // Both spending ledgers survive a project delete so a replacement
-              // project cannot reset the rolling window.
-              if (table === "narration_usage" || table === "video_usage") data[position].project_id = null;
-              else data.splice(position, 1);
+              // project cannot reset the rolling window. A campaign survives too;
+              // its project reference is cleared, mirroring on delete set null.
+              if (table === "narration_usage" || table === "video_usage" || table === "campaigns") {
+                data[position].project_id = null;
+              } else data.splice(position, 1);
             }
           }
           reply(200, [removed]);
@@ -550,11 +566,13 @@ export async function startFakeSupabase(
           const id = eqFilter(url.searchParams.get("id"));
           const ownerId = eqFilter(url.searchParams.get("owner_id"));
           const projectId = eqFilter(url.searchParams.get("project_id"));
+          const revision = eqFilter(url.searchParams.get("revision"));
           let rows = table.filter(
             (row) =>
               (id === null || row.id === id) &&
               (ownerId === null || row.owner_id === ownerId) &&
-              (projectId === null || row.project_id === projectId),
+              (projectId === null || row.project_id === projectId) &&
+              (revision === null || String(row.revision) === revision),
           );
 
           const order = url.searchParams.get("order");
@@ -770,6 +788,16 @@ export async function startFakeSupabase(
             request.headers.authorization !== `Bearer ${SERVICE_ROLE_KEY}`
           ) {
             sendJson(response, 401, { message: "unauthorized" });
+            return;
+          }
+          if (
+            failTableWrite &&
+            failTableWrite.table === table &&
+            failTableWrite.method === request.method &&
+            failTableWrite.remaining > 0
+          ) {
+            failTableWrite.remaining -= 1;
+            sendJson(response, 500, { message: "simulated table write failure" });
             return;
           }
 
@@ -1030,7 +1058,10 @@ export async function startFakeSupabase(
             }
             for (const row of matched) {
               for (const [key, value] of Object.entries(body)) {
-                if (key === "id" || key === "project_id" || key === "owner_id") continue;
+                if (key === "id" || key === "owner_id") continue;
+                // A campaign's render project is mutable; other child rows keep
+                // their project binding fixed.
+                if (key === "project_id" && table !== "campaigns") continue;
                 row[key] = value;
               }
             }
@@ -1042,6 +1073,31 @@ export async function startFakeSupabase(
             const removed: Record<string, unknown>[] = [];
             for (let position = data.length - 1; position >= 0; position -= 1) {
               if (matches(data[position])) removed.push(...data.splice(position, 1));
+            }
+            // Mirrors the product cascades: campaigns and ad-concept sets go
+            // with the product, and each campaign's sets go with the campaign.
+            if (table === "products") {
+              const productIds = new Set(removed.map((row) => row.id));
+              const campaignIds = new Set(
+                campaigns.filter((row) => productIds.has(row.product_id)).map((row) => row.id),
+              );
+              for (let position = campaigns.length - 1; position >= 0; position -= 1) {
+                if (campaignIds.has(campaigns[position].id)) campaigns.splice(position, 1);
+              }
+              for (let position = productAdConcepts.length - 1; position >= 0; position -= 1) {
+                const row = productAdConcepts[position];
+                if (productIds.has(row.product_id) || campaignIds.has(row.campaign_id)) {
+                  productAdConcepts.splice(position, 1);
+                }
+              }
+            }
+            if (table === "campaigns") {
+              const campaignIds = new Set(removed.map((row) => row.id));
+              for (let position = productAdConcepts.length - 1; position >= 0; position -= 1) {
+                if (campaignIds.has(productAdConcepts[position].campaign_id)) {
+                  productAdConcepts.splice(position, 1);
+                }
+              }
             }
             reply(200, removed);
             return;
@@ -1114,6 +1170,9 @@ export async function startFakeSupabase(
     narrationTracks,
     narrationUsage,
     videoUsage,
+    products,
+    campaigns,
+    productAdConcepts,
     jobLeases,
     jobLeaseClaims,
     close: () =>

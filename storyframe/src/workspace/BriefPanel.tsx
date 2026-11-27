@@ -1,11 +1,43 @@
-import type { BriefMode, ProjectBrief, VoicePreference } from "../../shared/project-contract";
+import type {
+  BriefMode,
+  ProjectBrief,
+  ProjectStoryNotes,
+  VoicePreference,
+} from "../../shared/project-contract";
 
 interface BriefPanelProps {
   brief: ProjectBrief;
+  storyNotes?: ProjectStoryNotes;
   onChange: (brief: ProjectBrief) => void;
+  onStoryNotesChange: (notes: ProjectStoryNotes) => void;
 }
 
-export function BriefPanel({ brief, onChange }: BriefPanelProps) {
+const EMPTY_STORY_NOTES: ProjectStoryNotes = { characters: "", setting: "", continuity: "" };
+const STORY_NOTE_MAX_CHARS = 8000;
+const STORY_NOTE_FIELDS: {
+  key: keyof ProjectStoryNotes;
+  label: string;
+  placeholder: string;
+}[] = [
+  {
+    key: "characters",
+    label: "Characters",
+    placeholder: "Who they are, what they want, and what changes.",
+  },
+  {
+    key: "setting",
+    label: "Setting",
+    placeholder: "Place, period, and visual rules that must stay consistent.",
+  },
+  {
+    key: "continuity",
+    label: "Continuity",
+    placeholder: "Props, wardrobe, time of day, or events that cannot jump.",
+  },
+];
+
+export function BriefPanel({ brief, storyNotes, onChange, onStoryNotesChange }: BriefPanelProps) {
+  const notes = storyNotes ?? EMPTY_STORY_NOTES;
   function text(key: "topic" | "audience" | "goal" | "tone" | "preset", value: string) {
     onChange({ ...brief, [key]: value });
   }
@@ -121,6 +153,31 @@ export function BriefPanel({ brief, onChange }: BriefPanelProps) {
             <option value="none">No narration</option>
           </select>
         </label>
+
+        {brief.mode === "fiction" && (
+          <fieldset className="field-grid story-notes">
+            <legend className="field-label">Fiction continuity notes</legend>
+            <p className="hint field-wide">
+              These notes stay with the document through script, storyboard, and history changes. They are not sent
+              as a factual claim and are not an automatic fact-check.
+            </p>
+            {STORY_NOTE_FIELDS.map((field) => (
+              <label className="field field-wide" htmlFor={`story-${field.key}`} key={field.key}>
+                <span className="field-label">{field.label}</span>
+                <textarea
+                  id={`story-${field.key}`}
+                  rows={3}
+                  maxLength={STORY_NOTE_MAX_CHARS}
+                  value={notes[field.key]}
+                  onChange={(event) =>
+                    onStoryNotesChange({ ...notes, [field.key]: event.target.value })
+                  }
+                  placeholder={field.placeholder}
+                />
+              </label>
+            ))}
+          </fieldset>
+        )}
 
         <label className="field" htmlFor="brief-budget">
           <span className="field-label">Planning budget (USD)</span>

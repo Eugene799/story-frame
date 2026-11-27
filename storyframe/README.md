@@ -1,4 +1,4 @@
-# StoryFrame — Phase 9: dashboard, image, narration, video export, and lip sync
+# StoryFrame — Phase 10 complete; Phase 11 implemented: product ads
 
 This repository state keeps the Phase 2 pieces — a **server-verified Supabase session boundary**, a **durable,
 idempotent usage ledger**, and the **project data model** with owner-scoped access — and the Phase 3 **private media
@@ -8,7 +8,12 @@ validated JSON proposals for angles, scripts, storyboards, ad concepts, and tran
 accepted content. Phase 6 adds protected Pexels and Pixabay stock search with normalized previews, a durable shared
 cache, credited attribution, and server-mediated imports into project media. Phase 7 adds image generation (Cloudflare
 Workers AI or Leonardo), Phase 8 adds Deepgram narration with uploaded audio, Phase 9 adds JSON2Video export, and lip
-sync through Everypixel Labs renders a talking clip or portrait against an audio track.
+sync through Everypixel Labs renders a talking clip or portrait against an audio track. Phase 10 completes
+recoverable revision history, the pre-render media/narration checklist, and optional fiction continuity notes; its
+paid factual-and-fiction acceptance run passed on 2026-11-27 against hosted Supabase, R2, Deepgram, and JSON2Video.
+Phase 11 adds the owner-scoped product and campaign catalog, grounded three-concept ad generation from a frozen
+snapshot, a one-way selected manifest, a dashboard catalog panel, and an apply step that turns the selected manifest
+into an approved project revision the existing video export can render.
 
 The account screens use real Supabase email/password sign-in, sign-up, and password recovery, and the signed-in
 workspace handles projects, media, planning, and exports. The Phase 1–2 connection-test screen remains a development
@@ -458,6 +463,7 @@ these tables. Apply them in filename order:
 19. `20261126100000_create_video_usage.sql` (Phase 9: credits ledger and atomic per-account reservation)
 20. `20261126110000_create_lipsync_exports.sql` (Phase 9: lip sync exports and the provider-seconds ledger)
 21. `20261126120000_create_job_leases.sql` (Phase 9: one durable advancement lease per sweep name, with claim and renew functions)
+22. `20261127120000_create_product_ad_concepts.sql` (Phase 11: frozen-snapshot ad-concept sets, one-way selection, manifest)
 
 Run the compatibility check first. It must return no rows:
 
@@ -470,7 +476,8 @@ where table_schema = 'public'
     'media_references', 'sources', 'claims', 'generation_proposals',
     'provider_jobs', 'render_snapshots', 'profiles', 'model_health', 'stock_search_cache',
     'image_generations', 'narration_tracks', 'narration_usage', 'video_usage',
-    'lipsync_exports', 'lipsync_usage', 'job_leases'
+    'lipsync_exports', 'lipsync_usage', 'job_leases',
+    'products', 'campaigns', 'product_ad_concepts'
   );
 ```
 
@@ -488,12 +495,15 @@ Afterwards, check the running server rather than assuming the schema is ready:
 2. With a real session token, read and write `GET/PUT /api/profile`, create one project, and
    list one child table. A `503` with `PROJECTS_UNAVAILABLE`, `PROFILE_UNAVAILABLE`, or
    `CHILD_STORE_UNAVAILABLE` means the hosted columns still do not match these files.
-3. Set `SMOKE_SUPABASE_ACCESS_TOKEN` to a session token and run `npm run smoke:live` (five
-   billable calls, described under Tests).
+3. Run `npm run smoke:live` (five billable calls, described under Tests). It creates and deletes
+   its own disposable Supabase user; no pre-existing session token is used.
 
-**The migration set through Phase 9 is applied to the configured project (`myrohtkfsuppcabedwmn`): the sixth on
+**The migration set through Phase 11 is applied to the configured project (`myrohtkfsuppcabedwmn`): the sixth on
 2026-11-24, the seventh and eighth (Phase 5) on 2026-11-25, the ninth through seventeenth (Phases 6–8) on 2026-11-25, and
-the eighteenth through twenty-first (Phase 9) through the management API, the last on 2026-11-26. `npm run verify:sql`
+the eighteenth through twenty-first (Phase 9) through the management API, the last on 2026-11-26. The twenty-second and
+twenty-third (Phase 11) followed through the same API on 2026-11-27; `verify:sql` then reported 162/162, and a direct
+probe confirmed all three tables, their select-own policies, an anon request refused with `42501`, and a service-role
+read of `product_ad_concepts` returning `200 []`. `npm run verify:sql`
 still proves every one locally first, and after applying the first two Phase 9 migrations a PostgREST probe returned
 `200` for `render_snapshots.kind`, `render_snapshots.media_id`, and `video_usage`.** The Phase 6 catalog was
 checked directly after applying it: `media_metadata.provenance` and its object constraint exist,
@@ -572,13 +582,14 @@ needs the Supabase dashboard; the service-role key cannot edit URL configuration
 | `AUTH_TIMEOUT_MS` | Supabase Auth/ledger timeout (default 5000). |
 | `OLLAMA_MODEL_*` | Optional exact-request-id overrides for the six families. |
 | `AI_ROUTE_ANGLES`, `AI_ROUTE_SCRIPT`, `AI_ROUTE_STORYBOARD`, `AI_ROUTE_AD_CONCEPT`, `AI_ROUTE_TRANSCRIPT_ANALYSIS` | Planning route override, naming a family key from the allowlist (`gemma`, `deepseek`, `glm`, `gpt-oss`, `minimax`). The default for every route is `gemma`; a value that is unknown, disabled, or lacks the capability disables that route instead of falling back. |
-| `AI_TIMEOUT_MS`, `AI_MAX_PROMPT_CHARS`, `AI_MAX_OUTPUT_TOKENS`, `AI_MAX_REQUESTS_PER_MINUTE` | Optional bounds. |
+| `AI_TIMEOUT_MS`, `AI_MAX_PROMPT_CHARS`, `AI_MAX_BODY_BYTES`, `AI_MAX_OUTPUT_TOKENS`, `AI_MAX_REQUESTS_PER_MINUTE` | Optional bounds. `AI_MAX_BODY_BYTES` caps the JSON request body for `/api/ai/test` (default 4096; range 256–65536). |
 | `AI_ABANDON_AFTER_MS` | Age at which a pending reservation may be settled as abandoned instead of retried (default 90000, floored at the provider timeout plus three auth timeouts). Planning uses a wider floor of two provider timeouts plus three auth timeouts, covering its initial call and one repair. |
 | `APP_ORIGIN` | Optional additional origin restriction for API calls. |
-| `SMOKE_SUPABASE_ACCESS_TOKEN` | Only for `npm run smoke:live`; a valid session token. Never commit it. |
+| `HOST`, `PORT` | Server bind address and port. `HOST` defaults to `127.0.0.1`; `PORT` falls back to `8787` when unset. |
 | `R2_ENDPOINT` | R2 S3 endpoint (`https://<account-id>.r2.cloudflarestorage.com`). `CLOUDFLARE_S3_ENDPOINT_URL` is accepted as a fallback. |
 | `R2_BUCKET_NAME` | Private media bucket. `CLOUDFLARE_R2_BUCKET_NAME` is accepted as a fallback. |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 S3 credentials. Read only in the Node process; never sent to the browser. `CLOUDFLARE_ACCESS_ID` / `CLOUDFLARE_SECRET_ACCESS_KEY` are accepted as fallbacks. |
+| `CLOUDFLARE_API_TOKEN` | Optional R2 edit token used only by `npm run cors:preview`; never read by the running server. |
 | `MEDIA_IMAGE_MAX_BYTES`, `MEDIA_AUDIO_MAX_BYTES`, `MEDIA_VIDEO_MAX_BYTES` | Per-file bounds (defaults 10 MiB, 25 MiB, 200 MiB). |
 | `MEDIA_OWNER_STORAGE_BYTES` | Total pending + ready bytes per account (default 2 GiB). |
 | `MEDIA_UPLOAD_URL_SECONDS`, `MEDIA_DOWNLOAD_URL_SECONDS`, `MEDIA_UPLOAD_TTL_MS` | Presigned URL and upload-window lifetimes. |
@@ -744,7 +755,8 @@ document, while `version` is the optimistic concurrency token for the row.
 
 Document **schema 2** carries the brief (`topic`, `audience`, `goal`, factual/fiction, target duration, tone, preset,
 voice preference, planning budget) and scenes with a stable id, order, narration, visual direction, asset ids,
-on-screen text, duration, approval, approval fingerprint, and per-component locks. Stored schema 1 rows are upgraded
+on-screen text, duration, approval, approval fingerprint, per-component locks, and optional fiction continuity notes.
+Stored schema 1 rows are upgraded
 on read and written back as schema 2 on the next save; the migration adds empty visual/on-screen fields, zero
 durations, unlocked components, and a default brief rather than guessing content.
 
@@ -758,7 +770,7 @@ rejected request cannot append a revision.
 | `GET /api/projects` | The caller's 50 most recently updated projects, without documents. |
 | `GET /api/projects/:id` | One owned project, including its document. |
 | `PUT /api/projects/:id` | Replace `{ title, document }`, sending the `version` last read. Scene asset ids must be UUID-shaped ready media in the same project (`422 MEDIA_ASSET_INVALID` otherwise). |
-| `DELETE /api/projects/:id` | Delete an owned project; its revisions cascade. |
+| `DELETE /api/projects/:id` | Delete an owned project; its revisions cascade. Refused with `409 PROJECT_MEDIA_IN_USE` while a catalog product still references one of its images. |
 | `GET /api/projects/:id/revisions` | The owner's 20 newest revision summaries (no document payloads). |
 | `POST /api/projects/:id/export` | Export the `{ title, document }` the editor is showing. Returns the document, one unique stock credit per referenced asset (creator, provider, source page, license, scene ids), and a render payload with per-scene credited assets. Attribution is read from stored media rows, never the request. |
 
@@ -1008,8 +1020,192 @@ and then attached the same scene as an explicit reference, so the store counted 
 one and deletion could not be resolved from the UI. The upload now registers the scene link once, as the explicit
 reference; the row and the delete guard agree.
 
-**FAIL: none in the Phase 4 scope.** Restoring an old revision from Settings is not implemented; history is read-only
-in Phase 4.
+**FAIL: none in the Phase 4 scope.** Phase 4 history is read-only; the Phase 10 slice below adds explicit restore.
+
+## Phase 10: complete story workflow (2026-11-27)
+
+Phase 10 is the first phase after the Phase 9 export. The current slice adds the workflow safeguards that were still
+missing from the editor; it does not claim that the full factual and fiction acceptance runs have been repeated against
+a paid JSON2Video render.
+
+**Recoverable history.** Settings now restores any saved revision through
+`POST /api/projects/:id/revisions/:revision/restore` with the current `version`. The server reads the saved document,
+migrates it if it is older, carries the current component locks into the restored document and applies the normal lock
+check, verifies every listed scene asset is still ready media, and appends the restored document as a new version. It
+never rewrites the revision it came from.
+`tests/projects-v2.test.ts` covers restore, stale versions, unknown revisions, locked fields, and owner scoping;
+`tests/settings-panel.test.tsx` covers the confirmation flow and the new-version report.
+
+**Pre-render checklist.** Preview now reads the project's media rows and narration state before the export block. It
+names attached assets that are missing, pending, or deleted; lists scenes that will render as text-only cards; shows
+the narration duration measured from the stored audio beside the scene timeline; and states which saved revision the
+export will pin. It says explicitly that a text-only scene is not a missing-file error. `tests/pre-render-checklist.test.tsx`
+covers missing, pending, text-only, measured-duration, and snapshot reporting.
+
+**Fiction continuity notes.** A fiction brief can now carry character, setting, and continuity notes. They are optional
+in schema 2, so existing documents remain readable, and the server preserves them through saves, reloads, and revision
+restore. `tests/brief-panel.test.tsx` covers the fields; `tests/projects-v2.test.ts` covers persistence and rejects a
+partial notes object.
+
+**Already in the workflow.** Planning proposals keep sources, exact-quote claims, and unresolved claim status; locked
+components resist script and storyboard updates; exports include the exact document and stock credits. The existing
+Media tab's attach/detach flow is the selective-replacement path: attach the replacement to the scene, then detach the
+old asset; the saved document and media references move independently and a failed save keeps the link visible.
+
+**Paid acceptance (2026-11-27).** `npm run verify:phase10-live` drove one factual and one fiction project through
+the real routes against hosted Supabase and R2, with a real Deepgram narration and a real JSON2Video render for each
+accepted project. The fiction half of the combined run was refused before submission; that failed attempt cost a
+narration but no render credit, and the fiction rerun passed in full.
+
+| Run | Checks | Deepgram narration | JSON2Video | Cleanup evidence |
+| --- | --- | --- | --- | --- |
+| Factual | 20/20 | 139 chars, $0.00417 | 10 s, 10 credits | project DELETE 200, read 404, 0 media rows; user probe 404 |
+| Fiction, first attempt | 12/13, stopped at render acceptance | 106 chars, $0.00318 | 409 `VIDEO_NARRATION_OVERFLOW`, 0 credits | user probe 404; project removed in `finally`, not asserted |
+| Fiction, rerun | 18/18 | 106 chars, $0.00318 | 10 s, 10 credits | project DELETE 200, read 404, 0 media rows; user probe 404 |
+
+**Provider spend in the retained logs.** 351 Deepgram characters = **$0.01053** at the recorded Aura-2 rate of
+$0.03 per 1,000 characters (`deepgram-aura-2-2026-11-25`), and **20 JSON2Video credits** for the two accepted
+10-second renders at the recorded one-credit-per-output-second rate (`json2video-2026-11-25`). The refused fiction
+submission reserved and consumed no render credit. JSON2Video publishes no credits-to-USD rate, so no dollar figure is
+invented. Each project uploaded two 1×1 PNGs; the two accepted renders
+added one MP4 each. R2 storage and request charges are not separately metered here. Narration and video ledger rows
+were removed with the disposable user, so this table is the durable record of those calls. Earlier exploratory
+attempts from the same session are not itemized; the table covers only the runs whose output was retained in
+`/tmp/phase10-live.log` and `/tmp/phase10-live-fiction.log`.
+
+**Cleanup evidence.** Each completed run asserted that the project `DELETE` returned 200, a follow-up `GET` returned
+404, and a hosted `media_metadata` query for the project returned zero rows; after deleting the disposable auth user,
+a probe of `/auth/v1/admin/users/:id` returned 404. The exported MP4 was downloaded from private storage and matched
+the stored byte size before cleanup. The script does not list bucket keys independently, so object removal is
+evidenced by the project-delete path and zero media rows rather than a separate bucket listing. Each completed run
+also created and restored a revision, reloaded the saved document, downloaded the JSON/script export, and replaced a
+scene asset while the old one was released and deleted. The provider-free workflows and failure cases remain covered
+by the route and UI tests above.
+
+**Provider-free smoke workflow test.** `tests/smoke-live-cleanup.test.ts` runs the real `scripts/smoke-live.ts`
+against mocked Supabase endpoints and fails CI if the disposable user is not created, signed in, and deleted, or if
+its `ai_usage` rows survive. It also covers a failed sign-in, an account that survives deletion, leaked ledger rows,
+and an unavailable deletion probe. It spends nothing and makes no provider call; the paid-acceptance boundary above
+still requires the opt-in `smoke:live` run. Phase 11 starts from that boundary with the product catalog and campaign
+foundation described below.
+
+## Phase 11: product ads — catalog, grounded concepts, and manifest (2026-11-27)
+
+A product ad needs facts before it needs footage. Phase 11 keeps those facts in an owner-scoped catalog: `products`
+holds the real name and variant, brand settings, **approved claims with their evidence notes**, **prohibited wording**,
+and the ready image ids for the actual product asset and logo. `campaigns` holds the offer: audience, price and
+currency, promotion window with its IANA time zone, call to action, destination, duration, aspect ratio, and
+disclaimer. Both tables live in `supabase/migrations/20261127090000_create_products_and_campaigns.sql` with the same
+select-own RLS and service-role-only writes as the project tables.
+
+**Catalog routes.** `POST/GET /api/products`, `GET /api/products/:id`, and `PATCH /api/products/:id` create, read, and
+correct a catalog entry; `GET /api/media/images` lists the account's ready images across every project, newest first,
+with each row's project id and title, content type, size, upload date, and stock provenance, so the catalog picker can
+name real files instead of UUIDs (pending, deleted, audio, and video rows are excluded); `POST/GET /api/campaigns`,
+`GET /api/campaigns/:id`, `PATCH /api/campaigns/:id`, and `DELETE /api/campaigns/:id` create, read, correct, and delete
+a campaign. A PATCH merges the omitted fields with the stored row and then reuses the creation validator, so a correction
+cannot bypass the same limits. A campaign's owning product is immutable; a different `productId` is `400
+INVALID_CAMPAIGN`, and deletion cascades only that campaign's concept sets. A product correction preserves the id of a
+claim whose text is unchanged (so later ad snapshots keep stable claim ids); changed or new claim text gets a generated
+id. Its media references are reconciled against the new image set: every added image must be a ready image owned by the
+caller, new references are written before the product row, references for removed images are released after it, and
+added references are rolled back if the row update fails. Campaign creation proves the product belongs to the caller and
+rejects a project id the caller does not own. A product's `assetMediaIds` and `logoMediaId` must be **ready images owned
+by the caller** (`readyOwnedMedia`), refused `422 PRODUCT_ASSET_INVALID` otherwise, so one account cannot point a catalog
+entry at another account's object. Each image gets a media reference naming the product, so the retention sweep cannot
+retire a catalog image as unreferenced; `DELETE /api/products/:id` releases those references and the database cascades
+the product's campaigns and concept sets. A product PATCH can also clear or replace those image references without
+deleting the product. The same references guard project deletion: `DELETE /api/projects/:id` answers `409
+PROJECT_MEDIA_IN_USE` while a product still names an image in that project, because the project cascade would remove the
+media row and leave the product with a dead id. Clear that image from the product (or delete the product) first to
+release its references, then the project. Validation also refuses empty
+text, duplicate claims or prohibited phrases, malformed asset ids, a non-http destination, an invalid time zone, a
+promotion window that ends before it starts, a bad currency or aspect ratio, and any field outside the documented
+shape. `tests/products.test.ts` covers creation, listing, owner isolation, every refusal case, and the ready-image
+library (its ready-image-only and owner scoping, the project title, and the auth/method guards).
+
+**Grounded concepts.** `POST /api/products/:id/ad-concepts` takes only `campaignId` and an optional `instruction`, and
+requires an `Idempotency-Key` plus an available `ad-concept` planning route. It copies the product and campaign into a
+**frozen snapshot** (with a SHA-256 `snapshotHash` over the version and both fact sets) before contacting the model;
+all later reads use that snapshot, so renaming the product or changing the offer cannot rewrite an existing generation
+or an approved manifest. The model is asked for one JSON object with exactly **three distinct concepts**. Each concept
+carries a title, a hook, exactly **two bounded alternate hooks**, and 2–6 beats whose durations total the campaign
+duration within 2 seconds; the final beat's on-screen text must contain the campaign's exact call to action. The
+server, not the model, assigns concept ids and totals.
+
+**What the model may not invent.** Every beat asset id must be null or one of the snapshot's own ready image ids;
+every `claimIds` entry must be an approved claim **with a non-empty evidence note**; any prohibited phrase anywhere in
+the reply fails validation; the model cannot return concept ids, media URLs, or unknown fields. A rejected reply gets
+exactly one disclosed repair, and a second failure is `422 AD_CONCEPT_INVALID_JSON` with nothing stored. The reply is
+validated as untrusted data, and the prompt labels the product and campaign block as data, not instructions.
+
+**Prompt and reply budgets.** The catalog bounds are part of that budget, not separate from it: at most **8 claims**
+(300 characters each, with 400 characters of evidence), **12 prohibited phrases** (80 characters each), and **12
+product images**. The campaign's audience, offer, destination, and disclaimer are bounded alongside them, so a maximal
+product, campaign, and 500-character instruction fit the route's **16,000-character prompt** without truncation. If a
+stored snapshot still exceeds that limit, the builder closes any cut product/campaign block and reserves the complete
+task schema and instruction before spending any prompt budget on facts, with a marker stating that facts were
+truncated. The
+`ad-concept` route asks for **8,000 output tokens**; the other planning routes keep their 1,200-token bound. A
+maximal accepted reply (three concepts, six beats each, every text at its limit) fits that cap even at a conservative
+three characters per token. `tests/ad-concepts.test.ts` builds the maximal product, campaign, and reply, asserts the
+prompt keeps the full schema and all facts, and accepts the reply without a repair.
+
+**Selection and manifest.** `GET /api/products/:id/ad-concepts`, `GET /api/ad-concepts?productId=…`, and
+`GET /api/ad-concepts/:id` list and read the owner's sets. `POST /api/ad-concepts/:id/select` with `{ "index": 0-2 }`
+freezes a **manifest** built from the snapshot: product name and variant, the product `logoMediaId`, the campaign
+`projectId`, the selected concept and all three hook variants, beats with their asset ids, total and campaign duration,
+aspect ratio, CTA, destination, disclaimer, the cited claims with evidence, and the prohibited-wording list. Selection
+is one-way; repeating the same index is idempotent, and a different index is `409 AD_CONCEPT_ALREADY_SELECTED`. A
+stored snapshot whose hash no longer matches is refused `503 AD_CONCEPT_SNAPSHOT_INVALID` rather than producing a
+manifest that claims unverified facts. Every snapshot image id is rechecked against `readyOwnedMedia` before a paid
+generation and again before selection, so a product whose image was deleted or belongs to another account cannot
+produce a manifest naming it (`409 AD_CONCEPT_MEDIA_INVALID`; no provider call and no selection are made). Both tables
+live in `supabase/migrations/20261127120000_create_product_ad_concepts.sql`; `verify:sql` covers the three-concept and
+selection constraints, select-own RLS, refused browser writes, and the product/auth-user cascades.
+
+**Applying a manifest to a render project.** `POST /api/ad-concepts/:id/project` writes a selected manifest into the
+project its campaign names. Each beat becomes an already-approved scene with a deterministic id derived from the
+concept, so applying the same manifest again replaces its own scenes instead of duplicating them and leaves the
+project's other scenes alone; the final scene carries the campaign CTA, which the video export renders as on-screen
+text. The logo and every beat asset must still be ready media **in that project** (`409 AD_CONCEPT_MEDIA_INVALID`),
+component locks are respected like any other save, and the write is a normal project revision (`200` with
+`projectRevision`). The paid render itself stays explicit: nothing in this step calls a provider or spends credits;
+the dashboard opens the saved revision in Projects, where the existing video export can render it.
+
+**Billable safety.** Generation reserves the existing `ai_usage` ledger with the verified user id and the caller's key
+before the provider call, so a retry returns the stored concept set without paying twice; reusing the key for another
+product or campaign is `409 IDEMPOTENCY_KEY_REUSED`, and the per-account in-flight and rate guards cover concurrent
+tabs. `tests/ad-concepts.test.ts` covers generation, prompt grounding, replay, the one repair, both refusal paths,
+owner isolation, the frozen snapshot surviving a later catalog edit, the manifest, tamper detection, campaign
+mismatch/foreign-campaign refusals, every concept closing on the campaign CTA, the media revalidation before generation
+and selection, and the apply path that writes approved scenes into the campaign's project (including a repeat apply
+and a deleted logo). The project-delete regression test proves that a project holding catalog-referenced media is
+refused (`409 PROJECT_MEDIA_IN_USE`), that generation and selection still freeze a manifest from the intact images,
+and that deleting the product releases the references so the project can then be deleted. `tests/media.test.ts` keeps
+a catalog-referenced image through retention until its product is deleted. `tests/products.test.ts` also covers partial
+product and campaign corrections, claim id stability, reference add/remove/rollback, immutable campaign products, and
+owner-scoped campaign deletion with its concept sets. `tests/catalog-panel.test.tsx` covers creation, generation,
+product and campaign editing, cancelling either edit without a write, unavailable media, and deleting one campaign while
+its sibling and product remain. The full suite is 55 files / 509 tests.
+
+**Catalog UI.** The dashboard's **Open product catalog** button opens `CatalogPanel`: create a product with its
+claims and evidence, prohibited wording, and ready images picked from the account library; create a campaign against a
+product, choosing the **Render project** that will hold and render the ad; choose a product and campaign and generate
+the three concepts;
+then select one, **apply** the frozen manifest to that project, inspect the manifest, or delete the product (which
+releases its image references and removes its campaigns and concept sets). Applying saves approved scenes and reports
+the project revision to open in Projects, where the existing preview and video export continue; the catalog does not
+start a paid render itself. Product images are picked from one account-wide list of ready images, each labelled by the
+project that holds it and its format, size, and upload date; the logo is a single-choice picker over the same list.
+The panel also exposes the correction path: **Edit product** loads the stored facts, claims, images, and logo into the
+form and saves them with `PATCH /api/products/:id`; **Edit campaign** loads the mutable offer fields and saves them with
+`PATCH /api/campaigns/:id` while keeping the owning product fixed; and **Delete campaign** removes only the selected
+campaign and its concept sets after confirmation, leaving the product and its media references intact. The larger
+**Delete product** action remains separate and still removes the product's campaigns and concept sets.
+
+Phase 11's routes and UI are implementation-complete and covered by the migration check and test suite. Unlike Phase 10,
+no paid live acceptance run is recorded for Phase 11.
 
 ## Phase 5: six-model routing and AI planning (2026-11-25)
 
@@ -1716,18 +1912,21 @@ Coverage includes:
 ### Repeatable live smoke check
 
 ```bash
-SMOKE_SUPABASE_ACCESS_TOKEN=<valid session token> npm run smoke:live
+npm run smoke:live
 ```
 
 This check is **opt-in** and makes **five real requests** (one per enabled family), which count against your Ollama
-usage and write five ledger rows. It requires `OLLAMA_API_KEY` plus Supabase configuration in the environment or
-`storyframe/.env`, and a valid session token. It starts an isolated API server on an ephemeral loopback port, runs the
-five families sequentially, then reads `/api/ai/usage` to confirm the ledger is working. It then repeats one successful
-request with its original `Idempotency-Key`: the replay must return the same stored values and leave the ledger row
-count unchanged, which proves no second provider call was billed. Because `response_body` is JSONB, the comparison
-ignores object key order. It exits non-zero on failure, performs no retries, and never prints the provider key or
-session token. Nemotron is checked only for its disabled status and is
-never called.
+usage and write five ledger rows. It requires `OLLAMA_API_KEY` plus `SUPABASE_URL`,
+`SUPABASE_SERVICE_ROLE_KEY`, and `SUPABASE_PUBLISHABLE_KEY` (or the legacy `SUPABASE_ANON_KEY`) in the environment or
+`storyframe/.env`. It creates a confirmed disposable user with the admin API and signs in as that user, so no manual
+token is needed. It starts an isolated API server on an ephemeral loopback port, runs the five families sequentially,
+then reads `/api/ai/usage` to confirm the ledger is working and prints the row count and latest model/status. It then repeats
+one successful request with its original `Idempotency-Key`: the replay must return the same stored values and leave
+the ledger row count unchanged, which proves no second provider call was billed. Because `response_body` is JSONB, the
+comparison ignores object key order. It exits non-zero on failure, performs no retries, and never prints the provider
+key or session token. Unavailable models are listed for visibility and are never called. It deletes the disposable
+user afterwards and verifies both the account and its `ai_usage` rows are gone; that cascade also removes the five
+rows the run created.
 
 ### Provider-free live route checks
 
@@ -1801,8 +2000,9 @@ as `BLOCKED` rather than as passes or failures, and the summary counts them sepa
 password-change, and expiry checks need no mail and always run.
 
 Supabase also rejects addresses on domains that cannot receive mail, so the sign-up step is `BLOCKED` by default.
-Set `E2E_SIGNUP_EMAIL` to a throwaway inbox you control to run it for real; the script deletes that account at the
-end, and never deletes an account that existed before the run.
+Set `E2E_SIGNUP_EMAIL` to a throwaway inbox you control to run the confirmation branch, and set
+`E2E_ACCOUNT_EMAIL` to a second throwaway inbox to send the reset-request mail to a real address. The script deletes
+the accounts it creates at the end, and never deletes an account that existed before the run.
 
 ## Security limitations
 
@@ -1851,7 +2051,8 @@ end, and never deletes an account that existed before the run.
   but durable quotas shared across instances, managed secret rotation, and hosted email delivery remain
   missing.
 - The workspace is single-user per project and has no conflict merging: a stale save is refused, the draft is kept,
-  and the caller must load the latest version. Revision history is read-only; restoring an old version is future work.
+  and the caller must load the latest version. Revision restore is explicit and appends a new version (Phase 10);
+  there is still no conflict merging.
 - Automatic scene generation is not implemented: scenes are authored by hand and use uploaded or generated media. Video
   rendering is implemented in Phase 9: the Preview tab submits the saved scene timeline to JSON2Video and stores the
   finished MP4 as a private media asset, and the lip-sync route renders a talking clip or portrait against an audio track
